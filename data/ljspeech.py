@@ -32,7 +32,14 @@ def build_from_path(in_dir, out_dir):
             basename = parts[0]
             text = parts[2]
             
-            ret = process_utterance(in_dir, out_dir, basename)
+            try:
+                ret = process_utterance(in_dir, out_dir, basename)
+            except:
+                print("Could not process " + basename)
+                continue
+         
+                
+            
             if ret is None:
                 continue
             else:
