@@ -93,6 +93,14 @@ python3 train.py
 
 The model takes less than 10k steps (less than 1 hour on my GTX1080 GPU) of training to generate audio samples with acceptable quality, which is much more efficient than the autoregressive models such as Tacotron2.
 
+### Finetuning 
+If you have little data, it is recommended that you instead finetune the [pretrained model](https://drive.google.com/file/d/1jXNDPMt1ybTN97_MztoTFyrPIthoQuSO/view?usp=sharing) on your dataset.
+
+```
+python3 train.py --pretrained checkpoint_300000.pth.tar
+```
+Be aware that training is very fast. On one of my smallest datasets, it started overfitting after 500 steps. In addition, if your dataset is very small, you'll have to lower the batch size.
+
 There might be some room for improvement for this repository. For example, I just simply add up the duration loss, f0 loss, energy loss and mel loss without any weighting. Please inform me if you find any useful tip for training the FastSpeech2 model.
 
 # Notes
