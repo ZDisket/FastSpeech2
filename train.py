@@ -32,6 +32,10 @@ def main(args):
     print("Model Has Been Defined")
     num_param = utils.get_param_num(model)
     print('Number of FastSpeech2 Parameters:', num_param)
+    if len(args.pretrained) > 1:
+      pret = torch.load(args.pretrained)
+      model.load_state_dict(pret["model"])
+      print("Loaded pretrained weights from " + args.pretrained)
 
     # Optimizer and loss
     optimizer = torch.optim.Adam(model.parameters(), betas=hp.betas, eps=hp.eps, weight_decay = hp.weight_decay)
@@ -187,6 +191,7 @@ if __name__ == "__main__":
 
     parser = argparse.ArgumentParser()
     parser.add_argument('--restore_step', type=int, default=0)
+    parser.add_argument("--pretrained",type=str,default="")
     args = parser.parse_args()
 
     main(args)
