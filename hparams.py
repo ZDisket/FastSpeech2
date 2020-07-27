@@ -2,13 +2,13 @@ import os
 
 # Dataset
 dataset = "LJSpeech"
-data_path = "./LJSpeech-1.1"
+data_path = "/home/ming/Data/Raw/LJSpeech-1.1"
 #dataset = "Blizzard2013"
 #data_path = "./Blizzard-2013/train/segmented/"
 
 
 # Text
-text_cleaners = []
+text_cleaners = ['english_cleaners']
 
 
 # Audio and mel
@@ -52,8 +52,8 @@ max_seq_len = 1000
 ### for LJSpeech ###
 f0_min = 71.0
 f0_max = 795.8
-energy_min = 17.76
-energy_max = 91.42
+energy_min = 0.0
+energy_max = 315.0
 ### for Blizzard2013 ###
 #f0_min = 71.0
 #f0_max = 786.7
@@ -68,9 +68,8 @@ preprocessed_path = os.path.join("./preprocessed/", dataset)
 checkpoint_path = os.path.join("./ckpt/", dataset)
 synth_path = os.path.join("./synth/", dataset)
 eval_path = os.path.join("./eval/", dataset)
-logger_path = os.path.join("./log/", dataset)
+log_path = os.path.join("./log/", dataset)
 test_path = "./results"
-waveglow_path = "./waveglow/pretrained_model/waveglow_256channels.pt"
 
 
 # Optimizer
@@ -78,15 +77,25 @@ batch_size = 16
 epochs = 1000
 n_warm_up_step = 4000
 grad_clip_thresh = 1.0
+acc_steps = 1
 
 betas = (0.9, 0.98)
 eps = 1e-9
-weight_decay = 1e-6
+weight_decay = 0.
+
+
+# Vocoder
+vocoder = 'melgan' # 'waveglow' or 'melgan'
+
+
+# Log-scaled duration
+log_offset = 1.
 
 
 # Save, log and synthesis
 save_step = 10000
 synth_step = 1000
+eval_step = 1000
 eval_size = 256
-log_step = 50
+log_step = 1000
 clear_Time = 20

@@ -8,6 +8,7 @@ import pyworld as pw
 import torch
 import audio as Audio
 from utils import get_alignment
+from text import _clean_text
 import hparams as hp
 
 def prepare_align(in_dir):
@@ -18,6 +19,7 @@ def prepare_align(in_dir):
             if os.path.exists(wav_path):
                 text = re.sub(' +', ' ', re.sub(r'[#@|]', '', next(f).strip())).strip(' ')
                 text = re.sub(r'\s([?.!":,-;\'\"](?:\s|$))', r'\1', text)
+                text = _clean_text(text, hp.text_cleaners)
             
                 with open(os.path.join(in_dir, 'wavn', '{}.txt'.format(basename)), 'w') as f1:
                     f1.write(text)
@@ -77,8 +79,10 @@ def process_utterance(in_dir, out_dir, basename):
     # Get alignments
     textgrid = tgt.io.read_textgrid(tg_path)
     phone, duration, start, end = get_alignment(textgrid.get_tier_by_name('phones'))
-    text = '{'+ ' '.join(phone) + '}'
-    text = text.replace(' $ ', '} {') # $ represents silent phones
+    text = '{'+ '}{'.join(phone) + '}' # '{A}{B}{$}{C}', $ represents silent phones
+    text = text.replace('{$}', ' ')    # '{A}{B} {C}'
+    text = text.replace('}{', ' ')     # '{A B} {C}'
+
     if start >= end:
         return None
     
@@ -90,14 +94,12 @@ def process_utterance(in_dir, out_dir, basename):
     f0, _ = pw.dio(wav.astype(np.float64), hp.sampling_rate, frame_period=hp.hop_length/hp.sampling_rate*1000)
     f0 = f0[:sum(duration)]
 
-    # Compute mel-scale spectrogram
-    mel_spectrogram = Audio.tools.get_mel_from_wav(torch.FloatTensor(wav)).numpy().astype(np.float32)
-    mel_spectrogram = mel_spectrogram[:, :sum(duration)]
+    # Compute mel-scale spectrogram and energy
+    mel_spectrogram, energy = Audio.tools.get_mel_from_wav(torch.FloatTensor(wav))
+    mel_spectrogram = mel_spectrogram.numpy().astype(np.float32)[:, :sum(duration)]
+    energy = energy.numpy().astype(np.float32)[:sum(duration)]
     if mel_spectrogram.shape[1] >= hp.max_seq_len:
         return None
-
-    # Compute energy
-    energy = np.linalg.norm(mel_spectrogram, axis=0)
 
     # Save alignment
     ali_filename = '{}-ali-{}.npy'.format(hp.dataset, basename)
