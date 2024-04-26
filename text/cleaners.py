@@ -12,12 +12,22 @@ hyperparameter. Some cleaners are English-specific. You'll typically want to use
      the symbols in symbols.py to match your data).
 '''
 
+HAS_ESPEAK = True
+
 
 # Regular expression matching whitespace:
 import re
 from unidecode import unidecode
 from .numbers import normalize_numbers
 _whitespace_re = re.compile(r'\s+')
+
+
+if HAS_ESPEAK:
+    from phonemizer import phonemize
+    import phonemizer
+    global_phonemizer = phonemizer.backend.EspeakBackend(language='en-us', preserve_punctuation=True,  with_stress=True)
+    spanish_phonemizer = phonemizer.backend.EspeakBackend(language='es-419', preserve_punctuation=True,  with_stress=True)
+
 
 # List of (regular expression, replacement) pairs for abbreviations:
 _abbreviations = [(re.compile('\\b%s\\.' % x[0], re.IGNORECASE), x[1]) for x in [
@@ -87,3 +97,14 @@ def english_cleaners(text):
     text = expand_abbreviations(text)
     text = collapse_whitespace(text)
     return text
+
+
+def english_cleaners2(text):
+  '''Pipeline for English text, including abbreviation expansion. + punctuation + stress'''
+  text = convert_to_ascii(text)
+  text = lowercase(text)
+  text = expand_abbreviations(text)
+  phonemes = global_phonemizer.phonemize([text], strip=True, njobs=1)
+  phonemes = phonemes[0]
+  phonemes = collapse_whitespace(phonemes)
+  return phonemes

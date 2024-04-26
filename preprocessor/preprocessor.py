@@ -64,19 +64,31 @@ class Preprocessor:
 
         # Compute pitch, energy, duration, and mel-spectrogram
         speakers = {}
-        for i, speaker in enumerate(tqdm(os.listdir(self.in_dir))):
+        speakers_dirs = []
+        for dirf in os.listdir(self.in_dir):
+            if os.path.isdir(dirf):
+                speakers_dirs.append(dirf)
+
+        print(os.listdir(self.in_dir))
+        speakers_dirs = os.listdir(self.in_dir)
+        for i, speaker in enumerate(tqdm(speakers_dirs)):
             speakers[speaker] = i
-            for wav_name in os.listdir(os.path.join(self.in_dir, speaker)):
+            files_in_folder = os.listdir(os.path.join(self.in_dir, speaker))
+
+            print(f"Found {len(files_in_folder)} in folder {speaker}")
+            for wav_name in tqdm(files_in_folder):
                 if ".wav" not in wav_name:
                     continue
 
                 basename = wav_name.split(".")[0]
+                is_v = True
                 tg_path = os.path.join(
                     self.out_dir, "TextGrid", speaker, "{}.TextGrid".format(basename)
                 )
-                if os.path.exists(tg_path):
+                if is_v:
                     ret = self.process_utterance(speaker, basename)
                     if ret is None:
+                        print(f"{basename} is None")
                         continue
                     else:
                         info, pitch, energy, n = ret
@@ -142,6 +154,8 @@ class Preprocessor:
         random.shuffle(out)
         out = [r for r in out if r is not None]
 
+        self.val_size = round(len(out) * 0.05)
+
         # Write metadata
         with open(os.path.join(self.out_dir, "train.txt"), "w", encoding="utf-8") as f:
             for m in out[self.val_size :]:
@@ -155,29 +169,16 @@ class Preprocessor:
     def process_utterance(self, speaker, basename):
         wav_path = os.path.join(self.in_dir, speaker, "{}.wav".format(basename))
         text_path = os.path.join(self.in_dir, speaker, "{}.lab".format(basename))
-        tg_path = os.path.join(
-            self.out_dir, "TextGrid", speaker, "{}.TextGrid".format(basename)
-        )
-
-        # Get alignments
-        textgrid = tgt.io.read_textgrid(tg_path)
-        phone, duration, start, end = self.get_alignment(
-            textgrid.get_tier_by_name("phones")
-        )
-        text = "{" + " ".join(phone) + "}"
-        if start >= end:
-            return None
 
         # Read and trim wav files
-        wav, _ = librosa.load(wav_path)
-        wav = wav[
-            int(self.sampling_rate * start) : int(self.sampling_rate * end)
-        ].astype(np.float32)
+        wav, _ = librosa.load(wav_path, sr=self.sampling_rate)
+        wav = wav.astype(np.float32)
 
         # Read raw text
-        with open(text_path, "r") as f:
+        with open(text_path, "r", encoding="utf-8") as f:
             raw_text = f.readline().strip("\n")
 
+        text = raw_text
         # Compute fundamental frequency
         pitch, t = pw.dio(
             wav.astype(np.float64),
@@ -186,50 +187,12 @@ class Preprocessor:
         )
         pitch = pw.stonemask(wav.astype(np.float64), pitch, t, self.sampling_rate)
 
-        pitch = pitch[: sum(duration)]
         if np.sum(pitch != 0) <= 1:
             return None
 
         # Compute mel-scale spectrogram and energy
         mel_spectrogram, energy = Audio.tools.get_mel_from_wav(wav, self.STFT)
-        mel_spectrogram = mel_spectrogram[:, : sum(duration)]
-        energy = energy[: sum(duration)]
 
-        if self.pitch_phoneme_averaging:
-            # perform linear interpolation
-            nonzero_ids = np.where(pitch != 0)[0]
-            interp_fn = interp1d(
-                nonzero_ids,
-                pitch[nonzero_ids],
-                fill_value=(pitch[nonzero_ids[0]], pitch[nonzero_ids[-1]]),
-                bounds_error=False,
-            )
-            pitch = interp_fn(np.arange(0, len(pitch)))
-
-            # Phoneme-level average
-            pos = 0
-            for i, d in enumerate(duration):
-                if d > 0:
-                    pitch[i] = np.mean(pitch[pos : pos + d])
-                else:
-                    pitch[i] = 0
-                pos += d
-            pitch = pitch[: len(duration)]
-
-        if self.energy_phoneme_averaging:
-            # Phoneme-level average
-            pos = 0
-            for i, d in enumerate(duration):
-                if d > 0:
-                    energy[i] = np.mean(energy[pos : pos + d])
-                else:
-                    energy[i] = 0
-                pos += d
-            energy = energy[: len(duration)]
-
-        # Save files
-        dur_filename = "{}-duration-{}.npy".format(speaker, basename)
-        np.save(os.path.join(self.out_dir, "duration", dur_filename), duration)
 
         pitch_filename = "{}-pitch-{}.npy".format(speaker, basename)
         np.save(os.path.join(self.out_dir, "pitch", pitch_filename), pitch)

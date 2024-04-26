@@ -8,7 +8,7 @@ from torch.utils.data import DataLoader
 
 from utils.model import get_model, get_vocoder
 from utils.tools import to_device, log, synth_one_sample
-from model import FastSpeech2Loss
+from model import FastSpeech2Loss, FastSpeech3Loss
 from dataset import Dataset
 
 
@@ -31,10 +31,10 @@ def evaluate(model, step, configs, logger=None, vocoder=None):
     )
 
     # Get loss function
-    Loss = FastSpeech2Loss(preprocess_config, model_config).to(device)
+    Loss = FastSpeech3Loss(preprocess_config, model_config, train_config).to(device)
 
     # Evaluation
-    loss_sums = [0 for _ in range(6)]
+    loss_sums = [0 for _ in range(7)]
     for batchs in loader:
         for batch in batchs:
             batch = to_device(batch, device)
@@ -43,19 +43,19 @@ def evaluate(model, step, configs, logger=None, vocoder=None):
                 output = model(*(batch[2:]))
 
                 # Cal Loss
-                losses = Loss(batch, output)
+                losses = Loss(batch, output, 0)
 
                 for i in range(len(losses)):
                     loss_sums[i] += losses[i].item() * len(batch[0])
 
     loss_means = [loss_sum / len(dataset) for loss_sum in loss_sums]
 
-    message = "Validation Step {}, Total Loss: {:.4f}, Mel Loss: {:.4f}, Mel PostNet Loss: {:.4f}, Pitch Loss: {:.4f}, Energy Loss: {:.4f}, Duration Loss: {:.4f}".format(
+    message = "Validation Step {}, Total Loss: {:.4f}, Mel Loss: {:.4f}, Mel PostNet Loss: {:.4f}, Pitch Loss: {:.4f}, Energy Loss: {:.4f}, Duration Loss: {:.4f}, Attention Loss: {:.4f}".format(
         *([step] + [l for l in loss_means])
     )
 
     if logger is not None:
-        fig, wav_reconstruction, wav_prediction, tag = synth_one_sample(
+        fig, wav_reconstruction, wav_prediction, tag, attn_soft = synth_one_sample(
             batch,
             output,
             vocoder,

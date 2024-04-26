@@ -19,6 +19,14 @@ class ScheduledOptim:
         self.current_step = current_step
         self.init_lr = np.power(model_config["transformer"]["encoder_hidden"], -0.5)
 
+
+    @property
+    def param_groups(self):
+        return self._optimizer.param_groups
+
+    def step(self, *args, **kwargs):
+        return self.step_and_update_lr()
+
     def step_and_update_lr(self):
         self._update_learning_rate()
         self._optimizer.step()

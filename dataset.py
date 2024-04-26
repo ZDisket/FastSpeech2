@@ -5,7 +5,7 @@ import os
 import numpy as np
 from torch.utils.data import Dataset
 
-from text import text_to_sequence
+from text import text_to_sequence, cleaned_text_to_sequence
 from utils.tools import pad_1D, pad_2D
 
 
@@ -34,7 +34,7 @@ class Dataset(Dataset):
         speaker = self.speaker[idx]
         speaker_id = self.speaker_map[speaker]
         raw_text = self.raw_text[idx]
-        phone = np.array(text_to_sequence(self.text[idx], self.cleaners))
+        phone = np.array(cleaned_text_to_sequence(self.text[idx], self.cleaners))
         mel_path = os.path.join(
             self.preprocessed_path,
             "mel",
@@ -53,12 +53,7 @@ class Dataset(Dataset):
             "{}-energy-{}.npy".format(speaker, basename),
         )
         energy = np.load(energy_path)
-        duration_path = os.path.join(
-            self.preprocessed_path,
-            "duration",
-            "{}-duration-{}.npy".format(speaker, basename),
-        )
-        duration = np.load(duration_path)
+
 
         sample = {
             "id": basename,
@@ -68,7 +63,6 @@ class Dataset(Dataset):
             "mel": mel,
             "pitch": pitch,
             "energy": energy,
-            "duration": duration,
         }
 
         return sample
@@ -97,7 +91,6 @@ class Dataset(Dataset):
         mels = [data[idx]["mel"] for idx in idxs]
         pitches = [data[idx]["pitch"] for idx in idxs]
         energies = [data[idx]["energy"] for idx in idxs]
-        durations = [data[idx]["duration"] for idx in idxs]
 
         text_lens = np.array([text.shape[0] for text in texts])
         mel_lens = np.array([mel.shape[0] for mel in mels])
@@ -107,7 +100,6 @@ class Dataset(Dataset):
         mels = pad_2D(mels)
         pitches = pad_1D(pitches)
         energies = pad_1D(energies)
-        durations = pad_1D(durations)
 
         return (
             ids,
@@ -121,12 +113,10 @@ class Dataset(Dataset):
             max(mel_lens),
             pitches,
             energies,
-            durations,
         )
 
     def collate_fn(self, data):
         data_size = len(data)
-
         if self.sort:
             len_arr = np.array([d["text"].shape[0] for d in data])
             idx_arr = np.argsort(-len_arr)
@@ -168,7 +158,7 @@ class TextDataset(Dataset):
         speaker = self.speaker[idx]
         speaker_id = self.speaker_map[speaker]
         raw_text = self.raw_text[idx]
-        phone = np.array(text_to_sequence(self.text[idx], self.cleaners))
+        phone = np.array(cleaned_text_to_sequence(self.text[idx], self.cleaners))
 
         return (basename, speaker_id, phone, raw_text)
 

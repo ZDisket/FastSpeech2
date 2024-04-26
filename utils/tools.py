@@ -13,10 +13,11 @@ matplotlib.use("Agg")
 
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+from text import text_to_sequence, sequence_to_text, cleaned_text_to_sequence
 
 
 def to_device(data, device):
-    if len(data) == 12:
+    if len(data) == 11:
         (
             ids,
             raw_texts,
@@ -29,7 +30,6 @@ def to_device(data, device):
             max_mel_len,
             pitches,
             energies,
-            durations,
         ) = data
 
         speakers = torch.from_numpy(speakers).long().to(device)
@@ -39,7 +39,6 @@ def to_device(data, device):
         mel_lens = torch.from_numpy(mel_lens).to(device)
         pitches = torch.from_numpy(pitches).float().to(device)
         energies = torch.from_numpy(energies).to(device)
-        durations = torch.from_numpy(durations).long().to(device)
 
         return (
             ids,
@@ -53,7 +52,6 @@ def to_device(data, device):
             max_mel_len,
             pitches,
             energies,
-            durations,
         )
 
     if len(data) == 6:
@@ -66,6 +64,41 @@ def to_device(data, device):
         return (ids, raw_texts, speakers, texts, src_lens, max_src_len)
 
 
+import matplotlib.pyplot as plt
+import torch
+
+
+def log_attention_maps(logger, attention_tensor, widths, heights, step, tag_prefix=""):
+    """
+    Log each attention map from the attention_tensor to TensorBoard, with given widths and heights.
+
+    :param logger: The TensorBoard SummaryWriter instance.
+    :param attention_tensor: A tensor of shape (batch, max_w, max_h) with attention maps.
+    :param widths: A 1D tensor or array of shape (batch) with widths for each attention map.
+    :param heights: A 1D tensor or array of shape (batch) with heights for each attention map.
+    :param step: The current step in training for logging.
+    :param tag_prefix: Prefix for the tag to categorize the logs in TensorBoard.
+    """
+    batch_size = attention_tensor.size(0)
+
+    for i in range(batch_size):
+        fig_width = 5
+        fig_height = fig_width * (heights[i] / widths[i])  # Adjust the height based on the aspect ratio
+        fig, ax = plt.subplots(figsize=(fig_width, fig_height))  # Create a matplotlib figure and axes.
+        # Slice the attention tensor to the specified width and height
+        attention_map = attention_tensor[i, :heights[i], :widths[i]].cpu().numpy()
+        im = ax.imshow(attention_map, cmap='hot', interpolation='nearest')
+        # Adjust colorbar size by changing fraction and pad
+        plt.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
+        plt.title(f'Attention Map {i + 1}')
+        plt.xlabel('Decoder Timestep')
+        plt.ylabel('Encoder Timestep')
+        plt.close(fig)  # Close the figure to prevent it from displaying
+
+        # Log the figure to TensorBoard
+        logger.add_figure(f"{tag_prefix}/Soft Attention {i + 1}", fig, global_step=step)
+
+
 def log(
     logger, step=None, losses=None, fig=None, audio=None, sampling_rate=22050, tag=""
 ):
@@ -76,6 +109,7 @@ def log(
         logger.add_scalar("Loss/pitch_loss", losses[3], step)
         logger.add_scalar("Loss/energy_loss", losses[4], step)
         logger.add_scalar("Loss/duration_loss", losses[5], step)
+        logger.add_scalar("Loss/attention_loss", losses[6], step)
 
     if fig is not None:
         logger.add_figure(tag, fig)
@@ -85,6 +119,7 @@ def log(
             tag,
             audio / max(abs(audio)),
             sample_rate=sampling_rate,
+            global_step=step,
         )
 
 
@@ -113,15 +148,13 @@ def synth_one_sample(targets, predictions, vocoder, model_config, preprocess_con
     mel_len = predictions[9][0].item()
     mel_target = targets[6][0, :mel_len].detach().transpose(0, 1)
     mel_prediction = predictions[1][0, :mel_len].detach().transpose(0, 1)
-    duration = targets[11][0, :src_len].detach().cpu().numpy()
+    attn_soft = predictions[12].squeeze(1)
     if preprocess_config["preprocessing"]["pitch"]["feature"] == "phoneme_level":
         pitch = targets[9][0, :src_len].detach().cpu().numpy()
-        pitch = expand(pitch, duration)
     else:
         pitch = targets[9][0, :mel_len].detach().cpu().numpy()
     if preprocess_config["preprocessing"]["energy"]["feature"] == "phoneme_level":
         energy = targets[10][0, :src_len].detach().cpu().numpy()
-        energy = expand(energy, duration)
     else:
         energy = targets[10][0, :mel_len].detach().cpu().numpy()
 
@@ -158,7 +191,7 @@ def synth_one_sample(targets, predictions, vocoder, model_config, preprocess_con
     else:
         wav_reconstruction = wav_prediction = None
 
-    return fig, wav_reconstruction, wav_prediction, basename
+    return fig, wav_reconstruction, wav_prediction, basename, attn_soft
 
 
 def synth_samples(targets, predictions, vocoder, model_config, preprocess_config, path):
@@ -315,3 +348,36 @@ def pad(input_ele, mel_max_length=None):
         out_list.append(one_batch_padded)
     out_padded = torch.stack(out_list)
     return out_padded
+
+
+from text import _clean_text
+def preproc_text(in_txt, cleaners = ["english_cleaners2"]):
+    txt_ipa = _clean_text(in_txt, cleaners)
+    txt_arr = cleaned_text_to_sequence(txt_ipa, cleaners)
+    return txt_arr
+
+
+def fs2_infer(inmodel, text):
+    src_len = torch.from_numpy(np.array([text.shape[1]])).to(device)
+    text = torch.IntTensor(text).to(device)
+    predictions = inmodel.infer([0], text, src_len, src_len[0])
+    mel, mel_postnet = predictions[0], predictions[1]
+
+    mel_torch = mel.transpose(1, 2).detach()
+    mel_postnet_torch = mel_postnet.transpose(1, 2).detach()
+    mel = mel[0].cpu().transpose(0, 1).detach()
+    mel_postnet = mel_postnet[0].cpu().transpose(0, 1).detach()
+
+    return mel, mel_postnet, mel_torch, mel_postnet_torch
+
+
+def test_one_fs2(inmodel, invocoder, in_txt):
+    with torch.no_grad():
+        txt = preproc_text(in_txt)
+        # [text_len] => [1, text_len]
+
+        txt = np.expand_dims(txt, 0)
+        mel, mel_postnet, mel_torch, mel_postnet_torch = fs2_infer(inmodel, txt)
+
+        audio = invocoder.infer(mel_postnet_torch.to(device))
+    return audio
