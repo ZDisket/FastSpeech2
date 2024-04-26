@@ -6,6 +6,7 @@ import numpy as np
 
 import hifigan
 from model import FastSpeech2, ScheduledOptim
+from istftnetfe import ISTFTNetFE
 
 
 def get_model(args, configs, device, train=False):
@@ -67,6 +68,10 @@ def get_vocoder(config, device):
         vocoder.eval()
         vocoder.remove_weight_norm()
         vocoder.to(device)
+    elif name == "iSTFTNet":
+        vocoder = ISTFTNetFE(None, None)
+        vocoder.load_ts("istftnet/universal","cuda")
+
 
     return vocoder
 
@@ -78,6 +83,8 @@ def vocoder_infer(mels, vocoder, model_config, preprocess_config, lengths=None):
             wavs = vocoder.inverse(mels / np.log(10))
         elif name == "HiFi-GAN":
             wavs = vocoder(mels).squeeze(1)
+        elif name == "iSTFTNet":
+            wavs = vocoder(mels.float()).squeeze(1)
 
     wavs = (
         wavs.cpu().numpy()
