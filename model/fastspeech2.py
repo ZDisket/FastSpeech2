@@ -63,7 +63,8 @@ class FastSpeech2(nn.Module):
       text_mask = text_mask.permute(0, 2, 1) # [b, 1, mxlen] => [b, mxlen, 1]
       spect = spect.permute(0,2,1)  #[b, mel_len, channels] => [b, channels, mel_len]
       attn_soft, attn_logprob = self.aligner(
-          spect, text_emb, mask=text_mask == 0, attn_prior=attn_prior,conditioning=None
+                                # note: text_mask is MASK=TRUE, do NOT invert it!!!!
+          spect, text_emb, mask=text_mask, attn_prior=attn_prior,conditioning=None
       )
       attn_hard = binarize_attention_parallel(attn_soft, text_len, spect_len)
       attn_hard_dur = attn_hard.sum(2)

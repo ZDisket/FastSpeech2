@@ -166,6 +166,8 @@ def main(args, configs):
 
                     for i, sent in enumerate(test_sentences):
                         t_aud = test_one_fs2(model.module, vocoder, sent)
+                        if t_aud is None:
+                            continue
                         log(
                             val_logger,
                             step=step,
@@ -213,6 +215,11 @@ if __name__ == "__main__":
     parser.add_argument(
         "-t", "--train_config", type=str, required=True, help="path to train.yaml"
     )
+    parser.add_argument(
+        "-o", "--output_dir", type=str, required=False, help="output dir override", default=""
+    )
+
+
     args = parser.parse_args()
 
     # Read Config
@@ -221,6 +228,16 @@ if __name__ == "__main__":
     )
     model_config = yaml.load(open(args.model_config, "r"), Loader=yaml.FullLoader)
     train_config = yaml.load(open(args.train_config, "r"), Loader=yaml.FullLoader)
+
+    if len(args.output_dir):
+        train_config["path"]["ckpt_path"] = f"{args.output_dir}/ckpt"
+        train_config["path"]["log_path"] = f"{args.output_dir}"
+        train_config["path"]["result_path"] = f"{args.output_dir}/results"
+
+
     configs = (preprocess_config, model_config, train_config)
+
+
+
 
     main(args, configs)

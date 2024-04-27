@@ -377,7 +377,13 @@ def test_one_fs2(inmodel, invocoder, in_txt):
         # [text_len] => [1, text_len]
 
         txt = np.expand_dims(txt, 0)
-        mel, mel_postnet, mel_torch, mel_postnet_torch = fs2_infer(inmodel, txt)
+        try:
+            mel, mel_postnet, mel_torch, mel_postnet_torch = fs2_infer(inmodel, txt)
+        except RuntimeError:
+            print(f"Error inferring {txt}")
+            return None
+
+
 
         audio = invocoder.infer(mel_postnet_torch.to(device))
     return audio

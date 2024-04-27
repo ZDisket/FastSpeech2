@@ -22,9 +22,12 @@ def get_model(args, configs, device, train=False):
         model.load_state_dict(ckpt["model"])
 
     if train:
-        scheduled_optim = ScheduledOptim(
-            model, train_config, model_config, args.restore_step
-        )
+        scheduled_optim = torch.optim.AdamW(model.parameters(),
+                                            lr=0.001,
+                                            betas=train_config["optimizer"]["betas"],
+                                            eps=train_config["optimizer"]["eps"],
+                                            weight_decay=0.001,
+                                            )
         if args.restore_step:
             scheduled_optim.load_state_dict(ckpt["optimizer"])
         model.train()

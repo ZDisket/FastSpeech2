@@ -5,15 +5,23 @@ import numpy as np
 from torch.nn import functional as F
 
 class CharbonnierLoss(nn.Module):
-    """Charbonnier Loss (L1)"""
+    """Charbonnier Loss (L1) - generalized to handle tensors of arbitrary shapes."""
     def __init__(self, eps=1e-6):
         super(CharbonnierLoss, self).__init__()
         self.eps = eps
 
     def forward(self, x, y):
-        b, c, h = y.size()
-        loss = torch.sum(torch.sqrt((x - y).pow(2) + self.eps**2))
-        return loss/(c*b*h)
+        # Flatten the tensor dimensions except for the batch dimension
+        # to handle arbitrary tensor shapes.
+        if x.dim() > 1:
+            x = x.view(x.size(0), -1)
+        if y.dim() > 1:
+            y = y.view(y.size(0), -1)
+
+        # Calculate the Charbonnier loss
+        diff = x - y
+        loss = torch.sqrt(diff.pow(2) + self.eps**2).mean()  # Mean across all dimensions except batch
+        return loss
 
 
 class BinLoss(torch.nn.modules.loss._Loss):
@@ -217,6 +225,7 @@ class FastSpeech3Loss(nn.Module):
         src_masks = ~src_masks
         mel_masks = ~mel_masks
         log_duration_targets = torch.log(attn_hard_dur.float() + 1)
+
         mel_targets = mel_targets[:, : mel_masks.shape[1], :]
         mel_masks = mel_masks[:, :mel_masks.shape[1]]
 
@@ -239,8 +248,8 @@ class FastSpeech3Loss(nn.Module):
             energy_predictions = energy_predictions.masked_select(mel_masks)
             energy_targets = energy_targets.masked_select(mel_masks)
 
-        log_duration_predictions = log_duration_predictions.masked_select(src_masks)
-        log_duration_targets = log_duration_targets.masked_select(src_masks)
+       # log_duration_predictions = log_duration_predictions.masked_select(src_masks)
+        #log_duration_targets = log_duration_targets.masked_select(src_masks)
 
         mel_predictions = mel_predictions.masked_select(mel_masks.unsqueeze(-1))
         postnet_mel_predictions = postnet_mel_predictions.masked_select(
@@ -253,7 +262,13 @@ class FastSpeech3Loss(nn.Module):
 
         pitch_loss = self.mse_loss(pitch_predictions, pitch_targets)
         energy_loss = self.mse_loss(energy_predictions, energy_targets)
-        duration_loss = self.mse_loss(log_duration_predictions, log_duration_targets)
+
+       # duration_loss = self.mse_loss(log_duration_predictions, log_duration_targets)
+        duration_loss = self.charb_loss(
+            log_duration_predictions.masked_fill(~src_masks, 0),
+            log_duration_targets.masked_fill(~src_masks, 0)
+        )
+
 
         # sometimes (almost aways for some reason), output_lengths.max() == attn_logprob.size(2) + 1
         output_lengths = torch.clamp_max(output_lengths, attn_logprob.size(2))
