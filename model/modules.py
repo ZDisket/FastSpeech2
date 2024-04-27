@@ -10,7 +10,7 @@ import numpy as np
 import torch.nn.functional as F
 
 from utils.tools import get_mask_from_lengths, pad
-
+from .submodels import VariantDurationPredictor
 
 from typing import Optional, Tuple
 from numba import jit, prange
@@ -429,7 +429,12 @@ class VarianceAdaptor(nn.Module):
 
     def __init__(self, preprocess_config, model_config):
         super(VarianceAdaptor, self).__init__()
-        self.duration_predictor = VariancePredictor(model_config)
+        self.duration_predictor = VariantDurationPredictor(
+            text_channels=model_config["transformer"]["encoder_hidden"],
+            filter_channels=model_config["variance_predictor"]["filter_size"],
+            depth=4,
+            heads=2,
+        )
         self.length_regulator = LengthRegulator()
         self.pitch_predictor = VariancePredictor(model_config)
         self.energy_predictor = VariancePredictor(model_config)
@@ -513,6 +518,7 @@ class VarianceAdaptor(nn.Module):
         self,
         x,
         src_mask,
+        src_lens,
         mel_mask=None,
         max_len=None,
         pitch_target=None,
@@ -523,7 +529,7 @@ class VarianceAdaptor(nn.Module):
         d_control=1.0,
     ):
 
-        log_duration_prediction = self.duration_predictor(x, src_mask)
+        log_duration_prediction = self.duration_predictor(x, src_lens)
         if self.pitch_feature_level == "phoneme_level":
             pitch_prediction, pitch_embedding = self.get_pitch_embedding(
                 x, pitch_target, src_mask, p_control

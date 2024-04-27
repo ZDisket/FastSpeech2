@@ -128,3 +128,51 @@ class TransformerEncoder(nn.Module):
             x = layer(x, x, x, mask)  # Here x serves as query, key, and value
 
         return x
+
+
+class TransformerDecoderLayer(nn.Module):
+    def __init__(self, embed_size, heads, forward_expansion, dropout):
+        super(TransformerDecoderLayer, self).__init__()
+        self.norm1 = nn.LayerNorm(embed_size)
+        self.norm2 = nn.LayerNorm(embed_size)
+        self.norm3 = nn.LayerNorm(embed_size)
+
+        self.self_attention = MultiHeadAttention(embed_size, heads)
+        self.encoder_decoder_attention = MultiHeadAttention(embed_size, heads)  # Not used in isolation
+
+        self.feed_forward = nn.Sequential(
+            SwiGLUFFN(embed_size, forward_expansion * embed_size, embed_size),
+            nn.Dropout(dropout)
+        )
+
+        self.dropout = nn.Dropout(dropout)
+
+    def forward(self, x, value, key, src_mask, tgt_mask):
+        # Self-attention with look-ahead mask
+        x = self.self_attention(x, x, x, tgt_mask)
+        x = self.dropout(self.norm1(x))
+
+        # Encoder-decoder attention (if you have encoder context)
+        x = self.encoder_decoder_attention(x, key, value, src_mask)
+        x = self.dropout(self.norm2(x))
+
+        # Feed-forward network
+        x = self.feed_forward(x)
+        x = self.dropout(self.norm3(x))
+
+        return x
+
+
+class TransformerDecoder(nn.Module):
+    def __init__(self, embed_size, heads, num_layers, forward_expansion, dropout):
+        super(TransformerDecoder, self).__init__()
+        self.layers = nn.ModuleList([
+            TransformerDecoderLayer(embed_size, heads, forward_expansion, dropout)
+            for _ in range(num_layers)
+        ])
+
+    def forward(self, x, src_encodings, src_mask, tgt_mask):
+        for layer in self.layers:
+            x = layer(x, src_encodings, src_encodings, src_mask, tgt_mask)
+
+        return x
