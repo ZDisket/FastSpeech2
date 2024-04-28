@@ -65,9 +65,9 @@ def lens_to_sequence_mask(lens_unpacked, max_seq_len):
     Tensor: A binary mask of size (batch, 1, seq_len) where 1 indicates valid positions and 0 indicates padding.
     """
     batch_size = lens_unpacked.size(0)
-    mask = torch.arange(max_seq_len).expand(batch_size, max_seq_len) < lens_unpacked.unsqueeze(1)
+    mask = torch.arange(max_seq_len).to(lens_unpacked.device).expand(batch_size, max_seq_len) < lens_unpacked.unsqueeze(1)
     mask = mask.unsqueeze(1).float()  # Add channel dimension and convert to float
-    return mask
+    return mask.to(lens_unpacked.device)
 
 
 def pad_to_original_length(lstm_output, original_seq_len, current_seq_len):
@@ -134,9 +134,11 @@ class VariantDurationPredictor(nn.Module):
             self.pre_proj = nn.Conv1d(text_channels, filter_channels, 1)
             self.use_pre_proj = True
 
-    # x = Encoder hidden states size (batch, text_channels, seq_len)
+    # x = Encoder hidden states size (batch, seq_len, text_channels)
     # x_lengths = Lengths of x size (batch_size,)
     def forward(self, x, x_lengths):
+        x = x.transpose(1,2) # (batch, seq_len, text_channels) => (batch, text_channels, seq_len)
+
         x_mask = lens_to_sequence_mask(x_lengths, x.size(2))
         if self.use_pre_proj:
             x = self.pre_proj(x)
@@ -194,5 +196,7 @@ class VariantDurationPredictor(nn.Module):
         log_durations = self.out_proj(x)
 
         log_durations *= x_mask
+
+        log_durations = log_durations.squeeze(1) # (batch, 1, seq_len) => (batch, seq_len)
 
         return log_durations, x_mask

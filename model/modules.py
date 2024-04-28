@@ -18,34 +18,12 @@ from numba import jit, prange
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 
-class SwiGLUFFN(nn.Module):
-    def __init__(
-            self,
-            in_features,
-            hidden_features=None,
-            out_features=None,
-            act_layer=None,
-            drop=0.0,
-            bias=True,
-    ):
-        super().__init__()
-        out_features = out_features or in_features
-        hidden_features = hidden_features or in_features
-        self.w12 = nn.Linear(in_features, 2 * hidden_features, bias=bias)
-        self.w3 = nn.Linear(hidden_features, out_features, bias=bias)
-
-    def forward(self, x):
-        x12 = self.w12(x)
-        x1, x2 = x12.chunk(2, dim=-1)
-        hidden = F.silu(x1) * x2
-        return self.w3(hidden)
-
-
 def sequence_mask(length, max_length=None):
-  if max_length is None:
-    max_length = length.max()
-  x = torch.arange(max_length, dtype=length.dtype, device=length.device)
-  return x.unsqueeze(0) < length.unsqueeze(1)
+    if max_length is None:
+        max_length = length.max()
+    x = torch.arange(max_length, dtype=length.dtype, device=length.device)
+    return x.unsqueeze(0) < length.unsqueeze(1)
+
 
 @jit(nopython=True)
 def mas_width1(attn_map):
@@ -99,7 +77,6 @@ def binarize_attention_parallel(attn, in_lens, out_lens):
         attn_cpu = attn.data.cpu().numpy()
         attn_out = b_mas(attn_cpu, in_lens.cpu().numpy(), out_lens.cpu().numpy(), width=1)
     return torch.from_numpy(attn_out).to(attn.device)
-
 
 
 class PartialConv1d(torch.nn.Conv1d):
@@ -194,20 +171,22 @@ class PartialConv1d(torch.nn.Conv1d):
             if mask_in is not None:
                 input = torch.mul(input, mask_in)
             return self._conv_forward(input, self.weight, self.bias)
+
+
 class ConvNorm(torch.nn.Module):
     def __init__(
-        self,
-        in_channels,
-        out_channels,
-        kernel_size=1,
-        stride=1,
-        padding=None,
-        dilation=1,
-        bias=True,
-        w_init_gain='linear',
-        use_partial_padding: bool = False,
-        use_weight_norm: bool = False,
-        norm_fn=None,
+            self,
+            in_channels,
+            out_channels,
+            kernel_size=1,
+            stride=1,
+            padding=None,
+            dilation=1,
+            bias=True,
+            w_init_gain='linear',
+            use_partial_padding: bool = False,
+            use_weight_norm: bool = False,
+            norm_fn=None,
     ):
         super(ConvNorm, self).__init__()
         if padding is None:
@@ -239,6 +218,7 @@ class ConvNorm(torch.nn.Module):
             ret = self.norm(ret)
         return ret
 
+
 class SafeSoftmax(nn.Module):
     def __init__(self, dim=-1):
         super(SafeSoftmax, self).__init__()
@@ -248,7 +228,8 @@ class SafeSoftmax(nn.Module):
         # Handle inf by replacing them with very large finite numbers
         large_value = torch.finfo(x.dtype).max
         x_replaced = torch.where(x == float('inf'), torch.tensor(large_value, dtype=x.dtype, device=x.device), x)
-        x_replaced = torch.where(x == float('-inf'), torch.tensor(-large_value, dtype=x.dtype, device=x.device), x_replaced)
+        x_replaced = torch.where(x == float('-inf'), torch.tensor(-large_value, dtype=x.dtype, device=x.device),
+                                 x_replaced)
 
         # Subtract the max value for numerical stability
         x_stable = x_replaced - torch.max(x_replaced, dim=self.dim, keepdim=True).values
@@ -264,17 +245,19 @@ class SafeLogSoftmax(nn.Module):
         # Handle inf by replacing them with very large finite numbers
         large_value = torch.finfo(x.dtype).max
         x_replaced = torch.where(x == float('inf'), torch.tensor(large_value, dtype=x.dtype, device=x.device), x)
-        x_replaced = torch.where(x == float('-inf'), torch.tensor(-large_value, dtype=x.dtype, device=x.device), x_replaced)
+        x_replaced = torch.where(x == float('-inf'), torch.tensor(-large_value, dtype=x.dtype, device=x.device),
+                                 x_replaced)
 
         # Subtract the max value for numerical stability
         x_stable = x_replaced - torch.max(x_replaced, dim=self.dim, keepdim=True).values
         return F.log_softmax(x_stable, self.dim)
 
+
 class AlignmentEncoder(torch.nn.Module):
     """Module for alignment text and mel spectrogram. """
 
     def __init__(
-        self, n_mel_channels=80, n_text_channels=512, n_att_channels=80, temperature=0.0005,
+            self, n_mel_channels=80, n_text_channels=512, n_att_channels=80, temperature=0.0005,
     ):
         super().__init__()
         self.temperature = temperature
@@ -417,8 +400,8 @@ class AlignmentEncoder(torch.nn.Module):
 
         attn_logprob = attn.clone()
 
-        if mask is not None:   # Original aligner uses -inf for the masked fill, but here we use -1e4 for stability during fp16 training.
-            attn.data.masked_fill_(mask.permute(0, 2, 1).unsqueeze(2),  float('-1e4'))
+        if mask is not None:  # Original aligner uses -inf for the masked fill, but here we use -1e4 for stability during fp16 training.
+            attn.data.masked_fill_(mask.permute(0, 2, 1).unsqueeze(2), float('-1e4'))
 
         attn = self.softmax(attn)  # softmax along T2
         return attn, attn_logprob
@@ -454,7 +437,7 @@ class VarianceAdaptor(nn.Module):
         assert pitch_quantization in ["linear", "log"]
         assert energy_quantization in ["linear", "log"]
         with open(
-            os.path.join(preprocess_config["path"]["preprocessed_path"], "stats.json")
+                os.path.join(preprocess_config["path"]["preprocessed_path"], "stats.json")
         ) as f:
             stats = json.load(f)
             pitch_min, pitch_max = stats["pitch"][:2]
@@ -515,21 +498,22 @@ class VarianceAdaptor(nn.Module):
         return prediction, embedding
 
     def forward(
-        self,
-        x,
-        src_mask,
-        src_lens,
-        mel_mask=None,
-        max_len=None,
-        pitch_target=None,
-        energy_target=None,
-        duration_target=None,
-        p_control=1.0,
-        e_control=1.0,
-        d_control=1.0,
+            self,
+            x,
+            src_mask,
+            src_lens,
+            mel_mask=None,
+            max_len=None,
+            pitch_target=None,
+            energy_target=None,
+            duration_target=None,
+            p_control=1.0,
+            e_control=1.0,
+            d_control=1.0,
     ):
+        log_duration_prediction, x_mask = self.duration_predictor(x, src_lens)
 
-        log_duration_prediction = self.duration_predictor(x, src_lens)
+
         if self.pitch_feature_level == "phoneme_level":
             pitch_prediction, pitch_embedding = self.get_pitch_embedding(
                 x, pitch_target, src_mask, p_control
@@ -672,15 +656,15 @@ class Conv(nn.Module):
     """
 
     def __init__(
-        self,
-        in_channels,
-        out_channels,
-        kernel_size=1,
-        stride=1,
-        padding=0,
-        dilation=1,
-        bias=True,
-        w_init="linear",
+            self,
+            in_channels,
+            out_channels,
+            kernel_size=1,
+            stride=1,
+            padding=0,
+            dilation=1,
+            bias=True,
+            w_init="linear",
     ):
         """
         :param in_channels: dimension of input
