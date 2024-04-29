@@ -1,6 +1,6 @@
 import torch
 import torch.nn as nn
-from .attentions import TransformerEncoder, TransformerDecoder
+from .attentions import TransformerEncoder, TransformerDecoder, TemporalConvNet
 from torch.nn.utils.rnn import pack_padded_sequence, pad_packed_sequence
 import torch.nn.functional as F
 
@@ -215,4 +215,47 @@ class VariantDurationPredictor(nn.Module):
         return log_durations, x_mask
 
 
-    
+# VariancePredictor but using TCNs for cheaper-than-RNN temporal dependencies.
+class TemporalVariancePredictor(nn.Module):
+
+    def __init__(self, input_channels, num_channels, kernel_size=2, dropout=0.2):
+        super(TemporalVariancePredictor, self).__init__()
+        # Temporal Convolutional Network
+        self.tcn = TemporalConvNet(input_channels, num_channels, kernel_size=kernel_size, dropout=dropout)
+
+        self.output_layer = nn.Linear(num_channels[-1], 1)
+
+        # Initialize weights
+        self.init_weights()
+
+    def init_weights(self):
+        initrange = 0.1
+        for m in self.modules():
+            if isinstance(m, nn.Conv1d):
+                nn.init.uniform_(m.weight, -initrange, initrange)
+                if m.bias is not None:
+                    nn.init.constant_(m.bias, 0)
+            elif isinstance(m, nn.Linear):
+                nn.init.uniform_(m.weight, -initrange, initrange)
+                nn.init.constant_(m.bias, 0)
+
+    def forward(self, x, x_mask):
+        # Pass input through the TCN
+        x = x.transpose(1, 2)  #  (batch, seq_len, channels) => (batch, channels, seq_len)
+        x_mask = x_mask.unsqueeze(1) # (batch, seq_len) => (batch, 1, seq_len)
+
+        x = self.tcn(x)  # x = (batch, channels, seq_len)
+
+        if x_mask is not None:
+          x = x.masked_fill(x_mask, 0.0)
+
+        # linear pass
+        x = x.transpose(1, 2)  # x = (batch, seq_len, channels)
+
+        # output
+        x = self.output_layer(x)  # x = (batch, seq_len, 1)
+
+        # squeeze 4 output
+        x = x.squeeze(-1)  # (batch, seq_len, 1) => (batch, seq_len)
+
+        return x

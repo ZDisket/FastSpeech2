@@ -10,7 +10,7 @@ import numpy as np
 import torch.nn.functional as F
 
 from utils.tools import get_mask_from_lengths, pad
-from .submodels import VariantDurationPredictor
+from .submodels import VariantDurationPredictor, TemporalVariancePredictor
 
 from typing import Optional, Tuple
 from numba import jit, prange
@@ -419,8 +419,18 @@ class VarianceAdaptor(nn.Module):
             heads=2,
         )
         self.length_regulator = LengthRegulator()
-        self.pitch_predictor = VariancePredictor(model_config)
-        self.energy_predictor = VariancePredictor(model_config)
+        self.pitch_predictor = TemporalVariancePredictor(
+            input_channels=model_config["transformer"]["encoder_hidden"],
+            num_channels=[model_config["variance_predictor"]["filter_size"]] * 2,
+            kernel_size=2,
+            dropout=0.15,
+        )
+        self.energy_predictor = TemporalVariancePredictor(
+            input_channels=model_config["transformer"]["encoder_hidden"],
+            num_channels=[model_config["variance_predictor"]["filter_size"]] * 2,
+            kernel_size=2,
+            dropout=0.15,
+        )
 
         self.pitch_feature_level = preprocess_config["preprocessing"]["pitch"][
             "feature"
