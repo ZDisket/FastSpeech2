@@ -58,6 +58,54 @@ class MultiHeadAttention(nn.Module):
         return output, attn
 
 
+
+class SwiGLUConvFFN(nn.Module):
+    """ A two-layer module with SwiGLU activation in a position-wise manner using convolutional layers """
+
+    def __init__(self, d_in, d_hid, kernel_size, dropout=0.1):
+        super(SwiGLUConvFFN, self).__init__()
+
+        # First convolution expands the channel dimension and prepares for gating
+        self.conv1 = nn.Conv1d(
+            d_in,
+            2 * d_hid,  # Doubling for gating purposes
+            kernel_size=kernel_size[0],
+            padding=(kernel_size[0] - 1) // 2,
+        )
+
+        # Second convolution brings the channel dimension back to the original
+        self.conv2 = nn.Conv1d(
+            d_hid,
+            d_in,
+            kernel_size=kernel_size[1],
+            padding=(kernel_size[1] - 1) // 2,
+        )
+
+        self.layer_norm = nn.LayerNorm(d_in)
+        self.dropout = nn.Dropout(dropout)
+
+    def forward(self, x):
+        residual = x  # Save for the residual connection
+        x = x.transpose(1, 2)  # (Batch, Channels, Seq_Length) for convolution
+
+        # Apply first convolution and split for gating
+        x = self.conv1(x)
+        x1, x2 = x.chunk(2, dim=1)  # Split along the channel dimension for gating
+        x = F.silu(x1) * x2  # Apply SwiGLU activation
+
+        # Apply second convolution
+        x = self.conv2(x)
+
+        # Restore shape to (Batch, Seq_Length, Channels)
+        x = x.transpose(1, 2)
+
+        # Apply dropout, residual connection, and layer normalization
+        x = self.dropout(x)
+        x = self.layer_norm(x + residual)
+
+        return x
+
+
 class PositionwiseFeedForward(nn.Module):
     """ A two-feed-forward-layer module """
 

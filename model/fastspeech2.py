@@ -32,11 +32,11 @@ class FastSpeech2(nn.Module):
             1.25
         )
         self.variance_adaptor = VarianceAdaptor(preprocess_config, model_config)
-        self.decoder = SpectrogramDecoder(model_config["transformer"]["decoder_hidden"],
-                                          preprocess_config["preprocessing"]["mel"]["n_mel_channels"],
-                                          model_config["transformer"]["decoder_layer"],
-                                          model_config["transformer"]["decoder_head"],
-                                          model_config["transformer"]["decoder_dropout"])
+        self.decoder = Decoder(model_config)
+        self.mel_linear = nn.Linear(
+            model_config["transformer"]["decoder_hidden"],
+            preprocess_config["preprocessing"]["mel"]["n_mel_channels"],
+        )
 
         self.postnet = PostNet(n_mel_channels=preprocess_config["preprocessing"]["mel"]["n_mel_channels"])
 
@@ -133,6 +133,7 @@ class FastSpeech2(nn.Module):
         )
 
         output, mel_masks = self.decoder(output, mel_masks)
+        output = self.mel_linear(output)
 
         postnet_output = self.postnet(output) + output
 
@@ -200,6 +201,7 @@ class FastSpeech2(nn.Module):
 
 
         output, mel_masks = self.decoder(output, mel_masks)
+        output = self.mel_linear(output)
 
         postnet_output = self.postnet(output) + output
 
