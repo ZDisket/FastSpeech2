@@ -4,6 +4,54 @@ import torch.nn.functional as F
 from torch.nn.utils import weight_norm
 
 
+
+class SwiGLUConvFFN(nn.Module):
+    """ A two-layer module with SwiGLU activation in a position-wise manner using convolutional layers """
+
+    def __init__(self, d_in, d_hid, kernel_size, dropout=0.1):
+        super(SwiGLUConvFFN, self).__init__()
+
+        # First convolution expands the channel dimension and prepares for gating
+        self.conv1 = nn.Conv1d(
+            d_in,
+            2 * d_hid,  # Doubling for gating purposes
+            kernel_size=kernel_size[0],
+            padding=(kernel_size[0] - 1) // 2,
+        )
+
+        # Second convolution brings the channel dimension back to the original
+        self.conv2 = nn.Conv1d(
+            d_hid,
+            d_in,
+            kernel_size=kernel_size[1],
+            padding=(kernel_size[1] - 1) // 2,
+        )
+
+        self.layer_norm = nn.LayerNorm(d_in)
+        self.dropout = nn.Dropout(dropout)
+
+    def forward(self, x):
+        residual = x  # Save for the residual connection
+        x = x.transpose(1, 2)  # (Batch, Channels, Seq_Length) for convolution
+
+        # Apply first convolution and split for gating
+        x = self.conv1(x)
+        x1, x2 = x.chunk(2, dim=1)  # Split along the channel dimension for gating
+        x = F.silu(x1) * x2  # Apply SwiGLU activation
+
+        # Apply second convolution
+        x = self.conv2(x)
+
+        # Restore shape to (Batch, Seq_Length, Channels)
+        x = x.transpose(1, 2)
+
+        # Apply dropout, residual connection, and layer normalization
+        x = self.dropout(x)
+        x = self.layer_norm(x + residual)
+
+        return x
+
+
 class SwiGLUFFN(nn.Module):
     def __init__(
             self,
@@ -153,7 +201,7 @@ class TransformerEncoder(nn.Module):
 
 
 class TransformerDecoderLayer(nn.Module):
-    def __init__(self, embed_size, heads, forward_expansion, dropout, alibi_alpha, start_i_index):
+    def __init__(self, embed_size, heads, forward_expansion, dropout, alibi_alpha, start_i_index, mode="linear", kernel_sizes=[2, 2]):
         super(TransformerDecoderLayer, self).__init__()
         self.norm1 = nn.LayerNorm(embed_size)
         self.norm2 = nn.LayerNorm(embed_size)
@@ -162,10 +210,15 @@ class TransformerDecoderLayer(nn.Module):
         self.self_attention = MultiHeadAttention(embed_size, heads, alibi_alpha, start_i_index)
         self.encoder_decoder_attention = MultiHeadAttention(embed_size, heads, alibi_alpha, start_i_index)  # Not used in isolation
 
-        self.feed_forward = nn.Sequential(
-            SwiGLUFFN(embed_size, forward_expansion * embed_size, embed_size),
-            nn.Dropout(dropout)
-        )
+        if mode == "linear":
+            self.feed_forward = nn.Sequential(
+                SwiGLUFFN(embed_size, forward_expansion * embed_size, embed_size),
+                nn.Dropout(dropout)
+            )
+        elif mode == "conv":
+            self.feed_forward = SwiGLUConvFFN(embed_size, forward_expansion * embed_size, kernel_sizes, dropout) #SwiGLUConvFFN already integrates dropout
+        else:
+            raise TypeError(f"Invalid FFN type for TransformerDecoderLayer: {mode}. Valid are linear and conv")
 
         self.dropout = nn.Dropout(dropout)
 
@@ -186,10 +239,11 @@ class TransformerDecoderLayer(nn.Module):
 
 
 class TransformerDecoder(nn.Module):
-    def __init__(self, embed_size, heads, num_layers, forward_expansion, dropout, alibi_alpha):
+    def __init__(self, embed_size, heads, num_layers, forward_expansion, dropout, alibi_alpha, mode="linear", kernel_sizes=[2, 2]):
         super(TransformerDecoder, self).__init__()
+
         self.layers = nn.ModuleList([
-            TransformerDecoderLayer(embed_size, heads, forward_expansion, dropout, alibi_alpha, i)
+            TransformerDecoderLayer(embed_size, heads, forward_expansion, dropout, alibi_alpha, i, mode, kernel_sizes)
             for i in range(num_layers)
         ])
 

@@ -265,7 +265,8 @@ class TemporalVariancePredictor(nn.Module):
 
 
 class SpectrogramDecoder(nn.Module):
-    def __init__(self, input_size, filter_channels, mel_channels, depth, heads, dropout=0.1, alibi_alpha=1.0, forward_expansion=3):
+    def __init__(self, input_size, filter_channels, mel_channels, depth, heads, kernel_sizes, dropout=0.1,
+                 alibi_alpha=1.0, forward_expansion=3):
         super(SpectrogramDecoder, self).__init__()
 
         self.input_size = input_size
@@ -275,8 +276,9 @@ class SpectrogramDecoder(nn.Module):
             self.pre_fc = nn.Linear(input_size, filter_channels)
 
         self.dec = TransformerDecoder(filter_channels,
-                                          heads=heads, num_layers=depth,
-                                          forward_expansion=forward_expansion, dropout=dropout, alibi_alpha=alibi_alpha)
+                                      heads=heads, num_layers=depth,
+                                      forward_expansion=forward_expansion, dropout=dropout, alibi_alpha=alibi_alpha,
+                                      mode="conv", kernel_sizes=kernel_sizes)
 
         self.mel_fc = nn.Linear(filter_channels, mel_channels)
 
@@ -299,7 +301,7 @@ class SpectrogramDecoder(nn.Module):
             x = self.pre_fc(x)
 
         x = self.dec(x, x, src_mask,
-                         tgt_mask)
+                     tgt_mask)
 
         x = self.mel_fc(x)
 

@@ -5,7 +5,9 @@ import torch.nn as nn
 import numpy as np
 from torch.nn import functional as F
 
-from .SubLayers import MultiHeadAttention, SwiGLUConvFFN
+from .SubLayers import MultiHeadAttention
+from model.attentions import SwiGLUConvFFN
+
 from model.attentions import SwiGLUFFN
 
 class FFTBlock(torch.nn.Module):
@@ -14,7 +16,6 @@ class FFTBlock(torch.nn.Module):
     def __init__(self, d_model, n_head, d_k, d_v, d_inner, kernel_size, dropout=0.1):
         super(FFTBlock, self).__init__()
         self.slf_attn = MultiHeadAttention(n_head, d_model, d_k, d_v, dropout=dropout)
-        #self.pos_ffn = SwiGLUFFN(d_model, d_inner, d_model)
         self.pos_ffn = SwiGLUConvFFN(
             d_model, d_inner, kernel_size, dropout=dropout
         )
