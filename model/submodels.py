@@ -119,7 +119,7 @@ class VariantDurationPredictor(nn.Module):
         self.pre_convs = SConvNorm(filter_channels, num_layers=conv_depth)
 
         self.decoder = TransformerDecoder(embed_size=filter_channels, heads=heads, num_layers=depth,
-                                          forward_expansion=4, dropout=p_dropout)
+                                          forward_expansion=4, dropout=p_dropout, alibi_alpha=1.5)
 
         self.pre_lstm_norm = nn.LayerNorm(filter_channels)
 
@@ -241,13 +241,13 @@ class TemporalVariancePredictor(nn.Module):
 
     def forward(self, x, x_mask):
         # Pass input through the TCN
-        x = x.transpose(1, 2)  #  (batch, seq_len, channels) => (batch, channels, seq_len)
-        x_mask = x_mask.unsqueeze(1) # (batch, seq_len) => (batch, 1, seq_len)
+        x = x.transpose(1, 2)  # (batch, seq_len, channels) => (batch, channels, seq_len)
+        x_mask = x_mask.unsqueeze(1)  # (batch, seq_len) => (batch, 1, seq_len)
 
         x = self.tcn(x)  # x = (batch, channels, seq_len)
 
         if x_mask is not None:
-          x = x.masked_fill(x_mask, 0.0)
+            x = x.masked_fill(x_mask, 0.0)
 
         # linear pass
         x = x.transpose(1, 2)  # x = (batch, seq_len, channels)
@@ -258,4 +258,40 @@ class TemporalVariancePredictor(nn.Module):
         # squeeze 4 output
         x = x.squeeze(-1)  # (batch, seq_len, 1) => (batch, seq_len)
 
+        if x_mask is not None:  # x_mask: (batch, 1, seq_len) => (batch, seq_len)
+            x = x.masked_fill(x_mask.squeeze(1), 0.0)
+
         return x
+
+
+class SpectrogramDecoder(nn.Module):
+    def __init__(self, input_size, mel_channels, depth, heads, dropout=0.1, alibi_alpha=1.0):
+        super(SpectrogramDecoder, self).__init__()
+
+        self.dec = TransformerDecoder(input_size,
+                                          heads=heads, num_layers=depth,
+                                          forward_expansion=4, dropout=dropout, alibi_alpha=alibi_alpha)
+
+        self.mel_fc = nn.Linear(input_size, mel_channels)
+
+    # x_mask : True=exclude mask size (batch, mel_lens)
+    # x: (batch, mel_lens, channels)
+    def forward(self, x, x_mask):
+
+        orig_mask = x_mask.clone()
+
+        # (batch, mel_lens) -> (batch, 1, mel_lens)
+        x_mask = x_mask.unsqueeze(1)
+        # True=exclude => True=Include
+        x_mask = ~x_mask
+
+        src_mask, tgt_mask = generate_masks_from_float_mask(x_mask)
+
+        # Decoder pass
+
+        x = self.dec(x, x, src_mask,
+                         tgt_mask)
+
+        x = self.mel_fc(x)
+
+        return x, orig_mask

@@ -8,7 +8,7 @@ import torch.nn.functional as F
 from transformer import Encoder, Decoder, PostNet
 from .modules import VarianceAdaptor,  AlignmentEncoder, sequence_mask, binarize_attention_parallel
 from utils.tools import get_mask_from_lengths
-from .submodels import TextEncoder
+from .submodels import TextEncoder, SpectrogramDecoder
 from text.symbols import symbols
 
 
@@ -32,11 +32,12 @@ class FastSpeech2(nn.Module):
             1.25
         )
         self.variance_adaptor = VarianceAdaptor(preprocess_config, model_config)
-        self.decoder = Decoder(model_config)
-        self.mel_linear = nn.Linear(
-            model_config["transformer"]["decoder_hidden"],
-            preprocess_config["preprocessing"]["mel"]["n_mel_channels"],
-        )
+        self.decoder = SpectrogramDecoder(model_config["transformer"]["decoder_hidden"],
+                                          preprocess_config["preprocessing"]["mel"]["n_mel_channels"],
+                                          model_config["transformer"]["decoder_layer"],
+                                          model_config["transformer"]["decoder_head"],
+                                          model_config["transformer"]["decoder_dropout"])
+
         self.postnet = PostNet(n_mel_channels=preprocess_config["preprocessing"]["mel"]["n_mel_channels"])
 
         self.aligner = AlignmentEncoder(n_mel_channels=preprocess_config["preprocessing"]["mel"]["n_mel_channels"],
@@ -132,7 +133,6 @@ class FastSpeech2(nn.Module):
         )
 
         output, mel_masks = self.decoder(output, mel_masks)
-        output = self.mel_linear(output)
 
         postnet_output = self.postnet(output) + output
 
@@ -198,8 +198,8 @@ class FastSpeech2(nn.Module):
             d_control,
         )
 
+
         output, mel_masks = self.decoder(output, mel_masks)
-        output = self.mel_linear(output)
 
         postnet_output = self.postnet(output) + output
 
