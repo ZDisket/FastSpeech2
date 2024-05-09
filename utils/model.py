@@ -23,7 +23,7 @@ def get_model(args, configs, device, train=False):
 
     if train:
         scheduled_optim = torch.optim.AdamW(model.parameters(),
-                                            lr=0.0002,
+                                            lr=train_config["optimizer"]["init_lr"],
                                             betas=train_config["optimizer"]["betas"],
                                             eps=train_config["optimizer"]["eps"],
                                             weight_decay=0.001,

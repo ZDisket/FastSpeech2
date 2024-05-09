@@ -417,19 +417,23 @@ class VarianceAdaptor(nn.Module):
             filter_channels=model_config["variance_predictor"]["filter_size"],
             depth=4,
             heads=2,
+            p_dropout=model_config["transformer"]["decoder_dropout"],
+            final_dropout=model_config["variance_predictor"]["dropout"],
+            kernel_size=model_config["variance_predictor"]["kernel_size"],
+            conv_depth=0,
         )
         self.length_regulator = LengthRegulator()
         self.pitch_predictor = TemporalVariancePredictor(
             input_channels=model_config["transformer"]["encoder_hidden"],
             num_channels=[model_config["variance_predictor"]["filter_size"]] * 2,
-            kernel_size=2,
-            dropout=0.15,
+            kernel_size=model_config["variance_predictor"]["kernel_size"],
+            dropout=model_config["variance_predictor"]["dropout"],
         )
         self.energy_predictor = TemporalVariancePredictor(
             input_channels=model_config["transformer"]["encoder_hidden"],
             num_channels=[model_config["variance_predictor"]["filter_size"]] * 2,
-            kernel_size=2,
-            dropout=0.15,
+            kernel_size=model_config["variance_predictor"]["kernel_size"],
+            dropout=model_config["variance_predictor"]["dropout"],
         )
 
         self.pitch_feature_level = preprocess_config["preprocessing"]["pitch"][

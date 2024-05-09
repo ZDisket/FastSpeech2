@@ -1,3 +1,6 @@
+ckpt/*
+ckpt2/*
+ckpt3/*
 .idea/*
 *.wav
 istftnet/*

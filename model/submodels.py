@@ -5,6 +5,28 @@ from torch.nn.utils.rnn import pack_padded_sequence, pad_packed_sequence
 import torch.nn.functional as F
 
 
+class StochasticDropout(nn.Module):
+    """
+    Also known as Monte Carlo dropout, StochasticDropout keeps a lower dropout rate to apply during inference, for stochasticity.
+    If not specified, it will be dropout / 3, with the minimum being 0.1
+    """
+    def __init__(self, p=0.5, p_inference=None, min_p_inference=0.1):
+        super(StochasticDropout, self).__init__()
+        self.p = p  # Dropout probability during training
+
+        if p_inference is None:
+            p_inference = max(min_p_inference, p / 3) # ensure stochastic dropout is at least 0.1
+
+        self.p_inference = p_inference  # Dropout probability during inference
+
+    def forward(self, x):
+        if self.training:
+            return F.dropout(x, self.p, self.training)
+        else:
+            return F.dropout(x, self.p, self.training)
+
+
+
 class TextEncoder(nn.Module):
     def __init__(self, vocab_size, embed_size, num_heads, num_layers, forward_expansion, dropout, alibi_alpha=1.0):
         super(TextEncoder, self).__init__()
@@ -12,7 +34,7 @@ class TextEncoder(nn.Module):
         self.emb_norm = nn.LayerNorm(embed_size)
         self.encoder = TransformerEncoder(embed_size, num_heads, num_layers, forward_expansion, dropout,
                                           alibi_alpha=alibi_alpha)
-        self.dropout = nn.Dropout(dropout)
+        self.dropout = StochasticDropout(dropout)
         self.layer_norm = nn.LayerNorm(embed_size)
 
     def forward(self, token_ids, seq_lens):
@@ -36,12 +58,13 @@ class TextEncoder(nn.Module):
 
 
 class SConvNorm(nn.Module):
-    def __init__(self, channels, num_layers=2, kernel_size=3):
+    def __init__(self, channels, num_layers=2, kernel_size=3, p_dropout=0.1):
         super(SConvNorm, self).__init__()
         self.conv_layers = nn.ModuleList([
             nn.Sequential(
                 nn.Conv1d(channels, channels, kernel_size, padding=kernel_size // 2),
                 nn.BatchNorm1d(channels),
+                nn.Dropout(p_dropout),
                 nn.ReLU()
             ) for _ in range(num_layers)
         ])
@@ -108,7 +131,7 @@ def generate_masks_from_float_mask(float_mask):
 
 
 class VariantDurationPredictor(nn.Module):
-    def __init__(self, text_channels, filter_channels=512, depth=4, heads=4, kernel_size=3, p_dropout=0.1,
+    def __init__(self, text_channels, filter_channels=512, depth=4, heads=4, kernel_size=3, p_dropout=0.2,
                  final_dropout=0.2, conv_depth=2, lstm_bidirectional=True):
         super(VariantDurationPredictor, self).__init__()
 
@@ -116,10 +139,19 @@ class VariantDurationPredictor(nn.Module):
         self.use_dual_proj = False
         self.lstm_bidirectional = lstm_bidirectional
 
-        self.pre_convs = SConvNorm(filter_channels, num_layers=conv_depth)
+
+
+        if conv_depth > 0:
+            self.pre_convs = SConvNorm(filter_channels, num_layers=conv_depth, kernel_size=kernel_size)
+            self.post_conv_drop = StochasticDropout(p_dropout)
+        else:
+            print("Not using pre convs")
+            self.pre_convs = nn.Identity()
+            self.post_conv_drop = nn.Identity()
+
 
         self.decoder = TransformerDecoder(embed_size=filter_channels, heads=heads, num_layers=depth,
-                                          forward_expansion=4, dropout=p_dropout, alibi_alpha=1.5)
+                                          forward_expansion=4, dropout=p_dropout, alibi_alpha=1.5, mode="conv", kernel_size=3)
 
         self.pre_lstm_norm = nn.LayerNorm(filter_channels)
 
@@ -136,7 +168,7 @@ class VariantDurationPredictor(nn.Module):
 
         self.out_proj = nn.Conv1d(in_channels=lstm_channels, out_channels=1, kernel_size=1)
 
-        self.final_dropout = final_dropout
+        self.final_dropout = StochasticDropout(final_dropout)
         self.use_pre_proj = False
 
         if text_channels != filter_channels:
@@ -153,10 +185,10 @@ class VariantDurationPredictor(nn.Module):
             x = self.pre_proj(x)
 
         x = self.pre_convs(x)  # x = (b, channels, seq_len)
+        x = self.post_conv_drop(x)
+
         # Apply mask after convolutions
         x = x * x_mask
-
-        x = F.dropout(x, self.final_dropout, training=True)
 
         # Perform transformer stuff
 
@@ -173,7 +205,7 @@ class VariantDurationPredictor(nn.Module):
         # Residual connection.
         x = self.pre_lstm_norm(x + x_dec)
         # Apply dropout even in inference
-        x = F.dropout(x, self.final_dropout, training=True)
+        x = self.final_dropout(x)
 
         # LSTM Portion
         # input must be (batch, seq_len, channels)
@@ -194,7 +226,7 @@ class VariantDurationPredictor(nn.Module):
 
         # Unpack the sequence
         x, lens_unpacked = pad_packed_sequence(x, batch_first=True)  # x_lstm:  (batch, seq_len, lstm_channels)
-        x = F.dropout(x, self.final_dropout, training=True)
+        x = self.final_dropout(x)
         # pad back to pre-LSTM seq_len
         x = pad_to_original_length(x, x_seq_len_orig, x.size(1))
 
@@ -203,7 +235,7 @@ class VariantDurationPredictor(nn.Module):
 
         # Transpose dimensions for the post-convolution
         x = x.transpose(1, 2)  # (b, seq_len, channels) -> (b, channels, seq_len)
-        x = F.dropout(x, self.final_dropout, training=True)
+        x = self.final_dropout(x)
 
         # Project using 1D convolution
         log_durations = self.out_proj(x)
@@ -222,6 +254,7 @@ class TemporalVariancePredictor(nn.Module):
         super(TemporalVariancePredictor, self).__init__()
         # Temporal Convolutional Network
         self.tcn = TemporalConvNet(input_channels, num_channels, kernel_size=kernel_size, dropout=dropout)
+        self.final_drop = StochasticDropout(dropout)
 
         self.output_layer = nn.Linear(num_channels[-1], 1)
 
@@ -251,6 +284,8 @@ class TemporalVariancePredictor(nn.Module):
 
         # linear pass
         x = x.transpose(1, 2)  # x = (batch, seq_len, channels)
+
+        x = self.final_drop(x)
 
         # output
         x = self.output_layer(x)  # x = (batch, seq_len, 1)

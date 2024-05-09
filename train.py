@@ -40,6 +40,13 @@ def main(args, configs):
 
     # Prepare model
     model, optimizer = get_model(args, configs, device, train=True)
+    scheduler = torch.optim.lr_scheduler.ExponentialLR(optimizer, gamma=train_config["optimizer"]["gamma"], last_epoch=-1)
+
+    if len(args.pretrained):
+        print(f"Loading pretrained weights from {args.pretrained}")
+        ckpt = torch.load(args.pretrained)
+        model.load_state_dict(ckpt["model"])
+
     model = nn.DataParallel(model)
     num_param = get_param_num(model)
     Loss = FastSpeech3Loss(preprocess_config, model_config, train_config).to(device)
@@ -105,7 +112,7 @@ def main(args, configs):
                 if step % log_step == 0:
                     losses = [l.item() for l in losses]
                     message1 = "Step {}/{}, ".format(step, total_step)
-                    message2 = "Total Loss: {:.4f}, Mel Loss: {:.4f}, Mel PostNet Loss: {:.4f}, Pitch Loss: {:.4f}, Energy Loss: {:.4f}, Duration Loss: {:.4f}, Attention Loss: {:.4f}".format(
+                    message2 = "Total Loss: {:.4f}, Mel Loss: {:.4f}, Mel PostNet Loss: {:.4f}, Pitch Loss: {:.4f}, Energy Loss: {:.4f}, Duration Loss: {:.4f}, Attention Loss: {:.4f}, Duration Temporal Loss: {:.4f}, Total Temporal Loss: {:.4f}".format(
                         *losses
                     )
 
@@ -196,7 +203,9 @@ def main(args, configs):
                 outer_bar.update(1)
 
             inner_bar.update(1)
+        scheduler.step()
         epoch += 1
+
 
 
 if __name__ == "__main__":
@@ -217,6 +226,9 @@ if __name__ == "__main__":
     )
     parser.add_argument(
         "-o", "--output_dir", type=str, required=False, help="output dir override", default=""
+    )
+    parser.add_argument(
+        "-pt", "--pretrained", type=str, required=False, help="Path to pretrained model to finetune from", default=""
     )
 
 

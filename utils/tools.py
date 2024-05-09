@@ -110,6 +110,8 @@ def log(
         logger.add_scalar("Loss/energy_loss", losses[4], step)
         logger.add_scalar("Loss/duration_loss", losses[5], step)
         logger.add_scalar("Loss/attention_loss", losses[6], step)
+        logger.add_scalar("Loss/duration_temporal_loss", losses[7], step)
+        logger.add_scalar("Loss/total_temporal_loss", losses[8], step)
 
     if fig is not None:
         logger.add_figure(tag, fig)

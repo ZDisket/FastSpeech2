@@ -24,18 +24,87 @@ class CharbonnierLoss(nn.Module):
         return loss
 
 
+class Charbonnier1D(nn.Module):
+    """Charbonnier Loss for 1D sequences (batch_size, seq_len)."""
+    def __init__(self, eps=1e-6):
+        super(Charbonnier1D, self).__init__()
+        self.eps = eps
+
+    def forward(self, x: torch.Tensor, y: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
+        """
+        Compute the Charbonnier loss between predictions and ground truth for 1D sequences.
+
+        Parameters:
+            x (torch.Tensor): Predictions of shape (batch_size, seq_len).
+            y (torch.Tensor): Ground truth of shape (batch_size, seq_len).
+            mask (torch.Tensor): Boolean mask of shape (batch_size, seq_len), where True means excluded (invalid).
+
+        Returns:
+            torch.Tensor: Computed Charbonnier loss for valid elements.
+        """
+        assert x.shape == y.shape, "Shape mismatch between predictions and ground truth"
+        assert mask.shape == x.shape, "Shape mismatch between mask and predictions/ground_truth"
+
+        # Masked difference calculation
+        diff = x - y
+        diff = diff[~mask]  # Include only valid elements using the inverted mask
+
+        # Charbonnier loss calculation
+        loss = torch.sqrt(diff.pow(2) + self.eps**2).mean()  # Mean across valid dimensions
+        return loss
+
+
+
+class TemporalConsistencyLoss(nn.Module):
+    def __init__(self, weight: float = 1.0):
+        """
+        Initializes the temporal consistency loss module.
+
+        Parameters:
+            weight (float): Weight of the temporal consistency loss.
+        """
+        super(TemporalConsistencyLoss, self).__init__()
+        self.weight = weight
+
+    def forward(self, predictions: torch.Tensor, ground_truth: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
+        """
+        Compute the temporal consistency loss between predictions and ground truth.
+
+        Parameters:
+            predictions (torch.Tensor): Predictions of shape (batch_size, seq_length).
+            ground_truth (torch.Tensor): Ground truth of shape (batch_size, seq_length).
+            mask (torch.Tensor): Mask of shape (batch_size, seq_length), where True means excluded (invalid).
+
+        Returns:
+            torch.Tensor: Computed temporal consistency loss.
+        """
+        # Ensure predictions and ground truth have the same shape
+        assert predictions.shape == ground_truth.shape, "Shape mismatch between predictions and ground truth"
+        assert mask.shape == predictions.shape, "Shape mismatch between mask and predictions/ground_truth"
+
+        # Compute consecutive differences for predictions and ground truth
+        diff_pred = predictions[:, 1:] - predictions[:, :-1]
+        diff_gt = ground_truth[:, 1:] - ground_truth[:, :-1]
+
+        # Create the consecutive differences mask
+        mask_diff = ~(mask[:, 1:] | mask[:, :-1])
+
+        # Apply the mask to the differences
+        diff_pred_masked = diff_pred[mask_diff]
+        diff_gt_masked = diff_gt[mask_diff]
+
+        # Calculate the temporal consistency loss as L1 norm between differences
+        temporal_loss = torch.mean(torch.abs(diff_pred_masked - diff_gt_masked))
+        return temporal_loss * self.weight
+
+
 class BinLoss(torch.nn.modules.loss._Loss):
     def __init__(self):
         super().__init__()
 
-
-
     def forward(self, hard_attention, soft_attention):
-      #  print(soft_attention)
         soft_attention = torch.nan_to_num(soft_attention)
-       # print(hard_attention)
         log_input = torch.clamp(soft_attention[hard_attention == 1], min=1e-12)
-        #print(log_input)
         log_sum = torch.log(log_input).sum()
         return -log_sum / hard_attention.sum()
 
@@ -176,7 +245,7 @@ def pad_tensor_to_max_width(tensor, lens_w):
     return tensor
 
 class FastSpeech3Loss(nn.Module):
-    """ FastSpeech2 Loss """
+    """ FastSpeech2+1 Loss """
 
     def __init__(self, preprocess_config, model_config, train_config):
         super(FastSpeech3Loss, self).__init__()
@@ -192,7 +261,13 @@ class FastSpeech3Loss(nn.Module):
 
         self.forward_sum = ForwardSumLoss()
         self.bin_loss = BinLoss()
-        self.charb_loss = CharbonnierLoss()
+        self.charb_loss = Charbonnier1D()
+        self.temp_loss = TemporalConsistencyLoss(1.0) # I tested 0.35, 0.5, 0.75, but 1.0 is best
+
+        # With all our new losses (attention, masked duration, temporal), the mel loss (individual) goes from being 20% of the loss
+        # to just 6% and audio quality suffers greatly. We re-weight, although too much is detrimental.
+        self.mel_loss_weight = 1.4
+        self.mel_postnet_loss_weight = 1.5
 
         self.bin_loss_start_epoch = train_config["optimizer"]["bin_loss_start_epoch"]
         self.bin_loss_warmup_epochs = train_config["optimizer"]["bin_loss_warmup_epochs"]
@@ -234,6 +309,9 @@ class FastSpeech3Loss(nn.Module):
         energy_targets.requires_grad = False
         mel_targets.requires_grad = False
 
+        pitch_t, pitch_p = pitch_targets.clone(), pitch_predictions.clone()
+        energy_t, energy_p = energy_targets.clone(), energy_predictions.clone()
+
         if self.pitch_feature_level == "phoneme_level":
             pitch_predictions = pitch_predictions.masked_select(src_masks)
             pitch_targets = pitch_targets.masked_select(src_masks)
@@ -257,20 +335,48 @@ class FastSpeech3Loss(nn.Module):
         )
         mel_targets = mel_targets.masked_select(mel_masks.unsqueeze(-1))
 
-        mel_loss = self.mae_loss(mel_predictions, mel_targets)
-        postnet_mel_loss = self.mae_loss(postnet_mel_predictions, mel_targets)
+        mel_loss = self.mae_loss(mel_predictions, mel_targets) * self.mel_loss_weight
+        postnet_mel_loss = self.mae_loss(postnet_mel_predictions, mel_targets) * self.mel_postnet_loss_weight
 
         pitch_loss = self.mse_loss(pitch_predictions, pitch_targets)
         energy_loss = self.mse_loss(energy_predictions, energy_targets)
 
        # duration_loss = self.mse_loss(log_duration_predictions, log_duration_targets)
+
+
+     #   log_duration_predictions = log_duration_predictions.masked_fill(~src_masks, 0)
+      #  log_duration_targets = log_duration_targets.masked_fill(~src_masks, 0)
+
+        # these masks are True=valid, our loss functions take True=invalid
         duration_loss = self.charb_loss(
-            log_duration_predictions.masked_fill(~src_masks, 0),
-            log_duration_targets.masked_fill(~src_masks, 0)
+            log_duration_predictions,
+            log_duration_targets,
+            ~src_masks,
         )
 
+        # temporal consistency
 
-        # sometimes (almost aways for some reason), output_lengths.max() == attn_logprob.size(2) + 1
+        duration_temporal = self.temp_loss(log_duration_predictions,
+                                           log_duration_targets,
+                                           ~src_masks)
+
+        #pitch_p = pitch_p.masked_fill(~mel_masks, 0)
+       # pitch_t = pitch_t.masked_fill(~mel_masks, 0)
+
+        pitch_temporal = self.temp_loss(pitch_p,
+                                        pitch_t,
+                                        ~mel_masks)
+
+        #energy_p = energy_p.masked_fill(~mel_masks, 0)
+        #energy_t = energy_t.masked_fill(~mel_masks, 0)
+
+        energy_temporal = self.temp_loss(energy_p,
+                                         energy_t,
+                                         ~mel_masks)
+
+        total_temporal = duration_temporal + pitch_temporal + energy_temporal
+
+        # sometimes (almost always for some reason), output_lengths.max() == attn_logprob.size(2) + 1
         output_lengths = torch.clamp_max(output_lengths, attn_logprob.size(2))
 
         al_forward_sum = self.forward_sum(attn_logprob=attn_logprob, in_lens=input_lengths, out_lens=output_lengths)
@@ -283,7 +389,7 @@ class FastSpeech3Loss(nn.Module):
             total_attn_loss += al_match_loss
 
         total_loss = (
-            mel_loss + postnet_mel_loss + duration_loss + pitch_loss + energy_loss + total_attn_loss
+            mel_loss + postnet_mel_loss + duration_loss + pitch_loss + energy_loss + total_attn_loss + total_temporal
         )
 
         return (
@@ -294,4 +400,6 @@ class FastSpeech3Loss(nn.Module):
             energy_loss,
             duration_loss,
             total_attn_loss,
+            duration_temporal,
+            total_temporal,
         )

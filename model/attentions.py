@@ -4,52 +4,126 @@ import torch.nn.functional as F
 from torch.nn.utils import weight_norm
 
 
-
 class SwiGLUConvFFN(nn.Module):
-    """ A two-layer module with SwiGLU activation in a position-wise manner using convolutional layers """
+    def __init__(
+            self,
+            in_features: int,
+            hidden_features: int = None,
+            out_features: int = None,
+            kernel_size: int = 3,
+            drop: float = 0.0,
+            bias: bool = True,
+            causal: bool = False
+    ):
+        """
+        Initializes the SwiGLU feed-forward network with Conv1D layers.
 
-    def __init__(self, d_in, d_hid, kernel_size, dropout=0.1):
-        super(SwiGLUConvFFN, self).__init__()
+        Parameters:
+            in_features (int): Input dimension of the FFN.
+            hidden_features (int, optional): Inner dimension of the FFN. Defaults to in_features.
+            out_features (int, optional): Output dimension of the FFN. Defaults to in_features.
+            kernel_size (int, optional): Kernel size for convolution layers. Defaults to 3.
+            drop (float, optional): Dropout rate. Defaults to 0.0.
+            bias (bool, optional): Whether to use bias in convolution layers. Defaults to True.
+            causal (bool, optional): Whether to use causal padding. Defaults to False.
+        """
+        super().__init__()
+        out_features = out_features or in_features
+        hidden_features = hidden_features or in_features
 
-        # First convolution expands the channel dimension and prepares for gating
-        self.conv1 = nn.Conv1d(
-            d_in,
-            2 * d_hid,  # Doubling for gating purposes
-            kernel_size=kernel_size[0],
-            padding=(kernel_size[0] - 1) // 2,
-        )
+        self.kernel_size = kernel_size
+        self.causal = causal
+        self.drop = nn.Dropout(drop)
 
-        # Second convolution brings the channel dimension back to the original
-        self.conv2 = nn.Conv1d(
-            d_hid,
-            d_in,
-            kernel_size=kernel_size[1],
-            padding=(kernel_size[1] - 1) // 2,
-        )
+        if causal:
+            self.padding = self._causal_padding
+        else:
+            self.padding = self._same_padding
 
-        self.layer_norm = nn.LayerNorm(d_in)
-        self.dropout = nn.Dropout(dropout)
+        self.conv1 = nn.Conv1d(in_features, 2 * hidden_features, kernel_size, bias=bias)
+        self.conv2 = nn.Conv1d(hidden_features, out_features, kernel_size, bias=bias)
 
-    def forward(self, x):
-        residual = x  # Save for the residual connection
-        x = x.transpose(1, 2)  # (Batch, Channels, Seq_Length) for convolution
+    def _causal_padding(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        Applies causal padding to the input tensor.
 
-        # Apply first convolution and split for gating
-        x = self.conv1(x)
-        x1, x2 = x.chunk(2, dim=1)  # Split along the channel dimension for gating
-        x = F.silu(x1) * x2  # Apply SwiGLU activation
+        Parameters:
+            x (torch.Tensor): Input tensor of shape (batch_size, channels, seq_length).
 
-        # Apply second convolution
-        x = self.conv2(x)
+        Returns:
+            torch.Tensor: Padded tensor.
+        """
+        if self.kernel_size == 1:
+            return x
+        pad_left = self.kernel_size - 1
+        pad_right = 0
+        return F.pad(x, (pad_left, pad_right))
 
-        # Restore shape to (Batch, Seq_Length, Channels)
+    def _same_padding(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        Applies same padding to the input tensor.
+
+        Parameters:
+            x (torch.Tensor): Input tensor of shape (batch_size, channels, seq_length).
+
+        Returns:
+            torch.Tensor: Padded tensor.
+        """
+        if self.kernel_size == 1:
+            return x
+        pad_left = (self.kernel_size - 1) // 2
+        pad_right = self.kernel_size // 2
+        return F.pad(x, (pad_left, pad_right))
+
+    def apply_mask(self, x: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
+        """
+        Applies a mask to the input tensor.
+
+        Parameters:
+            x (torch.Tensor): Input tensor of shape (batch_size, channels, seq_length).
+            mask (torch.Tensor): Mask tensor of shape (batch_size, 1, 1, seq_length).
+
+        Returns:
+            torch.Tensor: Masked input tensor of shape (batch_size, channels, seq_length).
+        """
+        batch_size, channels, seq_length = x.shape
+        if mask is not None:
+            assert mask.shape == (batch_size, 1, 1, seq_length), f"Mask shape mismatch: {mask.shape}"
+            mask = mask.squeeze(1)  # Reduce to (batch_size, 1, seq_length)
+            x = x * mask
+        return x
+
+    def forward(self, x: torch.Tensor, mask: torch.Tensor = None) -> torch.Tensor:
+        """
+        Forward pass through the SwiGLU Conv1D feed-forward network.
+
+        Parameters:
+            x (torch.Tensor): Input tensor of shape (batch_size, seq_length, in_features).
+            mask (torch.Tensor, optional): Mask tensor of shape (batch_size, 1, seq_length, seq_length), where True is include and False exclude.
+
+        Returns:
+            torch.Tensor: Output tensor of shape (batch_size, seq_length, out_features).
+        """
+        # Transpose for Conv1D (batch_size, channels, seq_length)
         x = x.transpose(1, 2)
 
-        # Apply dropout, residual connection, and layer normalization
-        x = self.dropout(x)
-        x = self.layer_norm(x + residual)
+        # Apply mask before the first convolution
+        x = self.apply_mask(x, mask)
 
-        return x
+        x12 = self.conv1(self.padding(x))
+        x1, x2 = x12.chunk(2, dim=1)
+
+        hidden = F.silu(x1) * x2
+        hidden = self.drop(hidden)
+
+        # Apply mask before the second convolution
+        hidden = self.apply_mask(hidden, mask)
+
+        out = self.conv2(self.padding(hidden))
+        out = self.drop(out)
+
+        # Transpose back to (batch_size, seq_length, out_features)
+        return out.transpose(1, 2)
 
 
 class SwiGLUFFN(nn.Module):
@@ -148,10 +222,12 @@ class TransformerEncoderLayer(nn.Module):
         self.norm1 = nn.LayerNorm(embed_size)
         self.norm2 = nn.LayerNorm(embed_size)
         self.attention = MultiHeadAttention(embed_size, heads, alibi_alpha=alibi_alpha, start_i_increment=start_i_increment)
-        self.feed_forward = SwiGLUFFN(
+        self.feed_forward = SwiGLUConvFFN(
             in_features=embed_size,
             hidden_features=forward_expansion * embed_size,
-            out_features=embed_size
+            out_features=embed_size,
+            kernel_size=3,
+            drop=0.1,
         )
         self.dropout = nn.Dropout(dropout)
 
@@ -169,7 +245,7 @@ class TransformerEncoderLayer(nn.Module):
         # Normalize before the feed-forward network
         x = self.norm2(x)
         # Feed-forward network
-        x = self.feed_forward(x)
+        x = self.feed_forward(x, mask)
         # Apply dropout and add the residual (skip connection)
         x = query + self.dropout(x)
 
@@ -201,7 +277,7 @@ class TransformerEncoder(nn.Module):
 
 
 class TransformerDecoderLayer(nn.Module):
-    def __init__(self, embed_size, heads, forward_expansion, dropout, alibi_alpha, start_i_index, mode="linear", kernel_sizes=[2, 2]):
+    def __init__(self, embed_size, heads, forward_expansion, dropout, alibi_alpha, start_i_index, mode="linear", kernel_size=3):
         super(TransformerDecoderLayer, self).__init__()
         self.norm1 = nn.LayerNorm(embed_size)
         self.norm2 = nn.LayerNorm(embed_size)
@@ -216,7 +292,14 @@ class TransformerDecoderLayer(nn.Module):
                 nn.Dropout(dropout)
             )
         elif mode == "conv":
-            self.feed_forward = SwiGLUConvFFN(embed_size, forward_expansion * embed_size, kernel_sizes, dropout) #SwiGLUConvFFN already integrates dropout
+            self.feed_forward = SwiGLUConvFFN(
+                in_features=embed_size,
+                hidden_features=forward_expansion * embed_size,
+                out_features=embed_size,
+                kernel_size=kernel_size,
+                drop=0.1,
+                causal=True,
+            )
         else:
             raise TypeError(f"Invalid FFN type for TransformerDecoderLayer: {mode}. Valid are linear and conv")
 
@@ -232,18 +315,18 @@ class TransformerDecoderLayer(nn.Module):
         x = self.dropout(self.norm2(x))
 
         # Feed-forward network
-        x = self.feed_forward(x)
+        x = self.feed_forward(x, src_mask)
         x = self.dropout(self.norm3(x))
 
         return x
 
 
 class TransformerDecoder(nn.Module):
-    def __init__(self, embed_size, heads, num_layers, forward_expansion, dropout, alibi_alpha, mode="linear", kernel_sizes=[2, 2]):
+    def __init__(self, embed_size, heads, num_layers, forward_expansion, dropout, alibi_alpha, mode="linear", kernel_size=3):
         super(TransformerDecoder, self).__init__()
 
         self.layers = nn.ModuleList([
-            TransformerDecoderLayer(embed_size, heads, forward_expansion, dropout, alibi_alpha, i, mode, kernel_sizes)
+            TransformerDecoderLayer(embed_size, heads, forward_expansion, dropout, alibi_alpha, i, mode, kernel_size)
             for i in range(num_layers)
         ])
 
