@@ -10,7 +10,7 @@ class StochasticDropout(nn.Module):
     Also known as Monte Carlo dropout, StochasticDropout keeps a lower dropout rate to apply during inference, for stochasticity.
     If not specified, it will be dropout / 3, with the minimum being 0.1
     """
-    def __init__(self, p=0.5, p_inference=None, min_p_inference=0.1):
+    def __init__(self, p=0.5, p_inference=None, min_p_inference=0.1, stochastic=False):
         super(StochasticDropout, self).__init__()
         self.p = p  # Dropout probability during training
 
@@ -18,12 +18,17 @@ class StochasticDropout(nn.Module):
             p_inference = max(min_p_inference, p / 3) # ensure stochastic dropout is at least 0.1
 
         self.p_inference = p_inference  # Dropout probability during inference
+        self.stochastic = stochastic
 
     def forward(self, x):
         if self.training:
             return F.dropout(x, self.p, self.training)
         else:
-            return F.dropout(x, self.p, self.training)
+            if self.stochastic:
+                return F.dropout(x, self.p, True)
+            else:
+                return F.dropout(x, self.p, self.training)
+
 
 
 
