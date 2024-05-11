@@ -45,7 +45,7 @@ def main(args, configs):
     if len(args.pretrained):
         print(f"Loading pretrained weights from {args.pretrained}")
         ckpt = torch.load(args.pretrained)
-        model.load_state_dict(ckpt["model"])
+        model.load_state_dict(ckpt["model"], strict=False)
 
     model = nn.DataParallel(model)
     num_param = get_param_num(model)

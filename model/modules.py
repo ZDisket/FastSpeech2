@@ -420,7 +420,7 @@ class VarianceAdaptor(nn.Module):
             p_dropout=model_config["transformer"]["decoder_dropout"],
             final_dropout=model_config["variance_predictor"]["dropout"],
             kernel_size=model_config["variance_predictor"]["kernel_size"],
-            conv_depth=0,
+            conv_depth=2,
         )
         self.length_regulator = LengthRegulator()
         self.pitch_predictor = TemporalVariancePredictor(
