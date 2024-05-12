@@ -322,11 +322,11 @@ class TransformerDecoderLayer(nn.Module):
 
 
 class TransformerDecoder(nn.Module):
-    def __init__(self, embed_size, heads, num_layers, forward_expansion, dropout, alibi_alpha, mode="linear", kernel_size=3):
+    def __init__(self, embed_size, heads, num_layers, forward_expansion, dropout, alibi_alpha, mode="linear", kernel_size=3, start_i=0):
         super(TransformerDecoder, self).__init__()
 
         self.layers = nn.ModuleList([
-            TransformerDecoderLayer(embed_size, heads, forward_expansion, dropout, alibi_alpha, i, mode, kernel_size)
+            TransformerDecoderLayer(embed_size, heads, forward_expansion, dropout, alibi_alpha, start_i + i, mode, kernel_size)
             for i in range(num_layers)
         ])
 

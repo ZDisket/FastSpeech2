@@ -29,7 +29,8 @@ class FastSpeech2(nn.Module):
             model_config["transformer"]["encoder_layer"],
             2,
             model_config["transformer"]["encoder_dropout"],
-            1.25
+            1.5,
+            2,
         )
         self.variance_adaptor = VarianceAdaptor(preprocess_config, model_config)
         self.decoder = Decoder(model_config)

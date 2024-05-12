@@ -54,6 +54,35 @@ class Charbonnier1D(nn.Module):
         return loss
 
 
+class MSE1D(nn.Module):
+    """Mean Squared Error Loss for 1D sequences with masking (batch_size, seq_len)."""
+    def __init__(self):
+        super(MSE1D, self).__init__()
+
+    def forward(self, x: torch.Tensor, y: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
+        """
+        Compute the Mean Squared Error loss between predictions and ground truth for 1D sequences,
+        considering a mask to exclude certain entries from the loss computation.
+
+        Parameters:
+            x (torch.Tensor): Predictions of shape (batch_size, seq_len).
+            y (torch.Tensor): Ground truth of shape (batch_size, seq_len).
+            mask (torch.Tensor): Boolean mask of shape (batch_size, seq_len), where True means excluded (invalid).
+
+        Returns:
+            torch.Tensor: Computed MSE loss for valid elements.
+        """
+        assert x.shape == y.shape, "Shape mismatch between predictions and ground truth"
+        assert mask.shape == x.shape, "Shape mismatch between mask and predictions/ground_truth"
+
+        # Apply the mask by selecting elements where mask is False
+        valid_x = x[~mask]
+        valid_y = y[~mask]
+
+        # Calculate MSE for the valid elements
+        mse_loss = F.mse_loss(valid_x, valid_y, reduction='mean')  # Calculate mean only over the unmasked elements
+        return mse_loss
+
 
 class TemporalConsistencyLoss(nn.Module):
     def __init__(self, weight: float = 1.0):
@@ -261,6 +290,7 @@ class FastSpeech3Loss(nn.Module):
 
         self.forward_sum = ForwardSumLoss()
         self.bin_loss = BinLoss()
+        self.mse2_loss = MSE1D()
         self.charb_loss = Charbonnier1D()
         self.temp_loss = TemporalConsistencyLoss(1.0) # I tested 0.35, 0.5, 0.75, but 1.0 is best
 
@@ -341,14 +371,8 @@ class FastSpeech3Loss(nn.Module):
         pitch_loss = self.mse_loss(pitch_predictions, pitch_targets)
         energy_loss = self.mse_loss(energy_predictions, energy_targets)
 
-       # duration_loss = self.mse_loss(log_duration_predictions, log_duration_targets)
-
-
-     #   log_duration_predictions = log_duration_predictions.masked_fill(~src_masks, 0)
-      #  log_duration_targets = log_duration_targets.masked_fill(~src_masks, 0)
-
         # these masks are True=valid, our loss functions take True=invalid
-        duration_loss = self.charb_loss(
+        duration_loss = self.mse2_loss(
             log_duration_predictions,
             log_duration_targets,
             ~src_masks,

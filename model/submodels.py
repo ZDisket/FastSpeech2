@@ -33,12 +33,12 @@ class StochasticDropout(nn.Module):
 
 
 class TextEncoder(nn.Module):
-    def __init__(self, vocab_size, embed_size, num_heads, num_layers, forward_expansion, dropout, alibi_alpha=1.0):
+    def __init__(self, vocab_size, embed_size, num_heads, num_layers, forward_expansion, dropout, alibi_alpha=1.0, start_i=0):
         super(TextEncoder, self).__init__()
         self.embed = nn.Embedding(vocab_size, embed_size)
         self.emb_norm = nn.LayerNorm(embed_size)
         self.encoder = TransformerEncoder(embed_size, num_heads, num_layers, forward_expansion, dropout,
-                                          alibi_alpha=alibi_alpha)
+                                          alibi_alpha=alibi_alpha, start_i=start_i)
         self.dropout = StochasticDropout(dropout)
         self.layer_norm = nn.LayerNorm(embed_size)
 
@@ -137,7 +137,7 @@ def generate_masks_from_float_mask(float_mask):
 
 class VariantDurationPredictor(nn.Module):
     def __init__(self, text_channels, filter_channels=512, depth=4, heads=4, kernel_size=3, p_dropout=0.2,
-                 final_dropout=0.2, conv_depth=2, lstm_bidirectional=True):
+                 final_dropout=0.2, conv_depth=2, lstm_bidirectional=True, start_i=0):
         super(VariantDurationPredictor, self).__init__()
 
         print("Using Variant Duration Predictor")
@@ -156,9 +156,7 @@ class VariantDurationPredictor(nn.Module):
 
 
         self.decoder = TransformerDecoder(embed_size=filter_channels, heads=heads, num_layers=depth,
-                                          forward_expansion=4, dropout=p_dropout, alibi_alpha=1.5, mode="conv", kernel_size=3)
-
-        self.pre_lstm_norm = nn.LayerNorm(filter_channels)
+                                          forward_expansion=4, dropout=p_dropout, alibi_alpha=1.5, mode="conv", kernel_size=3, start_i=start_i)
 
         lstm_channels = filter_channels // 2
 
@@ -208,7 +206,7 @@ class VariantDurationPredictor(nn.Module):
                              tgt_mask)  # x enc = (b, seq_len, channels)
 
         # Residual connection.
-        x = self.pre_lstm_norm(x + x_dec)
+        x = x + x_dec
         # Apply dropout even in inference
         x = self.final_dropout(x)
 
