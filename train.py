@@ -38,9 +38,19 @@ def main(args, configs):
         collate_fn=dataset.collate_fn,
     )
 
+    step = args.restore_step + 1
+    epoch = 1
+    last_epoch = -1
+
+    if step > 1:
+        steps_per_epoch = len(dataset) // batch_size
+        current_epoch = step // steps_per_epoch
+        epoch = current_epoch
+        last_epoch = epoch - 1
+
     # Prepare model
     model, optimizer = get_model(args, configs, device, train=True)
-    scheduler = torch.optim.lr_scheduler.ExponentialLR(optimizer, gamma=train_config["optimizer"]["gamma"], last_epoch=-1)
+    scheduler = torch.optim.lr_scheduler.ExponentialLR(optimizer, gamma=train_config["optimizer"]["gamma"], last_epoch=last_epoch)
 
     if len(args.pretrained):
         print(f"Loading pretrained weights from {args.pretrained}")
@@ -66,8 +76,6 @@ def main(args, configs):
     val_logger = SummaryWriter(val_log_path)
 
     # Training
-    step = args.restore_step + 1
-    epoch = 1
     grad_acc_step = train_config["optimizer"]["grad_acc_step"]
     grad_clip_thresh = train_config["optimizer"]["grad_clip_thresh"]
     total_step = train_config["step"]["total_step"]
@@ -245,6 +253,9 @@ if __name__ == "__main__":
         train_config["path"]["ckpt_path"] = f"{args.output_dir}/ckpt"
         train_config["path"]["log_path"] = f"{args.output_dir}"
         train_config["path"]["result_path"] = f"{args.output_dir}/results"
+
+    if args.restore_step > 1:
+        args.pretrained = ""
 
 
     configs = (preprocess_config, model_config, train_config)

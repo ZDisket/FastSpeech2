@@ -85,15 +85,17 @@ class MSE1D(nn.Module):
 
 
 class TemporalConsistencyLoss(nn.Module):
-    def __init__(self, weight: float = 1.0):
+    def __init__(self, weight: float = 1.0, use_mse: bool = False):
         """
         Initializes the temporal consistency loss module.
 
         Parameters:
             weight (float): Weight of the temporal consistency loss.
+            use_mse (bool): Flag to use MSE loss instead of L1 loss.
         """
         super(TemporalConsistencyLoss, self).__init__()
         self.weight = weight
+        self.use_mse = use_mse
 
     def forward(self, predictions: torch.Tensor, ground_truth: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
         """
@@ -122,8 +124,14 @@ class TemporalConsistencyLoss(nn.Module):
         diff_pred_masked = diff_pred[mask_diff]
         diff_gt_masked = diff_gt[mask_diff]
 
-        # Calculate the temporal consistency loss as L1 norm between differences
-        temporal_loss = torch.mean(torch.abs(diff_pred_masked - diff_gt_masked))
+        # Calculate the temporal consistency loss
+        if self.use_mse:
+            # Use mean squared error loss
+            temporal_loss = torch.mean((diff_pred_masked - diff_gt_masked) ** 2)
+        else:
+            # Use L1 loss (default)
+            temporal_loss = torch.mean(torch.abs(diff_pred_masked - diff_gt_masked))
+
         return temporal_loss * self.weight
 
 
@@ -292,7 +300,7 @@ class FastSpeech3Loss(nn.Module):
         self.bin_loss = BinLoss()
         self.mse2_loss = MSE1D()
         self.charb_loss = Charbonnier1D()
-        self.temp_loss = TemporalConsistencyLoss(1.0) # I tested 0.35, 0.5, 0.75, but 1.0 is best
+        self.temp_loss = TemporalConsistencyLoss(1.0, True) # I tested 0.35, 0.5, 0.75, but 1.0 is best
 
         # With all our new losses (attention, masked duration, temporal), the mel loss (individual) goes from being 20% of the loss
         # to just 6% and audio quality suffers greatly. We re-weight, although too much is detrimental.

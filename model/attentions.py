@@ -150,7 +150,7 @@ class SwiGLUFFN(nn.Module):
 
 
 class MultiHeadAttention(nn.Module):
-    def __init__(self, embed_size, heads, alibi_alpha=1.0, start_i_increment=0, use_alibi=True):
+    def __init__(self, embed_size, heads, alibi_alpha=1.0, start_i_increment=0, use_alibi=True, use_talking_heads=True):
         super(MultiHeadAttention, self).__init__()
         self.embed_size = embed_size
         self.heads = heads
@@ -167,6 +167,7 @@ class MultiHeadAttention(nn.Module):
         self.fc_out = nn.Linear(heads * self.head_dim, embed_size)
 
         self.alibi_alpha = alibi_alpha
+        self.use_talking_heads = use_talking_heads
         self.start_i_increment = start_i_increment
 
         if self.use_alibi:
@@ -174,6 +175,11 @@ class MultiHeadAttention(nn.Module):
             self.slopes = torch.tensor(
                 [2 ** (-self.alibi_alpha * (i + self.start_i_increment)) for i in range(1, self.heads + 1)],
                 dtype=torch.float32).view(1, self.heads, 1, 1)
+
+        if self.use_talking_heads: # Talking heads: x-transformers version (using Conv2d instead of Linear)
+            self.pre_softmax_talking_heads = nn.Conv2d(heads, heads, 1, bias=False)
+            self.post_softmax_talking_heads = nn.Conv2d(heads, heads, 1, bias=False)
+
 
     def forward(self, values, keys, queries, mask=None):
         N = queries.shape[0]
@@ -199,10 +205,18 @@ class MultiHeadAttention(nn.Module):
             alibi_bias = -alibi_bias * self.slopes
             energy += alibi_bias.to(energy.device)
 
+        if self.use_talking_heads:
+            energy = self.pre_softmax_talking_heads(energy)
+
         if mask is not None:                        #-1e4 for numerical stability with fp16
             energy = energy.masked_fill(mask == 0, float("-1e4"))
 
         attention = F.softmax(energy / (self.embed_size ** (1 / 2)), dim=3)
+
+        if self.use_talking_heads:
+            attention = self.post_softmax_talking_heads(attention)
+
+
         out = torch.einsum("nhql,nlhd->nqhd", [attention, values]).reshape(
             N, query_len, self.heads * self.head_dim
         )
