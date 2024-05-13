@@ -7,13 +7,13 @@ transformer:
   decoder_hidden: 256
   conv_filter_size: 1024
   conv_kernel_size: [9, 1]
-  encoder_dropout: 0.2
+  encoder_dropout: 0.1
   decoder_dropout: 0.2
 
 variance_predictor:
   filter_size: 256
   kernel_size: 3
-  dropout: 0.5
+  dropout: 0.15
 
 variance_embedding:
   pitch_quantization: "linear" # support 'linear' or 'log', 'log' is allowed only if the pitch values are not normalized during preprocessing

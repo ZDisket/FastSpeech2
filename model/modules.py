@@ -417,7 +417,7 @@ class VarianceAdaptor(nn.Module):
             filter_channels=model_config["variance_predictor"]["filter_size"],
             depth=4,
             heads=2,
-            p_dropout=model_config["transformer"]["decoder_dropout"],
+            p_dropout=model_config["transformer"]["encoder_dropout"],
             final_dropout=model_config["variance_predictor"]["dropout"],
             kernel_size=model_config["variance_predictor"]["kernel_size"],
             conv_depth=2,
