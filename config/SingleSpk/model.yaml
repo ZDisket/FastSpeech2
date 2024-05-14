@@ -24,7 +24,8 @@ duration_predictor:
   kernel_size: 3 # both: conv kernel size
   heads: 2 # both: attention heads
   filter_size: 256 # lstm: hidden size
-  dropout: 0.2 # both: dropout
+  dropout: 0.2 # both: dropout. recommend 0.2 for lstm, 0.5 tcn
+  bidirectional: true # both: bidirectional
 
 
 variance_embedding:

@@ -420,9 +420,11 @@ class VarianceAdaptor(nn.Module):
                 num_inputs=model_config["transformer"]["encoder_hidden"],
                 num_channels=model_config["duration_predictor"]["tcn_channels"],
                 kernel_size=model_config["duration_predictor"]["kernel_size"],
+                dropout=model_config["duration_predictor"]["dropout"],
                 start_i=1,
                 att_dropout=model_config["duration_predictor"]["att_dropout"],
                 heads=model_config["duration_predictor"]["heads"],
+                bidirectional=model_config["duration_predictor"]["bidirectional"],
             )
         elif dp_type == "lstm":
             self.duration_predictor = VariantDurationPredictor(
@@ -435,6 +437,7 @@ class VarianceAdaptor(nn.Module):
                 kernel_size=model_config["duration_predictor"]["kernel_size"],
                 conv_depth=model_config["duration_predictor"]["conv_depth"],
                 start_i=3,
+                lstm_bidirectional=model_config["duration_predictor"]["bidirectional"],
             )
         else:
             raise RuntimeError(f"Invalid duration predictor type: {dp_type}. Valid are tcn and lstm")

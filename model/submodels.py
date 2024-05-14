@@ -343,14 +343,34 @@ class SpectrogramDecoder(nn.Module):
         return x, orig_mask
 
 
+def mask_to_attention_mask(mask):
+    attention_mask = mask.unsqueeze(1) & mask.unsqueeze(2)
+    attention_mask = attention_mask.unsqueeze(1)
+    # Flip the mask, our attention uses True=valid
+    attention_mask = ~attention_mask
+    return attention_mask
+
+
 class DynamicDurationPredictor(nn.Module):
-    def __init__(self, num_inputs, num_channels, kernel_size=2, dropout=0.2, att_dropout=0.3, alibi_alpha=1.5, start_i=0, heads=2):
+    def __init__(self, num_inputs, num_channels, kernel_size=2, dropout=0.2, att_dropout=0.3, alibi_alpha=1.5, start_i=0, heads=2, bidirectional=False):
         super(DynamicDurationPredictor, self).__init__()
+
+        self.tcn_output_channels = num_channels[-1]
+        self.bidirectional = bidirectional
+
         # Initialize the TCNAttention module
         self.tcn_attention = TCNAttention(num_inputs, num_channels, kernel_size, dropout, att_dropout, heads,
                                           alibi_alpha=alibi_alpha, start_i_increment=start_i)
+        if self.bidirectional:
+            print("BiAttTCN")
+            self.backwards_tcn_attention = TCNAttention(num_inputs, num_channels, kernel_size, dropout, att_dropout, heads,
+                                           alibi_alpha=alibi_alpha, start_i_increment=start_i)
+            # prevent model from overrelying on backwards features
+            self.backwards_drop = nn.Dropout(att_dropout)
+            self.fw_projection = nn.Linear(2 * self.tcn_output_channels, self.tcn_output_channels)
 
-        self.linear_projection = nn.Linear(num_channels[-1], 1)
+        self.linear_projection = nn.Linear(self.tcn_output_channels, 1)
+
 
     def forward(self, x, x_lengths):
         """
@@ -367,17 +387,33 @@ class DynamicDurationPredictor(nn.Module):
         mask = mask >= x_lengths.unsqueeze(1)
 
         # Create an attention mask (batch, 1, seq_len, seq_len)
-        # This requires expanding the mask to cover each sequence element comparison
-        attention_mask = mask.unsqueeze(1) & mask.unsqueeze(2)
-        attention_mask = attention_mask.unsqueeze(1)
-        # Flip the mask, our attention uses True=valid
-        attention_mask = ~attention_mask
+        attention_mask = mask_to_attention_mask(mask)
+
+        if self.bidirectional:
+          x_orig = x.clone()
 
         # Pass input through the TCNAttention layer
         x = self.tcn_attention(x, attention_mask)
+
+        if self.bidirectional:
+            # Reverse input and mask for backward processing
+            x_reversed = x_orig.flip(dims=[1])
+            mask_reversed = mask.flip(dims=[1])
+            reverse_attention_mask = mask_to_attention_mask(mask_reversed)
+
+            x_reversed = self.backwards_tcn_attention(x_reversed, reverse_attention_mask)
+            x_reversed = self.backwards_drop(x_reversed)
+
+            # flip back to align with x
+            x_reversed = x_reversed.flip(dims=[1])
+
+            # cat and project back to normal
+            x = torch.cat((x, x_reversed), dim=-1)
+            x = self.fw_projection(x)
 
         x = self.linear_projection(x)
         x = x.squeeze(-1)
         x = x.masked_fill(mask, 0)
 
         return x, mask.float()
+
