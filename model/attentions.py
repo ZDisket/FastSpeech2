@@ -411,3 +411,76 @@ class TemporalConvNet(nn.Module):
 
     def forward(self, x):
         return self.network(x)
+
+
+def reduce_mask(mask):
+    """
+    Reduce an attention mask to a normal one
+    :param mask: Attention mask shape (batch, 1, seq_length, seq_length)
+
+    :return: Reduced mask size (batch, 1, seq_length)
+    """
+    reduced_mask = mask[:, 0, :, 0].unsqueeze(1)
+    return reduced_mask
+
+
+class TCNAttentionBlock(nn.Module):
+    def __init__(self, in_channels, out_channels, kernel_size, heads, att_dropout, dropout, dilation, alibi_alpha, start_i_increment=0):
+        super(TCNAttentionBlock, self).__init__()
+        self.attention = MultiHeadAttention(in_channels, heads, alibi_alpha=alibi_alpha, start_i_increment=start_i_increment)
+        self.dropout1 = nn.Dropout(att_dropout)  # Dropout for attention
+        padding = (kernel_size - 1) * dilation  # Calculate padding based on dilation
+        self.temporal_block = TemporalBlock(in_channels, out_channels, kernel_size, stride=1, dilation=dilation,
+                                            padding=padding, dropout=dropout)
+        self.batch_norm = nn.BatchNorm1d(out_channels)
+        self.dropout2 = nn.Dropout(dropout)
+
+    def forward(self, x, mask):
+        """
+        Args:
+            x: Input tensor of shape (batch_size, seq_length, channels).
+            mask: Mask tensor of shape (batch_size, 1, seq_length, seq_length), where True is valid and False is invalid
+        """
+        # x = (batch, seq_len, channels)
+        x_att = self.attention(x, x, x, mask)
+        x_att = self.dropout1(x_att)
+        x = x + x_att  # Residual connection
+
+        x = x.transpose(1, 2)  # Switch dimensions for convolution
+
+        # x = (batch, channels, seq_len)
+        x = self.temporal_block(x)
+
+        conv_mask = reduce_mask(mask)
+        x = x.masked_fill(conv_mask == 0, 0)
+
+        x = self.batch_norm(x).transpose(1, 2) # x = (batch, seq_len, channels)
+        x = self.dropout2(x)
+
+        return x
+
+
+class TCNAttention(nn.Module):
+    def __init__(self, num_inputs, num_channels, kernel_size=2, dropout=0.2, att_dropout=0.3, heads=2, alibi_alpha=1.25, start_i_increment=1):
+        super(TCNAttention, self).__init__()
+        self.layers = nn.ModuleList()
+
+        # Initialize TCNAttentionBlocks with proper dilation rates
+        current_channels = num_inputs
+        for level, out_channels in enumerate(num_channels):
+            dilation = 2 ** level
+            basic_i = start_i_increment + level
+            self.layers.append(TCNAttentionBlock(current_channels, out_channels, kernel_size, heads,
+                                                 att_dropout, dropout, dilation, alibi_alpha=alibi_alpha,
+                                                 start_i_increment=basic_i * heads))
+            current_channels = out_channels  # The output of the current block is the input for the next
+
+    def forward(self, x, mask):
+        """
+        Args:
+            x: Input tensor of shape (batch_size, seq_length, channels).
+            mask: Mask tensor of shape (batch_size, 1, seq_length, seq_length), where True is valid and False is invalid
+        """
+        for layer in self.layers:
+            x = layer(x, mask)
+        return x

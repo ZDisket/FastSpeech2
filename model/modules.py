@@ -10,7 +10,7 @@ import numpy as np
 import torch.nn.functional as F
 
 from utils.tools import get_mask_from_lengths, pad
-from .submodels import VariantDurationPredictor, TemporalVariancePredictor
+from .submodels import VariantDurationPredictor, TemporalVariancePredictor, DynamicDurationPredictor
 
 from typing import Optional, Tuple
 from numba import jit, prange
@@ -412,17 +412,33 @@ class VarianceAdaptor(nn.Module):
 
     def __init__(self, preprocess_config, model_config):
         super(VarianceAdaptor, self).__init__()
-        self.duration_predictor = VariantDurationPredictor(
-            text_channels=model_config["transformer"]["encoder_hidden"],
-            filter_channels=model_config["variance_predictor"]["filter_size"],
-            depth=4,
-            heads=2,
-            p_dropout=model_config["transformer"]["encoder_dropout"],
-            final_dropout=model_config["variance_predictor"]["dropout"],
-            kernel_size=model_config["variance_predictor"]["kernel_size"],
-            conv_depth=2,
-            start_i=3,
-        )
+
+        dp_type = model_config["duration_predictor"]["type"]
+
+        if dp_type == "tcn":
+            self.duration_predictor = DynamicDurationPredictor(
+                num_inputs=model_config["transformer"]["encoder_hidden"],
+                num_channels=model_config["duration_predictor"]["tcn_channels"],
+                kernel_size=model_config["duration_predictor"]["kernel_size"],
+                start_i=1,
+                att_dropout=model_config["duration_predictor"]["att_dropout"],
+                heads=model_config["duration_predictor"]["heads"],
+            )
+        elif dp_type == "lstm":
+            self.duration_predictor = VariantDurationPredictor(
+                text_channels=model_config["transformer"]["encoder_hidden"],
+                filter_channels=model_config["duration_predictor"]["filter_size"],
+                depth=model_config["duration_predictor"]["decoder_depth"],
+                heads=model_config["duration_predictor"]["heads"],
+                p_dropout=model_config["duration_predictor"]["dropout"],
+                final_dropout=model_config["duration_predictor"]["att_dropout"],
+                kernel_size=model_config["duration_predictor"]["kernel_size"],
+                conv_depth=model_config["duration_predictor"]["conv_depth"],
+                start_i=3,
+            )
+        else:
+            raise RuntimeError(f"Invalid duration predictor type: {dp_type}. Valid are tcn and lstm")
+
         self.length_regulator = LengthRegulator()
         self.pitch_predictor = TemporalVariancePredictor(
             input_channels=model_config["transformer"]["encoder_hidden"],

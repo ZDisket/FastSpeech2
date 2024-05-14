@@ -7,13 +7,25 @@ transformer:
   decoder_hidden: 256
   conv_filter_size: 1024
   conv_kernel_size: [9, 1]
-  encoder_dropout: 0.1
+  encoder_dropout: 0.15
   decoder_dropout: 0.2
 
 variance_predictor:
   filter_size: 256
   kernel_size: 3
-  dropout: 0.15
+  dropout: 0.5
+
+duration_predictor:
+  type: "tcn" # support tcn or lstm
+  att_dropout: 0.3 # only applies to TCN duration pred, dropout applied to attention
+  tcn_channels: [256, 384, 512] # only applies to TCN duration pred
+  decoder_depth: 2 # lstm: depth of auxiliary decoder
+  conv_depth: 2 # lstm: depth of pre-convs
+  kernel_size: 3 # both: conv kernel size
+  heads: 2 # both: attention heads
+  filter_size: 256 # lstm: hidden size
+  dropout: 0.2 # both: dropout
+
 
 variance_embedding:
   pitch_quantization: "linear" # support 'linear' or 'log', 'log' is allowed only if the pitch values are not normalized during preprocessing
@@ -29,7 +41,6 @@ variance_embedding:
 #   attn_head: 4
 
 multi_speaker: False
-
 max_seq_len: 1000
 
 vocoder:

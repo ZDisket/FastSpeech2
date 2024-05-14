@@ -1,6 +1,6 @@
 import torch
 import torch.nn as nn
-from .attentions import TransformerEncoder, TransformerDecoder, TemporalConvNet
+from .attentions import TransformerEncoder, TransformerDecoder, TemporalConvNet, TCNAttention
 from torch.nn.utils.rnn import pack_padded_sequence, pad_packed_sequence
 import torch.nn.functional as F
 
@@ -144,8 +144,6 @@ class VariantDurationPredictor(nn.Module):
         self.use_dual_proj = False
         self.lstm_bidirectional = lstm_bidirectional
 
-
-
         if conv_depth > 0:
             self.pre_convs = SConvNorm(filter_channels, num_layers=conv_depth, kernel_size=kernel_size)
             self.post_conv_drop = StochasticDropout(p_dropout)
@@ -153,7 +151,6 @@ class VariantDurationPredictor(nn.Module):
             print("Not using pre convs")
             self.pre_convs = nn.Identity()
             self.post_conv_drop = nn.Identity()
-
 
         self.decoder = TransformerDecoder(embed_size=filter_channels, heads=heads, num_layers=depth,
                                           forward_expansion=4, dropout=p_dropout, alibi_alpha=1.5, mode="conv", kernel_size=3, start_i=start_i)
@@ -344,3 +341,43 @@ class SpectrogramDecoder(nn.Module):
         x = self.mel_fc(x)
 
         return x, orig_mask
+
+
+class DynamicDurationPredictor(nn.Module):
+    def __init__(self, num_inputs, num_channels, kernel_size=2, dropout=0.2, att_dropout=0.3, alibi_alpha=1.5, start_i=0, heads=2):
+        super(DynamicDurationPredictor, self).__init__()
+        # Initialize the TCNAttention module
+        self.tcn_attention = TCNAttention(num_inputs, num_channels, kernel_size, dropout, att_dropout, heads,
+                                          alibi_alpha=alibi_alpha, start_i_increment=start_i)
+
+        self.linear_projection = nn.Linear(num_channels[-1], 1)
+
+    def forward(self, x, x_lengths):
+        """
+        Forward pass through the DynamicDurationPredictor
+
+        :param x: Encoded text size (batch, seq_len, channels)
+        :param x_lengths: Int tensor of the lengths of x size (batch,)
+
+        :return: Predicted durations size (batch, seq_len)
+        """
+        # Generate the appropriate mask for attention
+        max_length = x.size(1)
+        mask = torch.arange(max_length).expand(len(x_lengths), max_length).to(x_lengths.device)
+        mask = mask >= x_lengths.unsqueeze(1)
+
+        # Create an attention mask (batch, 1, seq_len, seq_len)
+        # This requires expanding the mask to cover each sequence element comparison
+        attention_mask = mask.unsqueeze(1) & mask.unsqueeze(2)
+        attention_mask = attention_mask.unsqueeze(1)
+        # Flip the mask, our attention uses True=valid
+        attention_mask = ~attention_mask
+
+        # Pass input through the TCNAttention layer
+        x = self.tcn_attention(x, attention_mask)
+
+        x = self.linear_projection(x)
+        x = x.squeeze(-1)
+        x = x.masked_fill(mask, 0)
+
+        return x, mask.float()
