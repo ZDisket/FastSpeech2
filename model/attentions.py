@@ -270,7 +270,7 @@ class TransformerEncoder(nn.Module):
     def __init__(self, embed_size, heads, num_layers, forward_expansion, dropout, alibi_alpha=1.0, start_i = 0):
         super(TransformerEncoder, self).__init__()
         self.encoder_layers = nn.ModuleList([                                                               # Index-Ramped ALiBi
-            TransformerEncoderLayer(embed_size, heads, forward_expansion, dropout, alibi_alpha=alibi_alpha, start_i_increment=start_i + i)
+            TransformerEncoderLayer(embed_size, heads, forward_expansion, dropout, alibi_alpha=alibi_alpha, start_i_increment=start_i + (i * heads))
             for i in range(num_layers)
         ])
         self.dropout = nn.Dropout(dropout)
@@ -340,7 +340,7 @@ class TransformerDecoder(nn.Module):
         super(TransformerDecoder, self).__init__()
 
         self.layers = nn.ModuleList([
-            TransformerDecoderLayer(embed_size, heads, forward_expansion, dropout, alibi_alpha, start_i + i, mode, kernel_size)
+            TransformerDecoderLayer(embed_size, heads, forward_expansion, dropout, alibi_alpha, start_i + (i * heads), mode, kernel_size)
             for i in range(num_layers)
         ])
 
@@ -425,6 +425,11 @@ def reduce_mask(mask):
 
 
 class TCNAttentionBlock(nn.Module):
+    """
+    Transformer-inspired TCNAttentionBlock:
+
+    x + Drop(MultiHeadAttention(x)) => TemporalBlock => Drop(BatchNorm)
+    """
     def __init__(self, in_channels, out_channels, kernel_size, heads, att_dropout, dropout, dilation, alibi_alpha, start_i_increment=0):
         super(TCNAttentionBlock, self).__init__()
         self.attention = MultiHeadAttention(in_channels, heads, alibi_alpha=alibi_alpha, start_i_increment=start_i_increment)
@@ -469,10 +474,11 @@ class TCNAttention(nn.Module):
         current_channels = num_inputs
         for level, out_channels in enumerate(num_channels):
             dilation = 2 ** level
-            basic_i = start_i_increment + level
             self.layers.append(TCNAttentionBlock(current_channels, out_channels, kernel_size, heads,
                                                  att_dropout, dropout, dilation, alibi_alpha=alibi_alpha,
-                                                 start_i_increment=basic_i * heads))
+                                                 start_i_increment=start_i_increment + (level * heads)
+                                                 )
+                               )
             current_channels = out_channels  # The output of the current block is the input for the next
 
     def forward(self, x, mask):
