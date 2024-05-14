@@ -6,7 +6,7 @@ optimizer:
   batch_size: 28
   betas: [0.9, 0.98]
   init_lr: 0.0001
-  gamma: 0.999875
+  gamma: 0.97565
   eps: 0.000000001
   weight_decay: 0.0
   grad_clip_thresh: 1.0
