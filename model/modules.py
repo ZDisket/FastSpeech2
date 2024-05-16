@@ -407,6 +407,21 @@ class AlignmentEncoder(torch.nn.Module):
         return attn, attn_logprob
 
 
+class TransposeBatchNorm(nn.Module):
+    def __init__(self, num_features):
+        super(TransposeBatchNorm, self).__init__()
+        self.batch_norm = nn.BatchNorm1d(num_features)
+
+    def forward(self, x):
+        # Transpose to (batch_size, num_features, sequence_length)
+        x = x.transpose(1, 2)
+        # Apply BatchNorm1d
+        x = self.batch_norm(x)
+        # Transpose back to (batch_size, sequence_length, num_features)
+        x = x.transpose(1, 2)
+        return x
+
+
 class VarianceAdaptor(nn.Module):
     """Variance Adaptor"""
 
@@ -506,9 +521,11 @@ class VarianceAdaptor(nn.Module):
         self.pitch_embedding = nn.Embedding(
             n_bins, model_config["transformer"]["encoder_hidden"]
         )
+        self.pitch_norm = TransposeBatchNorm(model_config["transformer"]["encoder_hidden"])
         self.energy_embedding = nn.Embedding(
             n_bins, model_config["transformer"]["encoder_hidden"]
         )
+        self.energy_norm = TransposeBatchNorm(model_config["transformer"]["encoder_hidden"])
 
         self.pitch_energy_drop = nn.Dropout(model_config["variance_predictor"]["dropout_on_emb"])
 
@@ -522,6 +539,7 @@ class VarianceAdaptor(nn.Module):
                 torch.bucketize(prediction, self.pitch_bins)
             )
 
+        embedding = self.pitch_norm(embedding)
         embedding = self.pitch_energy_drop(embedding)
         return prediction, embedding
 
@@ -535,6 +553,7 @@ class VarianceAdaptor(nn.Module):
                 torch.bucketize(prediction, self.energy_bins)
             )
 
+        embedding = self.energy_norm(embedding)
         embedding = self.pitch_energy_drop(embedding)
         return prediction, embedding
 

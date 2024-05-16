@@ -4,6 +4,8 @@ from .attentions import TransformerEncoder, TransformerDecoder, TemporalConvNet,
 from torch.nn.utils.rnn import pack_padded_sequence, pad_packed_sequence
 import torch.nn.functional as F
 
+
+
 # Applying LayerNorm + Dropout on embeddings increases performance, probably due to the regularizing effect
 # Thanks dathudeptrai from TensorFlowTTS for discovering this.
 class NormalizedEmbedding(nn.Module):
@@ -386,6 +388,7 @@ class DynamicDurationPredictor(nn.Module):
             self.backwards_drop = nn.Dropout(att_dropout)
             self.fw_projection = nn.Linear(2 * self.tcn_output_channels, self.tcn_output_channels)
 
+        self.final_drop = nn.Dropout(0.1)
         self.linear_projection = nn.Linear(self.tcn_output_channels, 1)
 
     def forward(self, x, x_lengths):
@@ -426,6 +429,8 @@ class DynamicDurationPredictor(nn.Module):
             # cat and project back to normal
             x = torch.cat((x, x_reversed), dim=-1)
             x = self.fw_projection(x)
+
+        x = self.final_drop(x)
 
         x = self.linear_projection(x)
         x = x.squeeze(-1)
