@@ -4,6 +4,23 @@ from .attentions import TransformerEncoder, TransformerDecoder, TemporalConvNet,
 from torch.nn.utils.rnn import pack_padded_sequence, pad_packed_sequence
 import torch.nn.functional as F
 
+# Applying LayerNorm + Dropout on embeddings increases performance, probably due to the regularizing effect
+# Thanks dathudeptrai from TensorFlowTTS for discovering this.
+class NormalizedEmbedding(nn.Module):
+    """
+    Embedding + LayerNorm + Dropout
+    """
+    def __init__(self, num_embeddings, embedding_dim, dropout=0.1):
+        super(NormalizedEmbedding, self).__init__()
+        self.embedding = nn.Embedding(num_embeddings, embedding_dim)
+        self.layer_norm = nn.LayerNorm(embedding_dim)
+        self.dropout = nn.Dropout(dropout)
+
+    def forward(self, x):
+        x = self.embedding(x)
+        x = self.layer_norm(x)
+        x = self.dropout(x)
+        return x
 
 class StochasticDropout(nn.Module):
     """

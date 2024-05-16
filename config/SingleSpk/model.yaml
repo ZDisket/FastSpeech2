@@ -7,24 +7,25 @@ transformer:
   decoder_hidden: 256
   conv_filter_size: 1024
   conv_kernel_size: [9, 1]
-  encoder_dropout: 0.15
-  decoder_dropout: 0.1
+  encoder_dropout: 0.1
+  decoder_dropout: 0.15
 
 variance_predictor:
   filter_size: 256
   kernel_size: 3
-  dropout: 0.15
+  dropout: 0.2
+  dropout_on_emb: 0.3 # dropout applied to pitch&energy embs before adding to decoder input, doesn't affect predictors directly
 
 duration_predictor:
   type: "tcn" # support tcn or lstm
-  att_dropout: 0.3 # only applies to TCN duration pred, dropout applied to attention
+  att_dropout: 0.35 # only applies to TCN duration pred, dropout applied to attention
   tcn_channels: [256, 384, 512] # only applies to TCN duration pred
   decoder_depth: 2 # lstm: depth of auxiliary decoder
   conv_depth: 2 # lstm: depth of pre-convs
   kernel_size: 3 # both: conv kernel size
   heads: 2 # both: attention heads
   filter_size: 256 # lstm: hidden size
-  dropout: 0.1 # both: dropout
+  dropout: 0.2 # both: dropout
   bidirectional: true # both: bidirectional
 
 

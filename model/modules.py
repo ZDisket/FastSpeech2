@@ -10,7 +10,7 @@ import numpy as np
 import torch.nn.functional as F
 
 from utils.tools import get_mask_from_lengths, pad
-from .submodels import VariantDurationPredictor, TemporalVariancePredictor, DynamicDurationPredictor
+from .submodels import VariantDurationPredictor, TemporalVariancePredictor, DynamicDurationPredictor, NormalizedEmbedding
 
 from typing import Optional, Tuple
 from numba import jit, prange
@@ -502,12 +502,15 @@ class VarianceAdaptor(nn.Module):
                 requires_grad=False,
             )
 
+        # I'll make these into NormalizedEmbeddings later
         self.pitch_embedding = nn.Embedding(
             n_bins, model_config["transformer"]["encoder_hidden"]
         )
         self.energy_embedding = nn.Embedding(
             n_bins, model_config["transformer"]["encoder_hidden"]
         )
+
+        self.pitch_energy_drop = nn.Dropout(model_config["variance_predictor"]["dropout_on_emb"])
 
     def get_pitch_embedding(self, x, target, mask, control):
         prediction = self.pitch_predictor(x, mask)
@@ -518,6 +521,8 @@ class VarianceAdaptor(nn.Module):
             embedding = self.pitch_embedding(
                 torch.bucketize(prediction, self.pitch_bins)
             )
+
+        embedding = self.pitch_energy_drop(embedding)
         return prediction, embedding
 
     def get_energy_embedding(self, x, target, mask, control):
@@ -529,6 +534,8 @@ class VarianceAdaptor(nn.Module):
             embedding = self.energy_embedding(
                 torch.bucketize(prediction, self.energy_bins)
             )
+
+        embedding = self.pitch_energy_drop(embedding)
         return prediction, embedding
 
     def forward(
