@@ -1,3 +1,5 @@
+from math import sqrt
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -150,7 +152,7 @@ class SwiGLUFFN(nn.Module):
 
 
 class MultiHeadAttention(nn.Module):
-    def __init__(self, embed_size, heads, alibi_alpha=1.0, start_i_increment=0, use_alibi=True, use_talking_heads=True):
+    def __init__(self, embed_size, heads, alibi_alpha=1.0, start_i_increment=0, use_alibi=True, use_talking_heads=True, num_persistent=0):
         super(MultiHeadAttention, self).__init__()
         self.embed_size = embed_size
         self.heads = heads
@@ -169,6 +171,7 @@ class MultiHeadAttention(nn.Module):
         self.alibi_alpha = alibi_alpha
         self.use_talking_heads = use_talking_heads
         self.start_i_increment = start_i_increment
+        self.num_persistent = num_persistent
 
         if self.use_alibi:
             # Precompute ALiBi slopes
@@ -179,6 +182,16 @@ class MultiHeadAttention(nn.Module):
         if self.use_talking_heads: # Talking heads: x-transformers version (using Conv2d instead of Linear)
             self.pre_softmax_talking_heads = nn.Conv2d(heads, heads, 1, bias=False)
             self.post_softmax_talking_heads = nn.Conv2d(heads, heads, 1, bias=False)
+
+        if self.num_persistent > 0:
+            # persistent vectors:
+            # (num_persistent, heads, head_dim)
+            self.persistent_keys = nn.Parameter(torch.randn(self.num_persistent, self.heads, self.head_dim))
+            self.persistent_values = nn.Parameter(torch.randn(self.num_persistent, self.heads, self.head_dim))
+
+            # Initialize persistent vectors
+            nn.init.kaiming_uniform_(self.persistent_keys, a=sqrt(self.num_persistent))
+            nn.init.kaiming_uniform_(self.persistent_values, a=sqrt(self.num_persistent))
 
 
     def forward(self, values, keys, queries, mask=None):
@@ -194,6 +207,14 @@ class MultiHeadAttention(nn.Module):
         keys = self.keys(keys)
         queries = self.queries(queries)
 
+        if self.num_persistent > 0:
+            expanded_persistent_keys = self.persistent_keys.unsqueeze(0).expand(N, -1, -1, -1)
+            expanded_persistent_values = self.persistent_values.unsqueeze(0).expand(N, -1, -1, -1)
+
+            # Concatenate persistent vectors to keys and values
+            keys = torch.cat([keys, expanded_persistent_keys], dim=1)
+            values = torch.cat([values, expanded_persistent_values], dim=1)
+
         # Compute energy using einsum, simplifying matrix multiplication across batches and heads
         energy = torch.einsum("nqhd,nkhd->nhqk", [queries, keys])
 
@@ -203,12 +224,25 @@ class MultiHeadAttention(nn.Module):
             t_k = torch.arange(key_len, device=self.slopes.device)
             alibi_bias = (t_q.view(1, 1, -1, 1) - t_k.view(1, 1, 1, -1)).abs()
             alibi_bias = -alibi_bias * self.slopes
+
+            if self.num_persistent > 0:
+                # Extend ALiBi bias for persistent vectors with zero bias (so that it is allowed to attend to everything)
+                extended_alibi_bias = F.pad(alibi_bias, (0, self.num_persistent), "constant", 0)
+                extended_alibi_bias = extended_alibi_bias.to(energy.device)
+                alibi_bias = extended_alibi_bias
+
             energy += alibi_bias.to(energy.device)
 
         if self.use_talking_heads:
             energy = self.pre_softmax_talking_heads(energy)
 
         if mask is not None:                        #-1e4 for numerical stability with fp16
+            if self.num_persistent > 0:
+                # Extend mask to include persistent vectors (always unmasked)
+                extended_mask = F.pad(mask, (0, self.num_persistent), value=1)
+                extended_mask = extended_mask.expand(N, self.heads, query_len, key_len + self.num_persistent)
+                mask = extended_mask
+
             energy = energy.masked_fill(mask == 0, float("-1e4"))
 
         attention = F.softmax(energy / (self.embed_size ** (1 / 2)), dim=3)
@@ -432,7 +466,8 @@ class TCNAttentionBlock(nn.Module):
     """
     def __init__(self, in_channels, out_channels, kernel_size, heads, att_dropout, dropout, dilation, alibi_alpha, start_i_increment=0):
         super(TCNAttentionBlock, self).__init__()
-        self.attention = MultiHeadAttention(in_channels, heads, alibi_alpha=alibi_alpha, start_i_increment=start_i_increment)
+        self.attention = MultiHeadAttention(in_channels, heads, alibi_alpha=alibi_alpha, start_i_increment=start_i_increment,
+                                            num_persistent=16)
         self.dropout1 = nn.Dropout(att_dropout)  # Dropout for attention
         padding = (kernel_size - 1) * dilation  # Calculate padding based on dilation
         self.temporal_block = TemporalBlock(in_channels, out_channels, kernel_size, stride=1, dilation=dilation,
