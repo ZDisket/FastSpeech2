@@ -441,6 +441,7 @@ class VarianceAdaptor(nn.Module):
                 heads=model_config["duration_predictor"]["heads"],
                 bidirectional=model_config["duration_predictor"]["bidirectional"],
             )
+            dp_output_channels = model_config["duration_predictor"]["tcn_channels"][-1]
         elif dp_type == "lstm":
             self.duration_predictor = VariantDurationPredictor(
                 text_channels=model_config["transformer"]["encoder_hidden"],
@@ -454,8 +455,10 @@ class VarianceAdaptor(nn.Module):
                 start_i=3,
                 lstm_bidirectional=model_config["duration_predictor"]["bidirectional"],
             )
+            dp_output_channels = model_config["duration_predictor"]["filter_size"]
         else:
             raise RuntimeError(f"Invalid duration predictor type: {dp_type}. Valid are tcn and lstm")
+
 
         self.length_regulator = LengthRegulator()
         self.pitch_predictor = TemporalVariancePredictor(
@@ -463,12 +466,14 @@ class VarianceAdaptor(nn.Module):
             num_channels=[model_config["variance_predictor"]["filter_size"]] * 2,
             kernel_size=model_config["variance_predictor"]["kernel_size"],
             dropout=model_config["variance_predictor"]["dropout"],
+            cond_input_size=dp_output_channels,
         )
         self.energy_predictor = TemporalVariancePredictor(
             input_channels=model_config["transformer"]["encoder_hidden"],
             num_channels=[model_config["variance_predictor"]["filter_size"]] * 2,
             kernel_size=model_config["variance_predictor"]["kernel_size"],
             dropout=model_config["variance_predictor"]["dropout"],
+            cond_input_size=dp_output_channels,
         )
 
         self.pitch_feature_level = preprocess_config["preprocessing"]["pitch"][
@@ -530,8 +535,8 @@ class VarianceAdaptor(nn.Module):
 
         self.pitch_energy_drop = nn.Dropout(model_config["variance_predictor"]["dropout_on_emb"])
 
-    def get_pitch_embedding(self, x, target, mask, control):
-        prediction = self.pitch_predictor(x, mask)
+    def get_pitch_embedding(self, x, target, mask, control, y, y_mask):
+        prediction = self.pitch_predictor(x, mask, y, y_mask)
         if target is not None:
             embedding = self.pitch_embedding(torch.bucketize(target, self.pitch_bins))
         else:
@@ -544,8 +549,8 @@ class VarianceAdaptor(nn.Module):
         embedding = self.pitch_energy_drop(embedding)
         return prediction, embedding
 
-    def get_energy_embedding(self, x, target, mask, control):
-        prediction = self.energy_predictor(x, mask)
+    def get_energy_embedding(self, x, target, mask, control, y, y_mask):
+        prediction = self.energy_predictor(x, mask, y, y_mask)
         if target is not None:
             embedding = self.energy_embedding(torch.bucketize(target, self.energy_bins))
         else:
@@ -572,17 +577,17 @@ class VarianceAdaptor(nn.Module):
             e_control=1.0,
             d_control=1.0,
     ):
-        log_duration_prediction, x_mask = self.duration_predictor(x, src_lens)
+        log_duration_prediction, x_mask, dur_hidden = self.duration_predictor(x, src_lens)
 
 
         if self.pitch_feature_level == "phoneme_level":
             pitch_prediction, pitch_embedding = self.get_pitch_embedding(
-                x, pitch_target, src_mask, p_control
+                x, pitch_target, src_mask, p_control, dur_hidden, x_mask
             )
             x = x + pitch_embedding
         if self.energy_feature_level == "phoneme_level":
             energy_prediction, energy_embedding = self.get_energy_embedding(
-                x, energy_target, src_mask, p_control
+                x, energy_target, src_mask, p_control, dur_hidden, x_mask
             )
             x = x + energy_embedding
 
@@ -599,12 +604,12 @@ class VarianceAdaptor(nn.Module):
 
         if self.pitch_feature_level == "frame_level":
             pitch_prediction, pitch_embedding = self.get_pitch_embedding(
-                x, pitch_target, mel_mask, p_control
+                x, pitch_target, mel_mask, p_control, dur_hidden, x_mask
             )
             x = x + pitch_embedding
         if self.energy_feature_level == "frame_level":
             energy_prediction, energy_embedding = self.get_energy_embedding(
-                x, energy_target, mel_mask, p_control
+                x, energy_target, mel_mask, p_control, dur_hidden, x_mask
             )
             x = x + energy_embedding
 

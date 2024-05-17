@@ -1,9 +1,8 @@
 import torch
 import torch.nn as nn
-from .attentions import TransformerEncoder, TransformerDecoder, TemporalConvNet, TCNAttention
+from .attentions import TransformerEncoder, TransformerDecoder, TemporalConvNet, TCNAttention, MultiHeadAttention
 from torch.nn.utils.rnn import pack_padded_sequence, pad_packed_sequence
 import torch.nn.functional as F
-
 
 
 # Applying LayerNorm + Dropout on embeddings increases performance, probably due to the regularizing effect
@@ -12,6 +11,7 @@ class NormalizedEmbedding(nn.Module):
     """
     Embedding + LayerNorm + Dropout
     """
+
     def __init__(self, num_embeddings, embedding_dim, dropout=0.1):
         super(NormalizedEmbedding, self).__init__()
         self.embedding = nn.Embedding(num_embeddings, embedding_dim)
@@ -24,17 +24,19 @@ class NormalizedEmbedding(nn.Module):
         x = self.dropout(x)
         return x
 
+
 class StochasticDropout(nn.Module):
     """
     Also known as Monte Carlo dropout, StochasticDropout keeps a lower dropout rate to apply during inference, for stochasticity.
     If not specified, it will be dropout / 3, with the minimum being 0.1
     """
+
     def __init__(self, p=0.5, p_inference=None, min_p_inference=0.1, stochastic=False):
         super(StochasticDropout, self).__init__()
         self.p = p  # Dropout probability during training
 
         if p_inference is None:
-            p_inference = max(min_p_inference, p / 3) # ensure stochastic dropout is at least 0.1
+            p_inference = max(min_p_inference, p / 3)  # ensure stochastic dropout is at least 0.1
 
         self.p_inference = p_inference  # Dropout probability during inference
         self.stochastic = stochastic
@@ -49,10 +51,9 @@ class StochasticDropout(nn.Module):
                 return F.dropout(x, self.p, self.training)
 
 
-
-
 class TextEncoder(nn.Module):
-    def __init__(self, vocab_size, embed_size, num_heads, num_layers, forward_expansion, dropout, alibi_alpha=1.0, start_i=0):
+    def __init__(self, vocab_size, embed_size, num_heads, num_layers, forward_expansion, dropout, alibi_alpha=1.0,
+                 start_i=0):
         super(TextEncoder, self).__init__()
         self.embed = nn.Embedding(vocab_size, embed_size)
         self.emb_norm = nn.LayerNorm(embed_size)
@@ -172,7 +173,8 @@ class VariantDurationPredictor(nn.Module):
             self.post_conv_drop = nn.Identity()
 
         self.decoder = TransformerDecoder(embed_size=filter_channels, heads=heads, num_layers=depth,
-                                          forward_expansion=4, dropout=p_dropout, alibi_alpha=1.5, mode="conv", kernel_size=3, start_i=start_i)
+                                          forward_expansion=4, dropout=p_dropout, alibi_alpha=1.5, mode="conv",
+                                          kernel_size=3, start_i=start_i)
 
         lstm_channels = filter_channels // 2
 
@@ -263,19 +265,42 @@ class VariantDurationPredictor(nn.Module):
 
         log_durations = log_durations.squeeze(1)  # (batch, 1, seq_len) => (batch, seq_len)
 
-        return log_durations, x_mask
+        x_mask = x_mask.squeeze(1).bool()
+        x_mask = ~x_mask
+
+        return log_durations, x_mask, x
 
 
 # VariancePredictor but using TCNs for cheaper-than-RNN temporal dependencies.
 class TemporalVariancePredictor(nn.Module):
 
-    def __init__(self, input_channels, num_channels, kernel_size=2, dropout=0.2):
+    def __init__(self, input_channels, num_channels, kernel_size=2, dropout=0.2, cond_input_size=None):
         super(TemporalVariancePredictor, self).__init__()
         # Temporal Convolutional Network
         self.tcn = TemporalConvNet(input_channels, num_channels, kernel_size=kernel_size, dropout=dropout)
         self.final_drop = StochasticDropout(dropout)
+        self.cond_input_size = cond_input_size
+        self.input_channels = input_channels
 
         self.output_layer = nn.Linear(num_channels[-1], 1)
+
+        # Duration-Spectrogram pre-conditioning
+        # AllAttention(duration_hidden) => LayerNorm => Dropout
+        if self.cond_input_size is not None:
+            # nn.Identity is useful for not writing control flows in inference code
+            # (risks confusing TorchScript and ONNX)
+            self.cond_pre_proj = nn.Identity()
+
+            if self.cond_input_size != input_channels:
+                self.cond_pre_proj = nn.Linear(self.cond_input_size, self.input_channels)
+
+            self.cond_attention = MultiHeadAttention(self.input_channels, 2, alibi_alpha=1.5,
+                                                     start_i_increment=1, num_persistent=16)
+
+            self.cond_norm = nn.LayerNorm(self.input_channels)
+
+            self.inter_cond_drop = nn.Dropout(0.1)
+            self.cond_drop = nn.Dropout(0.25)
 
         # Initialize weights
         self.init_weights()
@@ -289,9 +314,54 @@ class TemporalVariancePredictor(nn.Module):
                     nn.init.constant_(m.bias, 0)
             elif isinstance(m, nn.Linear):
                 nn.init.uniform_(m.weight, -initrange, initrange)
-                nn.init.constant_(m.bias, 0)
+                if m.bias is not None:
+                    nn.init.constant_(m.bias, 0)
 
-    def forward(self, x, x_mask):
+
+    def make_cond_vector(self, x, y, x_mask, y_mask):
+        """
+        Create conditioning vector
+        :param x: Input size (batch, seq_len, channels)
+        :param y: Conditioning size  (batch, cond_len, cond_channels)
+        :param x_mask: Mask of x size (batch, seq_len), where True is padded
+        :param y_mask: Mask of y size (batch, cond_len), where True is padded
+
+        :return: Conditioning vector, ready to add to hidden states
+        """
+        x_mask_expanded = x_mask.unsqueeze(1).unsqueeze(3)  # Shape: (batch_size, 1, mel_len, 1)
+        y_mask_expanded = y_mask.unsqueeze(1).unsqueeze(2)  # Shape: (batch_size, 1, 1, duration_len)
+
+        # Combine masks using broadcasting
+        attention_mask = x_mask_expanded & y_mask_expanded  # Shape: (batch_size, 1, mel_len, duration_len)
+        attention_mask = ~attention_mask  # True=padded => True=valid
+
+        y = self.cond_pre_proj(y)
+        y = self.inter_cond_drop(y)
+
+        z = self.cond_attention(y, y, x, mask=attention_mask)
+        z = self.inter_cond_drop(z)
+
+        z = self.cond_norm(z)
+
+        return z
+
+    def forward(self, x, x_mask, y, y_mask):
+        """
+        Forward pass through the Temporal Variance Predictor
+
+        :param x: Input hidden size (batch, seq_len, channels)
+        :param x_mask: Mask of x size (batch, seq_len), where True is padded
+        :param y: Conditioning hidden size (batch, cond_len, cond_channels)
+        :param y_mask: Mask of y size (batch, cond_len), where True is padded
+
+        :return: Predictions
+        """
+
+        if self.cond_input_size is not None:
+            cond = self.make_cond_vector(x, y, x_mask, y_mask)
+            cond = self.cond_drop(cond)
+            x = x + cond
+
         # Pass input through the TCN
         x = x.transpose(1, 2)  # (batch, seq_len, channels) => (batch, channels, seq_len)
         x_mask = x_mask.unsqueeze(1)  # (batch, seq_len) => (batch, 1, seq_len)
@@ -371,7 +441,8 @@ def mask_to_attention_mask(mask):
 
 
 class DynamicDurationPredictor(nn.Module):
-    def __init__(self, num_inputs, num_channels, kernel_size=2, dropout=0.2, att_dropout=0.3, alibi_alpha=1.5, start_i=0, heads=2, bidirectional=False):
+    def __init__(self, num_inputs, num_channels, kernel_size=2, dropout=0.2, att_dropout=0.3, alibi_alpha=1.5,
+                 start_i=0, heads=2, bidirectional=False):
         super(DynamicDurationPredictor, self).__init__()
 
         self.tcn_output_channels = num_channels[-1]
@@ -382,8 +453,9 @@ class DynamicDurationPredictor(nn.Module):
                                           alibi_alpha=alibi_alpha, start_i_increment=start_i)
         if self.bidirectional:
             print("BiAttTCN")
-            self.backwards_tcn_attention = TCNAttention(num_inputs, num_channels, kernel_size, dropout, att_dropout, heads,
-                                           alibi_alpha=alibi_alpha, start_i_increment=start_i)
+            self.backwards_tcn_attention = TCNAttention(num_inputs, num_channels, kernel_size, dropout, att_dropout,
+                                                        heads,
+                                                        alibi_alpha=alibi_alpha, start_i_increment=start_i)
             # prevent model from overrelying on backwards features
             self.backwards_drop = nn.Dropout(att_dropout)
             self.fw_projection = nn.Linear(2 * self.tcn_output_channels, self.tcn_output_channels)
@@ -432,9 +504,8 @@ class DynamicDurationPredictor(nn.Module):
 
         x = self.final_drop(x)
 
-        x = self.linear_projection(x)
-        x = x.squeeze(-1)
-        x = x.masked_fill(mask, 0)
+        durations = self.linear_projection(x)
+        durations = durations.squeeze(-1)
+        durations = durations.masked_fill(mask, 0)
 
-        return x, mask.float()
-
+        return durations, mask, x
