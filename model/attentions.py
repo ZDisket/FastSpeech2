@@ -150,8 +150,15 @@ class SwiGLUFFN(nn.Module):
         hidden = F.silu(x1) * x2
         return self.w3(hidden)
 
-
 class MultiHeadAttention(nn.Module):
+    """
+    Modern Multi Head Attention. Contains:
+
+    num_persistent: "Augmenting Self-attention with Persistent Memory" (https://arxiv.org/abs/1907.01470)
+    use_talking_heads: "Talking-Heads Attention" (https://arxiv.org/abs/2003.02436)
+    use_alibi: "Attention with Linear Biases" (https://ofir.io/train_short_test_long.pdf)
+
+    """
     def __init__(self, embed_size, heads, alibi_alpha=1.0, start_i_increment=0, use_alibi=True, use_talking_heads=True, num_persistent=0):
         super(MultiHeadAttention, self).__init__()
         self.embed_size = embed_size
@@ -462,7 +469,7 @@ class TCNAttentionBlock(nn.Module):
     """
     Transformer-inspired TCNAttentionBlock:
 
-    x + Drop(MultiHeadAttention(x)) => TemporalBlock => Drop(BatchNorm)
+    x + Drop(AllAttention(x)) => TemporalBlock => Drop(LayerNorm)
     """
     def __init__(self, in_channels, out_channels, kernel_size, heads, att_dropout, dropout, dilation, alibi_alpha, start_i_increment=0):
         super(TCNAttentionBlock, self).__init__()
@@ -472,7 +479,7 @@ class TCNAttentionBlock(nn.Module):
         padding = (kernel_size - 1) * dilation  # Calculate padding based on dilation
         self.temporal_block = TemporalBlock(in_channels, out_channels, kernel_size, stride=1, dilation=dilation,
                                             padding=padding, dropout=dropout)
-        self.batch_norm = nn.BatchNorm1d(out_channels)
+        self.norm = nn.LayerNorm(out_channels)
         self.dropout2 = nn.Dropout(dropout)
 
     def forward(self, x, mask):
@@ -494,7 +501,8 @@ class TCNAttentionBlock(nn.Module):
         conv_mask = reduce_mask(mask)
         x = x.masked_fill(conv_mask == 0, 0)
 
-        x = self.batch_norm(x).transpose(1, 2) # x = (batch, seq_len, channels)
+        x = x.transpose(1,2) # (batch, channels, seq_len) => (batch, seq_len, channels)
+        x = self.norm(x)
         x = self.dropout2(x)
 
         return x
