@@ -158,6 +158,8 @@ class MultiHeadAttention(nn.Module):
     use_talking_heads: "Talking-Heads Attention" (https://arxiv.org/abs/2003.02436)
     use_alibi: "Attention with Linear Biases" (https://ofir.io/train_short_test_long.pdf)
 
+    If num_persistent > 0, we call this an AllAttention layer.
+
     """
     def __init__(self, embed_size, heads, alibi_alpha=1.0, start_i_increment=0, use_alibi=True, use_talking_heads=True, num_persistent=0):
         super(MultiHeadAttention, self).__init__()
@@ -193,6 +195,7 @@ class MultiHeadAttention(nn.Module):
         if self.num_persistent > 0:
             # persistent vectors:
             # (num_persistent, heads, head_dim)
+            # Could shaping the persistent vectors like this also result in inter-head communication?
             self.persistent_keys = nn.Parameter(torch.randn(self.num_persistent, self.heads, self.head_dim))
             self.persistent_values = nn.Parameter(torch.randn(self.num_persistent, self.heads, self.head_dim))
 

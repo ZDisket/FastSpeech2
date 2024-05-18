@@ -285,22 +285,21 @@ class TemporalVariancePredictor(nn.Module):
         self.output_layer = nn.Linear(num_channels[-1], 1)
 
         # Duration-Spectrogram pre-conditioning
-        # AllAttention(duration_hidden) => LayerNorm => Dropout
+        # Conv1D => ReLU => AllAttention(duration_hidden,spec) => LayerNorm => ReLU => Dropout
         if self.cond_input_size is not None:
-            # nn.Identity is useful for not writing control flows in inference code
-            # (risks confusing TorchScript and ONNX)
-            self.cond_pre_proj = nn.Identity()
 
-            if self.cond_input_size != input_channels:
-                self.cond_pre_proj = nn.Linear(self.cond_input_size, self.input_channels)
+            self.cond_proj = nn.Conv1d(self.cond_input_size, self.input_channels,
+                                       3, padding="same")
 
-            self.cond_attention = MultiHeadAttention(self.input_channels, 2, alibi_alpha=1.5,
-                                                     start_i_increment=1, num_persistent=16)
+            # For some reason, this case benefits from having 4 heads instead of 2
+            self.cond_attention = MultiHeadAttention(self.input_channels, 4, alibi_alpha=1.5,
+                                                     start_i_increment=4, num_persistent=16)
 
             self.cond_norm = nn.LayerNorm(self.input_channels)
 
-            self.inter_cond_drop = nn.Dropout(0.1)
-            self.cond_drop = nn.Dropout(0.25)
+            self.cond_act = nn.ReLU()
+            self.inter_cond_drop = nn.Dropout(0.25)
+            self.cond_drop = nn.Dropout(0.5)
 
         # Initialize weights
         self.init_weights()
@@ -309,11 +308,11 @@ class TemporalVariancePredictor(nn.Module):
         initrange = 0.1
         for m in self.modules():
             if isinstance(m, nn.Conv1d):
-                nn.init.uniform_(m.weight, -initrange, initrange)
+                nn.init.kaiming_uniform_(m.weight, nonlinearity='relu')
                 if m.bias is not None:
                     nn.init.constant_(m.bias, 0)
             elif isinstance(m, nn.Linear):
-                nn.init.uniform_(m.weight, -initrange, initrange)
+                nn.init.xavier_uniform_(m.weight)
                 if m.bias is not None:
                     nn.init.constant_(m.bias, 0)
 
@@ -335,13 +334,19 @@ class TemporalVariancePredictor(nn.Module):
         attention_mask = x_mask_expanded & y_mask_expanded  # Shape: (batch_size, 1, mel_len, duration_len)
         attention_mask = ~attention_mask  # True=padded => True=valid
 
-        y = self.cond_pre_proj(y)
+        # (batch, seq_len, channels) <=> (batch, channels, seq_len)
+        y = self.cond_proj(
+            y.transpose(1, 2)
+        ).transpose(1,2)
+
+        y = self.cond_act(y)
         y = self.inter_cond_drop(y)
 
         z = self.cond_attention(y, y, x, mask=attention_mask)
         z = self.inter_cond_drop(z)
 
         z = self.cond_norm(z)
+        z = self.cond_act(z)
 
         return z
 
@@ -358,6 +363,10 @@ class TemporalVariancePredictor(nn.Module):
         """
 
         if self.cond_input_size is not None:
+            # Prevent backpropagation into the duration predictor
+            # If we don't do this, it tries to optimize the DP for pitch&energy and severely overfits
+            y = y.detach()
+
             cond = self.make_cond_vector(x, y, x_mask, y_mask)
             cond = self.cond_drop(cond)
             x = x + cond
