@@ -334,7 +334,7 @@ class TemporalVariancePredictor(nn.Module):
         attention_mask = x_mask_expanded & y_mask_expanded  # Shape: (batch_size, 1, mel_len, duration_len)
         attention_mask = ~attention_mask  # True=padded => True=valid
 
-        # (batch, seq_len, channels) <=> (batch, channels, seq_len)
+        # (batch, seq_len, channels) <<=> (batch, channels, seq_len)
         y = self.cond_proj(
             y.transpose(1, 2)
         ).transpose(1,2)
@@ -451,7 +451,7 @@ def mask_to_attention_mask(mask):
 
 class DynamicDurationPredictor(nn.Module):
     def __init__(self, num_inputs, num_channels, kernel_size=2, dropout=0.2, att_dropout=0.3, alibi_alpha=1.5,
-                 start_i=0, heads=2, bidirectional=False):
+                 start_i=0, heads=2, bidirectional=False, backwards_channels=[256, 256], backwards_heads=[2,2]):
         super(DynamicDurationPredictor, self).__init__()
 
         self.tcn_output_channels = num_channels[-1]
@@ -461,13 +461,15 @@ class DynamicDurationPredictor(nn.Module):
         self.tcn_attention = TCNAttention(num_inputs, num_channels, kernel_size, dropout, att_dropout, heads,
                                           alibi_alpha=alibi_alpha, start_i_increment=start_i)
         if self.bidirectional:
-            print("BiAttTCN")
-            self.backwards_tcn_attention = TCNAttention(num_inputs, num_channels, kernel_size, dropout, att_dropout,
-                                                        heads,
+            self.backwards_tcn_attention = TCNAttention(num_inputs, backwards_channels, kernel_size, dropout, att_dropout,
+                                                        backwards_heads,
                                                         alibi_alpha=alibi_alpha, start_i_increment=start_i)
+
+            self.bw_tcn_output_channels = backwards_channels[-1]
+
             # prevent model from overrelying on backwards features
             self.backwards_drop = nn.Dropout(att_dropout)
-            self.fw_projection = nn.Linear(2 * self.tcn_output_channels, self.tcn_output_channels)
+            self.fw_projection = nn.Linear(self.tcn_output_channels + self.bw_tcn_output_channels, self.tcn_output_channels)
 
         self.final_drop = nn.Dropout(0.1)
         self.linear_projection = nn.Linear(self.tcn_output_channels, 1)
@@ -479,7 +481,7 @@ class DynamicDurationPredictor(nn.Module):
         :param x: Encoded text size (batch, seq_len, channels)
         :param x_lengths: Int tensor of the lengths of x size (batch,)
 
-        :return: Predicted durations size (batch, seq_len)
+        :return: Predicted durations size (batch, seq_len), True=padded mask of x size (batch, seq_len), duration hidden states
         """
         # Generate the appropriate mask for attention
         max_length = x.size(1)

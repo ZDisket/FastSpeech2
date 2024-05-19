@@ -150,6 +150,7 @@ class SwiGLUFFN(nn.Module):
         hidden = F.silu(x1) * x2
         return self.w3(hidden)
 
+
 class MultiHeadAttention(nn.Module):
     """
     Modern Multi Head Attention. Contains:
@@ -161,7 +162,9 @@ class MultiHeadAttention(nn.Module):
     If num_persistent > 0, we call this an AllAttention layer.
 
     """
-    def __init__(self, embed_size, heads, alibi_alpha=1.0, start_i_increment=0, use_alibi=True, use_talking_heads=True, num_persistent=0):
+
+    def __init__(self, embed_size, heads, alibi_alpha=1.0, start_i_increment=0, use_alibi=True, use_talking_heads=True,
+                 num_persistent=0):
         super(MultiHeadAttention, self).__init__()
         self.embed_size = embed_size
         self.heads = heads
@@ -188,7 +191,7 @@ class MultiHeadAttention(nn.Module):
                 [2 ** (-self.alibi_alpha * (i + self.start_i_increment)) for i in range(1, self.heads + 1)],
                 dtype=torch.float32).view(1, self.heads, 1, 1)
 
-        if self.use_talking_heads: # Talking heads: x-transformers version (using Conv2d instead of Linear)
+        if self.use_talking_heads:  # Talking heads: x-transformers version (using Conv2d instead of Linear)
             self.pre_softmax_talking_heads = nn.Conv2d(heads, heads, 1, bias=False)
             self.post_softmax_talking_heads = nn.Conv2d(heads, heads, 1, bias=False)
 
@@ -202,7 +205,6 @@ class MultiHeadAttention(nn.Module):
             # Initialize persistent vectors
             nn.init.kaiming_uniform_(self.persistent_keys, a=sqrt(self.num_persistent))
             nn.init.kaiming_uniform_(self.persistent_values, a=sqrt(self.num_persistent))
-
 
     def forward(self, values, keys, queries, mask=None):
         N = queries.shape[0]
@@ -246,20 +248,19 @@ class MultiHeadAttention(nn.Module):
         if self.use_talking_heads:
             energy = self.pre_softmax_talking_heads(energy)
 
-        if mask is not None:                        #-1e4 for numerical stability with fp16
+        if mask is not None:
             if self.num_persistent > 0:
                 # Extend mask to include persistent vectors (always unmasked)
                 extended_mask = F.pad(mask, (0, self.num_persistent), value=1)
                 extended_mask = extended_mask.expand(N, self.heads, query_len, key_len + self.num_persistent)
                 mask = extended_mask
-
+                # -1e4 for numerical stability with fp16
             energy = energy.masked_fill(mask == 0, float("-1e4"))
 
         attention = F.softmax(energy / (self.embed_size ** (1 / 2)), dim=3)
 
         if self.use_talking_heads:
             attention = self.post_softmax_talking_heads(attention)
-
 
         out = torch.einsum("nhql,nlhd->nqhd", [attention, values]).reshape(
             N, query_len, self.heads * self.head_dim
@@ -269,17 +270,14 @@ class MultiHeadAttention(nn.Module):
         return out
 
 
-
-
-
-
 # pre-LN transformer Encoder with SwiGLUFFN
 class TransformerEncoderLayer(nn.Module):
     def __init__(self, embed_size, heads, forward_expansion, dropout, alibi_alpha=1.0, start_i_increment=0):
         super(TransformerEncoderLayer, self).__init__()
         self.norm1 = nn.LayerNorm(embed_size)
         self.norm2 = nn.LayerNorm(embed_size)
-        self.attention = MultiHeadAttention(embed_size, heads, alibi_alpha=alibi_alpha, start_i_increment=start_i_increment)
+        self.attention = MultiHeadAttention(embed_size, heads, alibi_alpha=alibi_alpha,
+                                            start_i_increment=start_i_increment)
         self.feed_forward = SwiGLUConvFFN(
             in_features=embed_size,
             hidden_features=forward_expansion * embed_size,
@@ -311,10 +309,11 @@ class TransformerEncoderLayer(nn.Module):
 
 
 class TransformerEncoder(nn.Module):
-    def __init__(self, embed_size, heads, num_layers, forward_expansion, dropout, alibi_alpha=1.0, start_i = 0):
+    def __init__(self, embed_size, heads, num_layers, forward_expansion, dropout, alibi_alpha=1.0, start_i=0):
         super(TransformerEncoder, self).__init__()
-        self.encoder_layers = nn.ModuleList([                                                               # Index-Ramped ALiBi
-            TransformerEncoderLayer(embed_size, heads, forward_expansion, dropout, alibi_alpha=alibi_alpha, start_i_increment=start_i + (i * heads))
+        self.encoder_layers = nn.ModuleList([  # Index-Ramped ALiBi
+            TransformerEncoderLayer(embed_size, heads, forward_expansion, dropout, alibi_alpha=alibi_alpha,
+                                    start_i_increment=start_i + (i * heads))
             for i in range(num_layers)
         ])
         self.dropout = nn.Dropout(dropout)
@@ -335,14 +334,16 @@ class TransformerEncoder(nn.Module):
 
 
 class TransformerDecoderLayer(nn.Module):
-    def __init__(self, embed_size, heads, forward_expansion, dropout, alibi_alpha, start_i_index, mode="linear", kernel_size=3):
+    def __init__(self, embed_size, heads, forward_expansion, dropout, alibi_alpha, start_i_index, mode="linear",
+                 kernel_size=3):
         super(TransformerDecoderLayer, self).__init__()
         self.norm1 = nn.LayerNorm(embed_size)
         self.norm2 = nn.LayerNorm(embed_size)
         self.norm3 = nn.LayerNorm(embed_size)
 
         self.self_attention = MultiHeadAttention(embed_size, heads, alibi_alpha, start_i_index)
-        self.encoder_decoder_attention = MultiHeadAttention(embed_size, heads, alibi_alpha, start_i_index)  # Not used in isolation
+        self.encoder_decoder_attention = MultiHeadAttention(embed_size, heads, alibi_alpha,
+                                                            start_i_index)  # Not used in isolation
 
         if mode == "linear":
             self.feed_forward = nn.Sequential(
@@ -380,11 +381,13 @@ class TransformerDecoderLayer(nn.Module):
 
 
 class TransformerDecoder(nn.Module):
-    def __init__(self, embed_size, heads, num_layers, forward_expansion, dropout, alibi_alpha, mode="linear", kernel_size=3, start_i=0):
+    def __init__(self, embed_size, heads, num_layers, forward_expansion, dropout, alibi_alpha, mode="linear",
+                 kernel_size=3, start_i=0):
         super(TransformerDecoder, self).__init__()
 
         self.layers = nn.ModuleList([
-            TransformerDecoderLayer(embed_size, heads, forward_expansion, dropout, alibi_alpha, start_i + (i * heads), mode, kernel_size)
+            TransformerDecoderLayer(embed_size, heads, forward_expansion, dropout, alibi_alpha, start_i + (i * heads),
+                                    mode, kernel_size)
             for i in range(num_layers)
         ])
 
@@ -393,8 +396,6 @@ class TransformerDecoder(nn.Module):
             x = layer(x, src_encodings, src_encodings, src_mask, tgt_mask)
 
         return x
-
-
 
 
 class Chomp1d(nn.Module):
@@ -446,10 +447,10 @@ class TemporalConvNet(nn.Module):
         num_levels = len(num_channels)
         for i in range(num_levels):
             dilation_size = 2 ** i
-            in_channels = num_inputs if i == 0 else num_channels[i-1]
+            in_channels = num_inputs if i == 0 else num_channels[i - 1]
             out_channels = num_channels[i]
             layers += [TemporalBlock(in_channels, out_channels, kernel_size, stride=1, dilation=dilation_size,
-                                     padding=(kernel_size-1) * dilation_size, dropout=dropout)]
+                                     padding=(kernel_size - 1) * dilation_size, dropout=dropout)]
 
         self.network = nn.Sequential(*layers)
 
@@ -474,9 +475,12 @@ class TCNAttentionBlock(nn.Module):
 
     x + Drop(AllAttention(x)) => TemporalBlock => Drop(LayerNorm)
     """
-    def __init__(self, in_channels, out_channels, kernel_size, heads, att_dropout, dropout, dilation, alibi_alpha, start_i_increment=0):
+
+    def __init__(self, in_channels, out_channels, kernel_size, heads, att_dropout, dropout, dilation, alibi_alpha,
+                 start_i_increment=0):
         super(TCNAttentionBlock, self).__init__()
-        self.attention = MultiHeadAttention(in_channels, heads, alibi_alpha=alibi_alpha, start_i_increment=start_i_increment,
+        self.attention = MultiHeadAttention(in_channels, heads, alibi_alpha=alibi_alpha,
+                                            start_i_increment=start_i_increment,
                                             num_persistent=16)
         self.dropout1 = nn.Dropout(att_dropout)  # Dropout for attention
         padding = (kernel_size - 1) * dilation  # Calculate padding based on dilation
@@ -504,7 +508,7 @@ class TCNAttentionBlock(nn.Module):
         conv_mask = reduce_mask(mask)
         x = x.masked_fill(conv_mask == 0, 0)
 
-        x = x.transpose(1,2) # (batch, channels, seq_len) => (batch, seq_len, channels)
+        x = x.transpose(1, 2)  # (batch, channels, seq_len) => (batch, seq_len, channels)
         x = self.norm(x)
         x = self.dropout2(x)
 
@@ -512,17 +516,21 @@ class TCNAttentionBlock(nn.Module):
 
 
 class TCNAttention(nn.Module):
-    def __init__(self, num_inputs, num_channels, kernel_size=2, dropout=0.2, att_dropout=0.3, heads=2, alibi_alpha=1.25, start_i_increment=1):
+    def __init__(self, num_inputs, num_channels, kernel_size=2, dropout=0.2, att_dropout=0.3, heads=[2, 2, 2],
+                 alibi_alpha=1.25, start_i_increment=1):
         super(TCNAttention, self).__init__()
         self.layers = nn.ModuleList()
 
+        if len(heads) != len(num_channels):
+            raise ValueError("The length of heads must be equal to the length of num_channels")
+
         # Initialize TCNAttentionBlocks with proper dilation rates
         current_channels = num_inputs
-        for level, out_channels in enumerate(num_channels):
+        for level, (out_channels, num_heads) in enumerate(zip(num_channels, heads)):
             dilation = 2 ** level
-            self.layers.append(TCNAttentionBlock(current_channels, out_channels, kernel_size, heads,
+            self.layers.append(TCNAttentionBlock(current_channels, out_channels, kernel_size, num_heads,
                                                  att_dropout, dropout, dilation, alibi_alpha=alibi_alpha,
-                                                 start_i_increment=start_i_increment + (level * heads)
+                                                 start_i_increment=start_i_increment + (level * num_heads)
                                                  )
                                )
             current_channels = out_channels  # The output of the current block is the input for the next

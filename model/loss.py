@@ -300,7 +300,7 @@ class FastSpeech3Loss(nn.Module):
         self.bin_loss = BinLoss()
         self.mse2_loss = MSE1D()
         self.charb_loss = Charbonnier1D()
-        self.temp_loss = TemporalConsistencyLoss(0.35, True) # I tested 0.35, 0.5, 0.75, but 1.0 is best
+        self.temp_loss = TemporalConsistencyLoss(1.0, True) # I tested 0.35, 0.5, 0.75, but 1.0 is best
 
         # With all our new losses (attention, masked duration, temporal), the mel loss (individual) goes from being 20% of the loss
         # to just 6% and audio quality suffers greatly. We re-weight, although too much is detrimental.

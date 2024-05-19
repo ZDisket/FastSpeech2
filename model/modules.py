@@ -438,8 +438,10 @@ class VarianceAdaptor(nn.Module):
                 dropout=model_config["duration_predictor"]["dropout"],
                 start_i=1,
                 att_dropout=model_config["duration_predictor"]["att_dropout"],
-                heads=model_config["duration_predictor"]["heads"],
+                heads=model_config["duration_predictor"]["tcn_heads"],
                 bidirectional=model_config["duration_predictor"]["bidirectional"],
+                backwards_channels=model_config["duration_predictor"]["backwards_tcn_channels"],
+                backwards_heads=model_config["duration_predictor"]["backwards_heads"],
             )
             dp_output_channels = model_config["duration_predictor"]["tcn_channels"][-1]
         elif dp_type == "lstm":
@@ -458,7 +460,6 @@ class VarianceAdaptor(nn.Module):
             dp_output_channels = model_config["duration_predictor"]["filter_size"]
         else:
             raise RuntimeError(f"Invalid duration predictor type: {dp_type}. Valid are tcn and lstm")
-
 
         self.length_regulator = LengthRegulator()
         self.pitch_predictor = TemporalVariancePredictor(
