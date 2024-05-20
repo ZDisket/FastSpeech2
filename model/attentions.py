@@ -516,24 +516,27 @@ class TCNAttentionBlock(nn.Module):
 
 
 class TCNAttention(nn.Module):
-    def __init__(self, num_inputs, num_channels, kernel_size=2, dropout=0.2, att_dropout=0.3, heads=[2, 2, 2],
+    def __init__(self, num_inputs, num_channels, kernel_size=[2, 2, 2], dropout=0.2, att_dropout=0.3, heads=[2, 2, 2],
                  alibi_alpha=1.25, start_i_increment=1):
         super(TCNAttention, self).__init__()
         self.layers = nn.ModuleList()
 
         if len(heads) != len(num_channels):
             raise ValueError("The length of heads must be equal to the length of num_channels")
+        if len(kernel_size) != len(num_channels):
+            raise ValueError("The length of kernel_size must be equal to the length of num_channels")
 
         # Initialize TCNAttentionBlocks with proper dilation rates
         current_channels = num_inputs
-        for level, (out_channels, num_heads) in enumerate(zip(num_channels, heads)):
+        for level, (out_channels, num_heads, k_size) in enumerate(zip(num_channels, heads, kernel_size)):
             dilation = 2 ** level
-            self.layers.append(TCNAttentionBlock(current_channels, out_channels, kernel_size, num_heads,
+            self.layers.append(TCNAttentionBlock(current_channels, out_channels, k_size, num_heads,
                                                  att_dropout, dropout, dilation, alibi_alpha=alibi_alpha,
                                                  start_i_increment=start_i_increment + (level * num_heads)
                                                  )
                                )
             current_channels = out_channels  # The output of the current block is the input for the next
+
 
     def forward(self, x, mask):
         """

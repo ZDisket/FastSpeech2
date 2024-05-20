@@ -450,18 +450,24 @@ def mask_to_attention_mask(mask):
 
 
 class DynamicDurationPredictor(nn.Module):
-    def __init__(self, num_inputs, num_channels, kernel_size=2, dropout=0.2, att_dropout=0.3, alibi_alpha=1.5,
-                 start_i=0, heads=2, bidirectional=False, backwards_channels=[256, 256], backwards_heads=[2,2]):
+    """
+    DynamicDurationPredictor:
+
+    (optionally bidirectional) TCN-Attention with increasing kernel sizes => Projection
+    """
+    def __init__(self, num_inputs, num_channels, kernel_sizes=[2, 2, 3], dropout=0.2, att_dropout=0.3, alibi_alpha=1.5,
+                 start_i=0, heads=2, bidirectional=False, backwards_channels=[256, 256], backwards_heads=[2,2],
+                 backwards_kernel_sizes=[2, 3]):
         super(DynamicDurationPredictor, self).__init__()
 
         self.tcn_output_channels = num_channels[-1]
         self.bidirectional = bidirectional
 
         # Initialize the TCNAttention module
-        self.tcn_attention = TCNAttention(num_inputs, num_channels, kernel_size, dropout, att_dropout, heads,
+        self.tcn_attention = TCNAttention(num_inputs, num_channels, kernel_sizes, dropout, att_dropout, heads,
                                           alibi_alpha=alibi_alpha, start_i_increment=start_i)
         if self.bidirectional:
-            self.backwards_tcn_attention = TCNAttention(num_inputs, backwards_channels, kernel_size, dropout, att_dropout,
+            self.backwards_tcn_attention = TCNAttention(num_inputs, backwards_channels, backwards_kernel_sizes, dropout, att_dropout,
                                                         backwards_heads,
                                                         alibi_alpha=alibi_alpha, start_i_increment=start_i)
 

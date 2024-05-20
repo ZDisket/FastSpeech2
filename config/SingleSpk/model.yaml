@@ -22,11 +22,13 @@ duration_predictor:
   att_dropout: 0.25 # only applies to TCN duration pred, dropout applied to attention
   tcn_channels: [512, 384, 256] # only applies to TCN duration pred
   tcn_heads: [4, 2, 2] #tcn: attention heads for each layer. must be equal in len to tcn_channels
+  tcn_kernel_sizes: [2, 3, 3] #tcn: kernel sizes for each layer
   backwards_tcn_channels: [256, 256]
   backwards_heads: [2, 2]
+  backwards_kernel_sizes: [2, 3]
   decoder_depth: 2 # lstm: depth of auxiliary decoder
   conv_depth: 2 # lstm: depth of pre-convs
-  kernel_size: 3 # both: conv kernel size
+  kernel_size: 3 # lstm: conv kernel size
   heads: 2 # lstm: attention heads
   filter_size: 256 # lstm: hidden size
   dropout: 0.15 # both: dropout

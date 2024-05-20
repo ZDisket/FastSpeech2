@@ -434,7 +434,7 @@ class VarianceAdaptor(nn.Module):
             self.duration_predictor = DynamicDurationPredictor(
                 num_inputs=model_config["transformer"]["encoder_hidden"],
                 num_channels=model_config["duration_predictor"]["tcn_channels"],
-                kernel_size=model_config["duration_predictor"]["kernel_size"],
+                kernel_sizes=model_config["duration_predictor"]["tcn_kernel_sizes"],
                 dropout=model_config["duration_predictor"]["dropout"],
                 start_i=1,
                 att_dropout=model_config["duration_predictor"]["att_dropout"],
@@ -442,6 +442,7 @@ class VarianceAdaptor(nn.Module):
                 bidirectional=model_config["duration_predictor"]["bidirectional"],
                 backwards_channels=model_config["duration_predictor"]["backwards_tcn_channels"],
                 backwards_heads=model_config["duration_predictor"]["backwards_heads"],
+                backwards_kernel_sizes=model_config["duration_predictor"]["backwards_kernel_sizes"],
             )
             dp_output_channels = model_config["duration_predictor"]["tcn_channels"][-1]
         elif dp_type == "lstm":
