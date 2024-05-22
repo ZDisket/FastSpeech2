@@ -10,7 +10,8 @@ transformer:
   encoder_dropout: 0.1
   decoder_dropout: 0.15
 
-variance_predictor:
+
+variance_predictor: 
   filter_size: 256
   kernel_size: 3
   dropout: 0.25
@@ -21,7 +22,7 @@ duration_predictor:
   bidirectional: true # both: bidirectional
   att_dropout: 0.25 # only applies to TCN duration pred, dropout applied to attention
   tcn_channels: [512, 384, 256] # only applies to TCN duration pred
-  tcn_heads: [4, 2, 2] #tcn: attention heads for each layer. must be equal in len to tcn_channels
+  tcn_heads: [4, 2, 2] #tcn: attention heads for each layer. you can use 0 for no attention
   tcn_kernel_sizes: [2, 3, 3] #tcn: kernel sizes for each layer
   backwards_tcn_channels: [256, 256]
   backwards_heads: [2, 2]

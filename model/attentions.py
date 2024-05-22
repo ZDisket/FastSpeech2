@@ -478,11 +478,27 @@ class TCNAttentionBlock(nn.Module):
 
     def __init__(self, in_channels, out_channels, kernel_size, heads, att_dropout, dropout, dilation, alibi_alpha,
                  start_i_increment=0):
+        """
+        Initialize the TCNAttentionBlock
+        :param in_channels: Input channels
+        :param out_channels: Output channels
+        :param kernel_size: Kernel size of convolution
+        :param heads: Attention heads. Set to 0 for no attention
+        :param att_dropout: Dropout for attention
+        :param dropout: General dropout
+        :param dilation: Dilation in the conv kernel
+        :param alibi_alpha: Alpha for ALiBi
+        :param start_i_increment: Starting increment of ALiBi
+        """
         super(TCNAttentionBlock, self).__init__()
-        self.attention = MultiHeadAttention(in_channels, heads, alibi_alpha=alibi_alpha,
-                                            start_i_increment=start_i_increment,
-                                            num_persistent=16)
-        self.dropout1 = nn.Dropout(att_dropout)  # Dropout for attention
+
+        self.heads = heads
+        if self.heads > 0:
+            self.attention = MultiHeadAttention(in_channels, heads, alibi_alpha=alibi_alpha,
+                                                start_i_increment=start_i_increment,
+                                                num_persistent=16)
+            self.dropout1 = nn.Dropout(att_dropout)  # Dropout for attention
+
         padding = (kernel_size - 1) * dilation  # Calculate padding based on dilation
         self.temporal_block = TemporalBlock(in_channels, out_channels, kernel_size, stride=1, dilation=dilation,
                                             padding=padding, dropout=dropout)
@@ -496,9 +512,10 @@ class TCNAttentionBlock(nn.Module):
             mask: Mask tensor of shape (batch_size, 1, seq_length, seq_length), where True is valid and False is invalid
         """
         # x = (batch, seq_len, channels)
-        x_att = self.attention(x, x, x, mask)
-        x_att = self.dropout1(x_att)
-        x = x + x_att  # Residual connection
+        if self.heads > 0:
+            x_att = self.attention(x, x, x, mask)
+            x_att = self.dropout1(x_att)
+            x = x + x_att  # Residual connection
 
         x = x.transpose(1, 2)  # Switch dimensions for convolution
 
@@ -529,7 +546,7 @@ class TCNAttention(nn.Module):
         # Initialize TCNAttentionBlocks with proper dilation rates
         current_channels = num_inputs
         for level, (out_channels, num_heads, k_size) in enumerate(zip(num_channels, heads, kernel_size)):
-            dilation = 2 ** level
+            dilation = 1 # we want max precision, dilation is detrimental.
             self.layers.append(TCNAttentionBlock(current_channels, out_channels, k_size, num_heads,
                                                  att_dropout, dropout, dilation, alibi_alpha=alibi_alpha,
                                                  start_i_increment=start_i_increment + (level * num_heads)
