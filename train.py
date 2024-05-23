@@ -8,7 +8,7 @@ from torch.utils.data import DataLoader
 from torch.utils.tensorboard import SummaryWriter
 from tqdm import tqdm
 
-from utils.model import get_model, get_vocoder, get_param_num
+from utils.model import get_model, get_vocoder, get_param_num, load_pretrained_weights
 from utils.tools import to_device, log, synth_one_sample, test_one_fs2, log_attention_maps
 from model import FastSpeech3Loss
 from dataset import Dataset
@@ -50,12 +50,12 @@ def main(args, configs):
 
     # Prepare model
     model, optimizer = get_model(args, configs, device, train=True)
-    scheduler = torch.optim.lr_scheduler.ExponentialLR(optimizer, gamma=train_config["optimizer"]["gamma"], last_epoch=last_epoch)
+    scheduler = torch.optim.lr_scheduler.ExponentialLR(optimizer, gamma=train_config["optimizer"]["gamma"],
+                                                       last_epoch=last_epoch)
 
     if len(args.pretrained):
-        print(f"Loading pretrained weights from {args.pretrained}")
-        ckpt = torch.load(args.pretrained)
-        model.load_state_dict(ckpt["model"], strict=False)
+        load_pretrained_weights(model, args.pretrained)
+
 
     model = nn.DataParallel(model)
     num_param = get_param_num(model)
@@ -215,7 +215,6 @@ def main(args, configs):
         epoch += 1
 
 
-
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--restore_step", type=int, default=0)
@@ -239,7 +238,6 @@ if __name__ == "__main__":
         "-pt", "--pretrained", type=str, required=False, help="Path to pretrained model to finetune from", default=""
     )
 
-
     args = parser.parse_args()
 
     # Read Config
@@ -257,10 +255,6 @@ if __name__ == "__main__":
     if args.restore_step > 1:
         args.pretrained = ""
 
-
     configs = (preprocess_config, model_config, train_config)
-
-
-
 
     main(args, configs)

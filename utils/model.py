@@ -9,6 +9,33 @@ from model import FastSpeech2, ScheduledOptim
 from istftnetfe import ISTFTNetFE
 
 
+def load_pretrained_weights(model, pretrained_path):
+    print(f"Loading pretrained weights from {pretrained_path}")
+    ckpt = torch.load(pretrained_path)
+    pretrained_dict = ckpt["model"]
+
+    model_dict = model.state_dict()
+    mismatched_shapes = []
+
+    for name, param in pretrained_dict.items():
+        if name in model_dict:
+            if model_dict[name].shape != param.shape:
+                mismatched_shapes.append((name, model_dict[name].shape, param.shape))
+            else:
+                model_dict[name] = param
+
+    # Print mismatched shapes
+    if mismatched_shapes:
+        print("Mismatched shapes found:")
+        for name, model_shape, pretrained_shape in mismatched_shapes:
+            print(f"{name}: model shape {model_shape}, pretrained shape {pretrained_shape}")
+
+        print("This is not an error, if you know what you're doing.")
+
+    # Load the updated state dict with matching shapes
+    model.load_state_dict(model_dict, strict=False)
+
+
 def get_model(args, configs, device, train=False):
     (preprocess_config, model_config, train_config) = configs
 

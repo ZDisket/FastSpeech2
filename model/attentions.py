@@ -397,6 +397,25 @@ class TransformerDecoder(nn.Module):
 
         return x
 
+class SEBlock1D(nn.Module):
+    """
+    Lightweight Squeeze-Excite attention.
+    """
+    def __init__(self, in_channels, reduction=16):
+        super(SEBlock1D, self).__init__()
+        self.avg_pool = nn.AdaptiveAvgPool1d(1)
+        self.fc = nn.Sequential(
+            nn.Linear(in_channels, in_channels // reduction, bias=False),
+            nn.ReLU(inplace=True),
+            nn.Linear(in_channels // reduction, in_channels, bias=False),
+            nn.Sigmoid()
+        )
+
+    def forward(self, x):
+        b, c, _ = x.size()
+        y = self.avg_pool(x).view(b, c)
+        y = self.fc(y).view(b, c, 1)
+        return x * y.expand_as(x)
 
 class Chomp1d(nn.Module):
     def __init__(self, chomp_size):
@@ -408,7 +427,8 @@ class Chomp1d(nn.Module):
 
 
 class TemporalBlock(nn.Module):
-    def __init__(self, n_inputs, n_outputs, kernel_size, stride, dilation, padding, dropout=0.2):
+    def __init__(self, n_inputs, n_outputs, kernel_size, stride, dilation, padding, dropout=0.2, use_se=False,
+                 reduction=16):
         super(TemporalBlock, self).__init__()
         self.conv1 = weight_norm(nn.Conv1d(n_inputs, n_outputs, kernel_size,
                                            stride=stride, padding=padding, dilation=dilation))
@@ -425,7 +445,11 @@ class TemporalBlock(nn.Module):
         self.net = nn.Sequential(self.conv1, self.chomp1, self.relu1, self.dropout1,
                                  self.conv2, self.chomp2, self.relu2, self.dropout2)
         self.downsample = nn.Conv1d(n_inputs, n_outputs, 1) if n_inputs != n_outputs else None
+
+        self.se_block = nn.Identity()
         self.relu = nn.ReLU()
+        if use_se:
+            self.se_block = SEBlock1D(n_outputs, reduction)
         self.init_weights()
 
     def init_weights(self):
@@ -437,20 +461,36 @@ class TemporalBlock(nn.Module):
     def forward(self, x):
         out = self.net(x)
         res = x if self.downsample is None else self.downsample(x)
-        return self.relu(out + res)
+        out = out + res
+        out = self.se_block(out)
+        return self.relu(out)
 
 
 class TemporalConvNet(nn.Module):
-    def __init__(self, num_inputs, num_channels, kernel_size=2, dropout=0.2):
+    def __init__(self, num_inputs, num_channels, kernel_size=2, dropout=0.2, dilation_growth="exp", use_se=False):
         super(TemporalConvNet, self).__init__()
         layers = []
         num_levels = len(num_channels)
+
+        if not isinstance(kernel_size, list):
+            kernel_size = [kernel_size] * num_levels
+
         for i in range(num_levels):
-            dilation_size = 2 ** i
+
+            if dilation_growth == "exp":
+                dilation_size = 2 ** i
+            elif dilation_growth == "mul":
+                dilation_size = max(1, 2 * i)
+            elif dilation_growth == "add":
+                dilation_size = i + 1
+            else:
+                raise RuntimeError(f"Unknown dilation growth type {dilation_growth}")
+
+            k_size = kernel_size[i]
             in_channels = num_inputs if i == 0 else num_channels[i - 1]
             out_channels = num_channels[i]
-            layers += [TemporalBlock(in_channels, out_channels, kernel_size, stride=1, dilation=dilation_size,
-                                     padding=(kernel_size - 1) * dilation_size, dropout=dropout)]
+            layers += [TemporalBlock(in_channels, out_channels, k_size, stride=1, dilation=dilation_size,
+                                     padding=(k_size - 1) * dilation_size, dropout=dropout, use_se=use_se)]
 
         self.network = nn.Sequential(*layers)
 
@@ -546,14 +586,13 @@ class TCNAttention(nn.Module):
         # Initialize TCNAttentionBlocks with proper dilation rates
         current_channels = num_inputs
         for level, (out_channels, num_heads, k_size) in enumerate(zip(num_channels, heads, kernel_size)):
-            dilation = 1 # we want max precision, dilation is detrimental.
+            dilation = 1  # we want max precision, dilation is detrimental.
             self.layers.append(TCNAttentionBlock(current_channels, out_channels, k_size, num_heads,
                                                  att_dropout, dropout, dilation, alibi_alpha=alibi_alpha,
                                                  start_i_increment=start_i_increment + (level * num_heads)
                                                  )
                                )
             current_channels = out_channels  # The output of the current block is the input for the next
-
 
     def forward(self, x, mask):
         """

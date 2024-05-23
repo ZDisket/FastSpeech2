@@ -465,14 +465,14 @@ class VarianceAdaptor(nn.Module):
         self.length_regulator = LengthRegulator()
         self.pitch_predictor = TemporalVariancePredictor(
             input_channels=model_config["transformer"]["encoder_hidden"],
-            num_channels=[model_config["variance_predictor"]["filter_size"]] * 2,
+            num_channels=model_config["variance_predictor"]["filter_size"],
             kernel_size=model_config["variance_predictor"]["kernel_size"],
             dropout=model_config["variance_predictor"]["dropout"],
             cond_input_size=dp_output_channels,
         )
         self.energy_predictor = TemporalVariancePredictor(
             input_channels=model_config["transformer"]["encoder_hidden"],
-            num_channels=[model_config["variance_predictor"]["filter_size"]] * 2,
+            num_channels=model_config["variance_predictor"]["filter_size"],
             kernel_size=model_config["variance_predictor"]["kernel_size"],
             dropout=model_config["variance_predictor"]["dropout"],
             cond_input_size=dp_output_channels,
