@@ -541,7 +541,7 @@ class TCNAttentionBlock(nn.Module):
 
         padding = (kernel_size - 1) * dilation  # Calculate padding based on dilation
         self.temporal_block = TemporalBlock(in_channels, out_channels, kernel_size, stride=1, dilation=dilation,
-                                            padding=padding, dropout=dropout)
+                                            padding=padding, dropout=dropout, use_se=self.heads == 0)
         self.norm = nn.LayerNorm(out_channels)
         self.dropout2 = nn.Dropout(dropout)
 

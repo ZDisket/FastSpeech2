@@ -277,7 +277,9 @@ class TemporalVariancePredictor(nn.Module):
     def __init__(self, input_channels, num_channels, kernel_size=2, dropout=0.2, cond_input_size=None):
         super(TemporalVariancePredictor, self).__init__()
         # Temporal Convolutional Network
-        self.tcn = TemporalConvNet(input_channels, num_channels, kernel_size=kernel_size, dropout=dropout, dilation_growth="mul", use_se=True)
+        # Multiplicative dilation growth gives the best balance between coverage and accuracy.
+        self.tcn = TemporalConvNet(input_channels, num_channels, kernel_size=kernel_size, dropout=dropout,
+                                   dilation_growth="mul", use_se=True)
         self.final_drop = StochasticDropout(dropout)
         self.cond_input_size = cond_input_size
         self.input_channels = input_channels
