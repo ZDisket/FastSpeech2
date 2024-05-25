@@ -114,6 +114,9 @@ def log(
         logger.add_scalar("Loss/total_temporal_loss", losses[8], step)
         logger.add_scalar("Loss/duration_kl_loss", losses[9], step)
         logger.add_scalar("Loss/pitch_energy_kl_loss", losses[10], step)
+        if len(losses) > 11:
+            logger.add_scalar("Loss/dur_discriminator_loss", losses[11], step)
+            logger.add_scalar("Loss/dur_gan_loss", losses[12], step)
 
     if fig is not None:
         logger.add_figure(tag, fig)

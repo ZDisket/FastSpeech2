@@ -10,7 +10,7 @@ from tqdm import tqdm
 
 from utils.model import get_model, get_vocoder, get_param_num, load_pretrained_weights
 from utils.tools import to_device, log, synth_one_sample, test_one_fs2, log_attention_maps
-from model import FastSpeech3Loss
+from model import FastSpeech3Loss, PatchDiscriminator
 from dataset import Dataset
 from torch.cuda.amp import GradScaler, autocast
 
@@ -57,7 +57,13 @@ def main(args, configs):
         load_pretrained_weights(model, args.pretrained)
 
 
+    discriminator = PatchDiscriminator(1, 3, 3, 128, 3, 0.3).to(device)
+    discriminator.train()
+    criterion_d = nn.BCELoss()
+    optimizer_d = torch.optim.Adam(discriminator.parameters(), lr=0.0001)
+
     model = nn.DataParallel(model)
+    discriminator = nn.DataParallel(discriminator)
     num_param = get_param_num(model)
     Loss = FastSpeech3Loss(preprocess_config, model_config, train_config).to(device)
     print("Number of FastSpeech2 Parameters:", num_param)
@@ -91,6 +97,7 @@ def main(args, configs):
     # torch.autograd.set_detect_anomaly(True, True)
 
     scaler = GradScaler()
+    scaler_d = GradScaler()
 
     while True:
         inner_bar = tqdm(total=len(loader), desc=f"Epoch {epoch}", position=1)
@@ -99,9 +106,59 @@ def main(args, configs):
 
                 with autocast(enabled=True):
                     batch = to_device(batch, device)
+
                     # Forward pass and loss computation with autocast
                     output = model(*(batch[2:]))
+
+                    # =========================== DISCRIMINATOR ==================================
+                    # train discrim first
+
+                    durations_real = output[5]
+                    durations_fake = output[4]
+                    seq_lens = batch[2 + 2]
+
+                    # train on real
+                    outputs_real = discriminator(durations_real, seq_lens)
+                    real_labels = torch.ones(outputs_real.size()).to(device)
+
+                    # prevent
+                    # RuntimeError: torch.nn.functional.binary_cross_entropy and torch.nn.BCELoss are unsafe to autocast
+                    with autocast(enabled=False):
+                        loss_real = criterion_d(outputs_real.float(), real_labels.float())
+
+                    # train on fake
+                    outputs_fake = discriminator(durations_fake.detach(), seq_lens)
+                    fake_labels = torch.zeros(outputs_fake.size()).to(device)
+
+                    with autocast(enabled=False):
+                        loss_fake = criterion_d(outputs_fake.float(), fake_labels.float())
+
+
+                    loss_d = (loss_real + loss_fake) / 2
+
+                    scaler_d.scale(loss_d).backward()
+                    scaler_d.unscale_(optimizer_d)
+                    nn.utils.clip_grad_norm_(discriminator.parameters(), grad_clip_thresh)
+
+                    scaler_d.step(optimizer_d)
+                    scaler_d.update()
+                    optimizer_d.zero_grad()
+
+                    # =========================== END DISCRIMINATOR ==================================
+
                     losses = Loss(batch, output, epoch, model.module)
+
+                    outputs_fake = discriminator(durations_fake, seq_lens)
+                    #real_labels = torch.ones(outputs_fake.size())
+
+                    # calculate GAN loss
+                    with autocast(enabled=False):
+                        gan_loss = criterion_d(outputs_fake.float(), real_labels.float())
+
+                    losses.append(loss_d)
+                    losses.append(gan_loss)
+                    losses[0] += gan_loss
+
                     total_loss = losses[0] / grad_acc_step
 
                 # Backward pass with scaled loss
@@ -122,7 +179,8 @@ def main(args, configs):
                     message1 = "Step {}/{}, ".format(step, total_step)
                     message2 = ("Total Loss: {:.4f}, Mel Loss: {:.4f}, Mel PostNet Loss: {:.4f}, Pitch Loss: {:.4f}, Energy Loss: {:.4f}, Duration Loss: {:.4f},"
                                 " Attention Loss: {:.4f}, Duration Temporal Loss: {:.4f}, Total Temporal Loss: {:.4f},"
-                                "Duration KL Divergence Loss: {:.4f}, Pitch-Energy KL Loss: {:.4f}"
+                                "Duration KL Divergence Loss: {:.4f}, Pitch-Energy KL Loss: {:.4f}, Dur Discriminator Loss: {:.4f}"
+                                ", Duration GAN Loss: {:.4f}"
                                 ).format(
                                     *losses
                                 )

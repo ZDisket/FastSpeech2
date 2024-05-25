@@ -303,7 +303,9 @@ class FastSpeech3Loss(nn.Module):
         self.charb_loss = Charbonnier1D()
         self.temp_loss = TemporalConsistencyLoss(1.0, True) # I tested 0.35, 0.5, 0.75, but 1.0 is best
         self.kl_loss = bnn.BKLLoss(reduction='mean', last_layer_only=False)
-        self.kl_loss_weight = 1.0
+
+        self.duration_kl_loss_weight = 30.0
+        self.pitch_energy_kl_loss_weight = 35.0
 
         # With all our new losses (attention, masked duration, temporal), the mel loss (individual) goes from being 20% of the loss
         # to just 6% and audio quality suffers greatly. We re-weight, although too much is detrimental.
@@ -417,9 +419,9 @@ class FastSpeech3Loss(nn.Module):
             al_match_loss = self.bin_loss(hard_attention=attn_hard, soft_attention=attn_soft) * bin_loss_scale
             total_attn_loss += al_match_loss
 
-        kl_duration = self.kl_loss(model.variance_adaptor.duration_predictor) * self.kl_loss_weight
-        kl_energy = self.kl_loss(model.variance_adaptor.energy_predictor) * self.kl_loss_weight
-        kl_pitch = self.kl_loss(model.variance_adaptor.pitch_predictor) * self.kl_loss_weight
+        kl_duration = self.kl_loss(model.variance_adaptor.duration_predictor) * self.duration_kl_loss_weight
+        kl_energy = self.kl_loss(model.variance_adaptor.energy_predictor) * self.pitch_energy_kl_loss_weight
+        kl_pitch = self.kl_loss(model.variance_adaptor.pitch_predictor) * self.pitch_energy_kl_loss_weight
 
         kl_pitch_energy = kl_energy + kl_pitch
 
@@ -431,7 +433,7 @@ class FastSpeech3Loss(nn.Module):
             total_attn_loss + total_temporal + total_kl
         )
 
-        return (
+        ret = (
             total_loss,
             mel_loss,
             postnet_mel_loss,
@@ -444,3 +446,4 @@ class FastSpeech3Loss(nn.Module):
             kl_duration,
             kl_pitch_energy,
         )
+        return list(ret)
