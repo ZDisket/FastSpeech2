@@ -12,7 +12,7 @@ transformer:
 
 
 variance_predictor:
-  filter_size: [256, 256, 256]
+  filter_size: [256, 384, 256]
   kernel_size: [3, 3, 4]
   dropout: 0.25
   dropout_on_emb: 0.5 # dropout applied to pitch&energy embs before adding to decoder input, doesn't affect predictors directly
