@@ -10,7 +10,7 @@ from tqdm import tqdm
 
 from utils.model import get_model, get_vocoder, get_param_num, load_pretrained_weights
 from utils.tools import to_device, log, synth_one_sample, test_one_fs2, log_attention_maps
-from model import FastSpeech3Loss, PatchDiscriminator
+from model import FastSpeech3Loss, PatchDiscriminator, SeqDiscriminator
 from dataset import Dataset
 from torch.cuda.amp import GradScaler, autocast
 
@@ -56,11 +56,10 @@ def main(args, configs):
     if len(args.pretrained):
         load_pretrained_weights(model, args.pretrained)
 
-
-    discriminator = PatchDiscriminator(1, 3, 3, 128, 3, 0.3).to(device)
+    discriminator = SeqDiscriminator().to(device)
     discriminator.train()
-    criterion_d = nn.BCELoss()
-    optimizer_d = torch.optim.Adam(discriminator.parameters(), lr=0.0001)
+    criterion_d = nn.BCEWithLogitsLoss()
+    optimizer_d = torch.optim.Adam(discriminator.parameters(), lr=0.000001)
 
     model = nn.DataParallel(model)
     discriminator = nn.DataParallel(discriminator)
@@ -117,22 +116,23 @@ def main(args, configs):
                     durations_fake = output[4]
                     seq_lens = batch[2 + 2]
 
+                    # the attn_hard_dur is in the linear space, bring it to the log one
+                    durations_real = torch.log(durations_real.float() + 1)
+
                     # train on real
                     outputs_real = discriminator(durations_real, seq_lens)
                     real_labels = torch.ones(outputs_real.size()).to(device)
 
                     # prevent
                     # RuntimeError: torch.nn.functional.binary_cross_entropy and torch.nn.BCELoss are unsafe to autocast
-                    with autocast(enabled=False):
-                        loss_real = criterion_d(outputs_real.float(), real_labels.float())
+
+                    loss_real = criterion_d(outputs_real, real_labels)
 
                     # train on fake
                     outputs_fake = discriminator(durations_fake.detach(), seq_lens)
                     fake_labels = torch.zeros(outputs_fake.size()).to(device)
 
-                    with autocast(enabled=False):
-                        loss_fake = criterion_d(outputs_fake.float(), fake_labels.float())
-
+                    loss_fake = criterion_d(outputs_fake, fake_labels)
 
                     loss_d = (loss_real + loss_fake) / 2
 

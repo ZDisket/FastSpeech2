@@ -502,28 +502,35 @@ class TransposeLayerNorm(nn.Module):
         x = x.transpose(1, 2)
         return x
 
+
+def make_conv(bayesian, in_channels, out_channels, kernel_size, stride=1, padding=0, dilation=1):
+    return BayesConv1d(0.0,0.1, in_channels, out_channels, kernel_size,
+                                           stride=stride, padding=padding, dilation=dilation) \
+        if bayesian else weight_norm(nn.Conv1d(in_channels, out_channels, kernel_size,
+                                           stride=stride, padding=padding, dilation=dilation))
+
 class TemporalBlock(nn.Module):
     def __init__(self, n_inputs, n_outputs, kernel_size, stride, dilation, padding, dropout=0.2, use_se=False,
-                 reduction=16):
+                 reduction=16, bayesian=False):
         super(TemporalBlock, self).__init__()
-        self.conv1 = BayesConv1d(0.0,0.1, n_inputs, n_outputs, kernel_size,
+        self.conv1 = make_conv(bayesian, n_inputs, n_outputs, kernel_size,
                                            stride=stride, padding=padding, dilation=dilation)
         self.chomp1 = Chomp1d(padding)
-        self.ln1 = TransposeRMSNorm(n_outputs)
+        self.ln1 = TransposeRMSNorm(n_outputs) if bayesian else nn.Identity()
         self.relu1 = nn.ReLU()
         self.dropout1 = nn.Dropout(dropout)
 
-        self.conv2 = BayesConv1d(0.0,0.1, n_outputs, n_outputs, kernel_size,
+        self.conv2 = make_conv(bayesian, n_outputs, n_outputs, kernel_size,
                                            stride=stride, padding=padding, dilation=dilation)
         self.chomp2 = Chomp1d(padding)
-        self.ln2 = TransposeRMSNorm(n_outputs)
+        self.ln2 = TransposeRMSNorm(n_outputs) if bayesian else nn.Identity()
         self.relu2 = nn.ReLU()
         self.dropout2 = nn.Dropout(dropout)
 
         self.net = nn.Sequential(self.conv1, self.chomp1, self.ln1, self.relu1, self.dropout1,
                                  self.conv2, self.chomp2, self.ln2, self.relu2, self.dropout2)
 
-        self.downsample = BayesConv1d(0.0,0.1, n_inputs, n_outputs, 1) if n_inputs != n_outputs else None
+        self.downsample = make_conv(bayesian, n_inputs, n_outputs, 1) if n_inputs != n_outputs else None
 
         self.se_block = nn.Identity()
         self.relu = nn.ReLU()
@@ -539,7 +546,7 @@ class TemporalBlock(nn.Module):
 
 
 class TemporalConvNet(nn.Module):
-    def __init__(self, num_inputs, num_channels, kernel_size=2, dropout=0.2, dilation_growth="exp", use_se=False):
+    def __init__(self, num_inputs, num_channels, kernel_size=2, dropout=0.2, dilation_growth="exp", use_se=False, bayesian=False):
         super(TemporalConvNet, self).__init__()
         layers = []
         num_levels = len(num_channels)
@@ -562,7 +569,7 @@ class TemporalConvNet(nn.Module):
             in_channels = num_inputs if i == 0 else num_channels[i - 1]
             out_channels = num_channels[i]
             layers += [TemporalBlock(in_channels, out_channels, k_size, stride=1, dilation=dilation_size,
-                                     padding=(k_size - 1) * dilation_size, dropout=dropout, use_se=use_se)]
+                                     padding=(k_size - 1) * dilation_size, dropout=dropout, use_se=use_se, bayesian=bayesian)]
 
         self.network = nn.Sequential(*layers)
 
@@ -589,7 +596,7 @@ class TCNAttentionBlock(nn.Module):
     """
 
     def __init__(self, in_channels, out_channels, kernel_size, heads, att_dropout, dropout, dilation, alibi_alpha,
-                 start_i_increment=0):
+                 start_i_increment=0, bayesian=False):
         """
         Initialize the TCNAttentionBlock
         :param in_channels: Input channels
@@ -613,7 +620,7 @@ class TCNAttentionBlock(nn.Module):
 
         padding = (kernel_size - 1) * dilation  # Calculate padding based on dilation
         self.temporal_block = TemporalBlock(in_channels, out_channels, kernel_size, stride=1, dilation=dilation,
-                                            padding=padding, dropout=dropout, use_se=self.heads == 0)
+                                            padding=padding, dropout=dropout, use_se=self.heads == 0, bayesian=bayesian)
         self.norm = nn.LayerNorm(out_channels)
         self.dropout2 = nn.Dropout(dropout)
 
@@ -646,7 +653,7 @@ class TCNAttentionBlock(nn.Module):
 
 class TCNAttention(nn.Module):
     def __init__(self, num_inputs, num_channels, kernel_size=[2, 2, 2], dropout=0.2, att_dropout=0.3, heads=[2, 2, 2],
-                 alibi_alpha=1.25, start_i_increment=1):
+                 alibi_alpha=1.25, start_i_increment=1, bayesian=False):
         super(TCNAttention, self).__init__()
         self.layers = nn.ModuleList()
 
@@ -661,7 +668,8 @@ class TCNAttention(nn.Module):
             dilation = 1  # we want max precision, dilation is detrimental.
             self.layers.append(TCNAttentionBlock(current_channels, out_channels, k_size, num_heads,
                                                  att_dropout, dropout, dilation, alibi_alpha=alibi_alpha,
-                                                 start_i_increment=start_i_increment + (level * num_heads)
+                                                 start_i_increment=start_i_increment + (level * num_heads),
+                                                 bayesian=bayesian
                                                  )
                                )
             current_channels = out_channels  # The output of the current block is the input for the next
