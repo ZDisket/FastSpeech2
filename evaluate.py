@@ -34,7 +34,7 @@ def evaluate(model, step, configs, logger=None, vocoder=None):
     Loss = FastSpeech3Loss(preprocess_config, model_config, train_config).to(device)
 
     # Evaluation
-    loss_sums = [0 for _ in range(7 + 2)]
+    loss_sums = [0 for _ in range(7 + 4)]
     for batchs in loader:
         for batch in batchs:
             batch = to_device(batch, device)
@@ -43,14 +43,16 @@ def evaluate(model, step, configs, logger=None, vocoder=None):
                 output = model(*(batch[2:]))
 
                 # Cal Loss
-                losses = Loss(batch, output, 0)
+                losses = Loss(batch, output, 0, model.module)
 
                 for i in range(len(losses)):
                     loss_sums[i] += losses[i].item() * len(batch[0])
 
     loss_means = [loss_sum / len(dataset) for loss_sum in loss_sums]
 
-    message = "Validation Step {}, Total Loss: {:.4f}, Mel Loss: {:.4f}, Mel PostNet Loss: {:.4f}, Pitch Loss: {:.4f}, Energy Loss: {:.4f}, Duration Loss: {:.4f}, Attention Loss: {:.4f}, Duration Temporal Loss: {:.4f}, Total Temporal Loss: {:.4f}".format(
+    message = ("Validation Step {}, Total Loss: {:.4f}, Mel Loss: {:.4f}, Mel PostNet Loss: {:.4f}, Pitch Loss: {:.4f}, Energy Loss: {:.4f}, Duration Loss: {:.4f}, "
+               "Attention Loss: {:.4f}, Duration Temporal Loss: {:.4f}, Total Temporal Loss: {:.4f},"
+               "Duration KL Divergence Loss: {:.4f}, Pitch-Energy KL Loss: {:.4f}").format(
         *([step] + [l for l in loss_means])
     )
 

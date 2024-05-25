@@ -3,6 +3,7 @@ import torch.nn as nn
 from numba import jit
 import numpy as np
 from torch.nn import functional as F
+import torchbnn as bnn
 
 class CharbonnierLoss(nn.Module):
     """Charbonnier Loss (L1) - generalized to handle tensors of arbitrary shapes."""
@@ -301,6 +302,8 @@ class FastSpeech3Loss(nn.Module):
         self.mse2_loss = MSE1D()
         self.charb_loss = Charbonnier1D()
         self.temp_loss = TemporalConsistencyLoss(1.0, True) # I tested 0.35, 0.5, 0.75, but 1.0 is best
+        self.kl_loss = bnn.BKLLoss(reduction='mean', last_layer_only=False)
+        self.kl_loss_weight = 1.0
 
         # With all our new losses (attention, masked duration, temporal), the mel loss (individual) goes from being 20% of the loss
         # to just 6% and audio quality suffers greatly. We re-weight, although too much is detrimental.
@@ -310,7 +313,7 @@ class FastSpeech3Loss(nn.Module):
         self.bin_loss_start_epoch = train_config["optimizer"]["bin_loss_start_epoch"]
         self.bin_loss_warmup_epochs = train_config["optimizer"]["bin_loss_warmup_epochs"]
 
-    def forward(self, inputs, predictions, epoch):
+    def forward(self, inputs, predictions, epoch, model=None):
         (
             mel_targets,
             _,
@@ -392,15 +395,9 @@ class FastSpeech3Loss(nn.Module):
                                            log_duration_targets,
                                            ~src_masks)
 
-        #pitch_p = pitch_p.masked_fill(~mel_masks, 0)
-       # pitch_t = pitch_t.masked_fill(~mel_masks, 0)
-
         pitch_temporal = self.temp_loss(pitch_p,
                                         pitch_t,
                                         ~mel_masks)
-
-        #energy_p = energy_p.masked_fill(~mel_masks, 0)
-        #energy_t = energy_t.masked_fill(~mel_masks, 0)
 
         energy_temporal = self.temp_loss(energy_p,
                                          energy_t,
@@ -420,8 +417,18 @@ class FastSpeech3Loss(nn.Module):
             al_match_loss = self.bin_loss(hard_attention=attn_hard, soft_attention=attn_soft) * bin_loss_scale
             total_attn_loss += al_match_loss
 
+        kl_duration = self.kl_loss(model.variance_adaptor.duration_predictor) * self.kl_loss_weight
+        kl_energy = self.kl_loss(model.variance_adaptor.energy_predictor) * self.kl_loss_weight
+        kl_pitch = self.kl_loss(model.variance_adaptor.pitch_predictor) * self.kl_loss_weight
+
+        kl_pitch_energy = kl_energy + kl_pitch
+
+        total_kl = kl_duration + kl_pitch_energy
+
+
         total_loss = (
-            mel_loss + postnet_mel_loss + duration_loss + pitch_loss + energy_loss + total_attn_loss + total_temporal
+            mel_loss + postnet_mel_loss + duration_loss + pitch_loss + energy_loss +
+            total_attn_loss + total_temporal + total_kl
         )
 
         return (
@@ -434,4 +441,6 @@ class FastSpeech3Loss(nn.Module):
             total_attn_loss,
             duration_temporal,
             total_temporal,
+            kl_duration,
+            kl_pitch_energy,
         )

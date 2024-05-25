@@ -101,7 +101,7 @@ def main(args, configs):
                     batch = to_device(batch, device)
                     # Forward pass and loss computation with autocast
                     output = model(*(batch[2:]))
-                    losses = Loss(batch, output, epoch)
+                    losses = Loss(batch, output, epoch, model.module)
                     total_loss = losses[0] / grad_acc_step
 
                 # Backward pass with scaled loss
@@ -120,9 +120,12 @@ def main(args, configs):
                 if step % log_step == 0:
                     losses = [l.item() for l in losses]
                     message1 = "Step {}/{}, ".format(step, total_step)
-                    message2 = "Total Loss: {:.4f}, Mel Loss: {:.4f}, Mel PostNet Loss: {:.4f}, Pitch Loss: {:.4f}, Energy Loss: {:.4f}, Duration Loss: {:.4f}, Attention Loss: {:.4f}, Duration Temporal Loss: {:.4f}, Total Temporal Loss: {:.4f}".format(
-                        *losses
-                    )
+                    message2 = ("Total Loss: {:.4f}, Mel Loss: {:.4f}, Mel PostNet Loss: {:.4f}, Pitch Loss: {:.4f}, Energy Loss: {:.4f}, Duration Loss: {:.4f},"
+                                " Attention Loss: {:.4f}, Duration Temporal Loss: {:.4f}, Total Temporal Loss: {:.4f},"
+                                "Duration KL Divergence Loss: {:.4f}, Pitch-Energy KL Loss: {:.4f}"
+                                ).format(
+                                    *losses
+                                )
 
                     with open(os.path.join(train_log_path, "log.txt"), "a") as f:
                         f.write(message1 + message2 + "\n")

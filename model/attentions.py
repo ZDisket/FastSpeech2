@@ -5,6 +5,8 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.nn.utils import weight_norm
 
+import torchbnn
+from torchbnn import BayesConv1d
 
 class SwiGLUConvFFN(nn.Module):
     def __init__(
@@ -426,37 +428,107 @@ class Chomp1d(nn.Module):
         return x[:, :, :-self.chomp_size].contiguous()
 
 
+class RMSNorm(nn.Module):
+    def __init__(self, d, p=-1., eps=1e-8, bias=False):
+        """
+            Root Mean Square Layer Normalization
+        :param d: model size
+        :param p: partial RMSNorm, valid value [0, 1], default -1.0 (disabled)
+        :param eps:  epsilon value, default 1e-8
+        :param bias: whether use bias term for RMSNorm, disabled by
+            default because RMSNorm doesn't enforce re-centering invariance.
+        """
+        super(RMSNorm, self).__init__()
+
+        self.eps = eps
+        self.d = d
+        self.p = p
+        self.bias = bias
+
+        self.scale = nn.Parameter(torch.ones(d))
+        self.register_parameter("scale", self.scale)
+
+        if self.bias:
+            self.offset = nn.Parameter(torch.zeros(d))
+            self.register_parameter("offset", self.offset)
+
+    def forward(self, x):
+        if self.p < 0. or self.p > 1.:
+            norm_x = x.norm(2, dim=-1, keepdim=True)
+            d_x = self.d
+        else:
+            partial_size = int(self.d * self.p)
+            partial_x, _ = torch.split(x, [partial_size, self.d - partial_size], dim=-1)
+
+            norm_x = partial_x.norm(2, dim=-1, keepdim=True)
+            d_x = partial_size
+
+        rms_x = norm_x * d_x ** (-1. / 2)
+        x_normed = x / (rms_x + self.eps)
+
+        if self.bias:
+            return self.scale * x_normed + self.offset
+
+        return self.scale * x_normed
+
+
+class TransposeRMSNorm(nn.Module):
+    def __init__(self, num_features, eps=1e-5, affine=True):
+        super(TransposeRMSNorm, self).__init__()
+        self.ln = RMSNorm(num_features, eps=eps)
+
+    def forward(self, x):
+        # Transpose from (batch, channels, seq_len) to (batch, seq_len, channels)
+        x = x.transpose(1, 2)
+        # Apply RMSNorm
+        x = self.ln(x)
+        # Transpose back from (batch, seq_len, channels) to (batch, channels, seq_len)
+        x = x.transpose(1, 2)
+        return x
+
+
+
+class TransposeLayerNorm(nn.Module):
+    def __init__(self, num_features, eps=1e-5, affine=True):
+        super(TransposeLayerNorm, self).__init__()
+        self.ln = nn.LayerNorm(num_features, eps, affine)
+
+    def forward(self, x):
+        # Transpose from (batch, channels, seq_len) to (batch, seq_len, channels)
+        x = x.transpose(1, 2)
+        # Apply LayerNorm
+        x = self.ln(x)
+        # Transpose back from (batch, seq_len, channels) to (batch, channels, seq_len)
+        x = x.transpose(1, 2)
+        return x
+
 class TemporalBlock(nn.Module):
     def __init__(self, n_inputs, n_outputs, kernel_size, stride, dilation, padding, dropout=0.2, use_se=False,
                  reduction=16):
         super(TemporalBlock, self).__init__()
-        self.conv1 = weight_norm(nn.Conv1d(n_inputs, n_outputs, kernel_size,
-                                           stride=stride, padding=padding, dilation=dilation))
+        self.conv1 = BayesConv1d(0.0,0.1, n_inputs, n_outputs, kernel_size,
+                                           stride=stride, padding=padding, dilation=dilation)
         self.chomp1 = Chomp1d(padding)
+        self.ln1 = TransposeRMSNorm(n_outputs)
         self.relu1 = nn.ReLU()
         self.dropout1 = nn.Dropout(dropout)
 
-        self.conv2 = weight_norm(nn.Conv1d(n_outputs, n_outputs, kernel_size,
-                                           stride=stride, padding=padding, dilation=dilation))
+        self.conv2 = BayesConv1d(0.0,0.1, n_outputs, n_outputs, kernel_size,
+                                           stride=stride, padding=padding, dilation=dilation)
         self.chomp2 = Chomp1d(padding)
+        self.ln2 = TransposeRMSNorm(n_outputs)
         self.relu2 = nn.ReLU()
         self.dropout2 = nn.Dropout(dropout)
 
-        self.net = nn.Sequential(self.conv1, self.chomp1, self.relu1, self.dropout1,
-                                 self.conv2, self.chomp2, self.relu2, self.dropout2)
-        self.downsample = nn.Conv1d(n_inputs, n_outputs, 1) if n_inputs != n_outputs else None
+        self.net = nn.Sequential(self.conv1, self.chomp1, self.ln1, self.relu1, self.dropout1,
+                                 self.conv2, self.chomp2, self.ln2, self.relu2, self.dropout2)
+
+        self.downsample = BayesConv1d(0.0,0.1, n_inputs, n_outputs, 1) if n_inputs != n_outputs else None
 
         self.se_block = nn.Identity()
         self.relu = nn.ReLU()
         if use_se:
             self.se_block = SEBlock1D(n_outputs, reduction)
-        self.init_weights()
-
-    def init_weights(self):
-        self.conv1.weight.data.normal_(0, 0.01)
-        self.conv2.weight.data.normal_(0, 0.01)
-        if self.downsample is not None:
-            self.downsample.weight.data.normal_(0, 0.01)
 
     def forward(self, x):
         out = self.net(x)
