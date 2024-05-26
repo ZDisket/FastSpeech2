@@ -481,6 +481,7 @@ class DynamicDurationPredictor(nn.Module):
 
         self.final_drop = nn.Dropout(0.1)
         self.linear_projection = nn.Linear(self.tcn_output_channels, 1)
+        self.entry_dropout = nn.Dropout(0.5)
 
     def forward(self, x, x_lengths):
         """
@@ -499,9 +500,11 @@ class DynamicDurationPredictor(nn.Module):
         # Create an attention mask (batch, 1, seq_len, seq_len)
         attention_mask = mask_to_attention_mask(mask)
 
+
         if self.bidirectional:
             x_orig = x.clone()
 
+        x = self.entry_dropout(x)
         # Pass input through the TCNAttention layer
         x = self.tcn_attention(x, attention_mask)
 

@@ -59,7 +59,7 @@ def main(args, configs):
     discriminator = SeqDiscriminator().to(device)
     discriminator.train()
     criterion_d = nn.BCEWithLogitsLoss()
-    optimizer_d = torch.optim.Adam(discriminator.parameters(), lr=0.000001)
+    optimizer_d = torch.optim.Adam(discriminator.parameters(), lr=0.0001)
 
     model = nn.DataParallel(model)
     discriminator = nn.DataParallel(discriminator)
@@ -98,6 +98,8 @@ def main(args, configs):
     scaler = GradScaler()
     scaler_d = GradScaler()
 
+    discriminator_train_start_steps = 2500
+
     while True:
         inner_bar = tqdm(total=len(loader), desc=f"Epoch {epoch}", position=1)
         for batchs in loader:
@@ -110,50 +112,49 @@ def main(args, configs):
                     output = model(*(batch[2:]))
 
                     # =========================== DISCRIMINATOR ==================================
-                    # train discrim first
 
-                    durations_real = output[5]
+                    durations_real = output[5].detach() # we don't want to optimize the AlignmentEncoder
                     durations_fake = output[4]
                     seq_lens = batch[2 + 2]
 
                     # the attn_hard_dur is in the linear space, bring it to the log one
                     durations_real = torch.log(durations_real.float() + 1)
 
-                    # train on real
-                    outputs_real = discriminator(durations_real, seq_lens)
-                    real_labels = torch.ones(outputs_real.size()).to(device)
+                    if step > discriminator_train_start_steps:
+                        # train on real
+                        outputs_real = discriminator(durations_real, seq_lens)
+                        real_labels = torch.ones(outputs_real.size()).to(device)
 
-                    # prevent
-                    # RuntimeError: torch.nn.functional.binary_cross_entropy and torch.nn.BCELoss are unsafe to autocast
+                        loss_real = criterion_d(outputs_real, real_labels)
 
-                    loss_real = criterion_d(outputs_real, real_labels)
+                        # train on fake
+                        outputs_fake = discriminator(durations_fake.detach(), seq_lens)
+                        fake_labels = torch.zeros(outputs_fake.size()).to(device)
 
-                    # train on fake
-                    outputs_fake = discriminator(durations_fake.detach(), seq_lens)
-                    fake_labels = torch.zeros(outputs_fake.size()).to(device)
+                        loss_fake = criterion_d(outputs_fake, fake_labels)
 
-                    loss_fake = criterion_d(outputs_fake, fake_labels)
+                        loss_d = (loss_real + loss_fake) / 2
 
-                    loss_d = (loss_real + loss_fake) / 2
+                        scaler_d.scale(loss_d).backward()
+                        scaler_d.unscale_(optimizer_d)
+                        nn.utils.clip_grad_norm_(discriminator.parameters(), grad_clip_thresh)
 
-                    scaler_d.scale(loss_d).backward()
-                    scaler_d.unscale_(optimizer_d)
-                    nn.utils.clip_grad_norm_(discriminator.parameters(), grad_clip_thresh)
+                        scaler_d.step(optimizer_d)
+                        scaler_d.update()
+                        optimizer_d.zero_grad()
+                    else:
+                        loss_d = torch.FloatTensor([0.0]).to(device)
 
-                    scaler_d.step(optimizer_d)
-                    scaler_d.update()
-                    optimizer_d.zero_grad()
 
                     # =========================== END DISCRIMINATOR ==================================
 
                     losses = Loss(batch, output, epoch, model.module)
 
-                    outputs_fake = discriminator(durations_fake, seq_lens)
-                    #real_labels = torch.ones(outputs_fake.size())
-
-                    # calculate GAN loss
-                    with autocast(enabled=False):
-                        gan_loss = criterion_d(outputs_fake.float(), real_labels.float())
+                    if step > discriminator_train_start_steps:
+                        outputs_fake = discriminator(durations_fake, seq_lens)
+                        gan_loss = criterion_d(outputs_fake, real_labels)
+                    else:
+                        gan_loss = torch.FloatTensor([0.0]).to(device)
 
                     losses.append(loss_d)
                     losses.append(gan_loss)
