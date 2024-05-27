@@ -10,7 +10,7 @@ from tqdm import tqdm
 
 from utils.model import get_model, get_vocoder, get_param_num, load_pretrained_weights
 from utils.tools import to_device, log, synth_one_sample, test_one_fs2, log_attention_maps
-from model import FastSpeech3Loss, PatchDiscriminator, SeqDiscriminator
+from model import FastSpeech3Loss, PatchDiscriminator, SeqDiscriminator, AdvSeqDiscriminator
 from dataset import Dataset
 from torch.cuda.amp import GradScaler, autocast
 
@@ -56,10 +56,10 @@ def main(args, configs):
     if len(args.pretrained):
         load_pretrained_weights(model, args.pretrained)
 
-    discriminator = SeqDiscriminator().to(device)
+    discriminator = AdvSeqDiscriminator().to(device)
     discriminator.train()
     criterion_d = nn.BCEWithLogitsLoss()
-    optimizer_d = torch.optim.Adam(discriminator.parameters(), lr=0.0001)
+    optimizer_d = torch.optim.Adam(discriminator.parameters(), lr=0.00001)
 
     model = nn.DataParallel(model)
     discriminator = nn.DataParallel(discriminator)

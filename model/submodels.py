@@ -271,6 +271,21 @@ class VariantDurationPredictor(nn.Module):
         return log_durations, x_mask, x
 
 
+def expand_masks(x_mask, y_mask):
+    """
+    Expand True=padded masks into an attention mask.
+    Inputs can be different or the same
+    :param x_mask: Mask of x size (batch, seq_len), where True is padded
+    :param y_mask: Mask of y size (batch, seq_2_len), where True is padded
+    :return: Attention mask for MultiHeadAttention
+    """
+    x_mask_expanded = x_mask.unsqueeze(1).unsqueeze(3)  # Shape: (batch_size, 1, mel_len, 1)
+    y_mask_expanded = y_mask.unsqueeze(1).unsqueeze(2)  # Shape: (batch_size, 1, 1, duration_len)
+    # Combine masks using broadcasting
+    attention_mask = x_mask_expanded & y_mask_expanded  # Shape: (batch_size, 1, mel_len, duration_len)
+    attention_mask = ~attention_mask  # True=padded => True=valid
+    return attention_mask
+
 # VariancePredictor but using TCNs for cheaper-than-RNN temporal dependencies.
 class TemporalVariancePredictor(nn.Module):
 
@@ -329,12 +344,7 @@ class TemporalVariancePredictor(nn.Module):
 
         :return: Conditioning vector, ready to add to hidden states
         """
-        x_mask_expanded = x_mask.unsqueeze(1).unsqueeze(3)  # Shape: (batch_size, 1, mel_len, 1)
-        y_mask_expanded = y_mask.unsqueeze(1).unsqueeze(2)  # Shape: (batch_size, 1, 1, duration_len)
-
-        # Combine masks using broadcasting
-        attention_mask = x_mask_expanded & y_mask_expanded  # Shape: (batch_size, 1, mel_len, duration_len)
-        attention_mask = ~attention_mask  # True=padded => True=valid
+        attention_mask = expand_masks(x_mask, y_mask)
 
         # (batch, seq_len, channels) <<=> (batch, channels, seq_len)
         y = self.cond_proj(
@@ -451,6 +461,18 @@ def mask_to_attention_mask(mask):
     return attention_mask
 
 
+def sequence_mask(max_length, x_lengths):
+    """
+    Make a bool sequence mask
+    :param max_length: Max length of sequences
+    :param x_lengths: Tensor (batch,) indicating sequence lenghts
+    :return: Bool tensor size (batch, max_length) where True is padded and False is valid
+    """
+    mask = torch.arange(max_length).expand(len(x_lengths), max_length).to(x_lengths.device)
+    mask = mask >= x_lengths.unsqueeze(1)
+    return mask
+
+
 class DynamicDurationPredictor(nn.Module):
     """
     DynamicDurationPredictor:
@@ -493,13 +515,10 @@ class DynamicDurationPredictor(nn.Module):
         :return: Predicted durations size (batch, seq_len), True=padded mask of x size (batch, seq_len), duration hidden states
         """
         # Generate the appropriate mask for attention
-        max_length = x.size(1)
-        mask = torch.arange(max_length).expand(len(x_lengths), max_length).to(x_lengths.device)
-        mask = mask >= x_lengths.unsqueeze(1)
+        mask = sequence_mask(x.size(1), x_lengths)
 
         # Create an attention mask (batch, 1, seq_len, seq_len)
         attention_mask = mask_to_attention_mask(mask)
-
 
         if self.bidirectional:
             x_orig = x.clone()
