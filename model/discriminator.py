@@ -5,6 +5,43 @@ from .attentions import SEBlock1D, TransposeRMSNorm, MultiHeadAttention
 from .submodels import sequence_mask, mask_to_attention_mask
 
 
+class SequenceNormalization(nn.Module):
+    """
+    Masked sequence normalization with learned alpha and beta values
+    """
+    def __init__(self, num_features):
+        super(SequenceNormalization, self).__init__()
+        self.alpha = nn.Parameter(torch.ones(1, num_features, 1))
+        self.beta = nn.Parameter(torch.zeros(1, num_features, 1))
+
+    def forward(self, x, seq_lens):
+        """
+        Forward pass through the learnable normalization layer
+        :param x: Tensor size (batch, seq_len, num_features)
+        :param seq_lens: Int sequence lengths tensor size (batch,)
+        :return: Normalized x, same shape
+        """
+        x = x.transpose(1,2) # (batch, seq_len, 1) => (batch, 1, seq_len)
+
+        # Create mask based on sequence lengths
+        batch_size, max_len = x.size(0), x.size(2)
+        mask = torch.arange(max_len, device=x.device).expand(batch_size, max_len) < seq_lens.unsqueeze(1)
+
+        # Masked min and max calculations
+        masked_x = x.masked_fill(~mask.unsqueeze(1), float('inf'))
+        min_vals = masked_x.min(dim=2, keepdim=True).values
+        masked_x = x.masked_fill(~mask.unsqueeze(1), float('-inf'))
+        max_vals = masked_x.max(dim=2, keepdim=True).values
+
+        # Normalize to [0, 1]
+        normalized_x = (x - min_vals) / (max_vals - min_vals + 1e-8)
+
+        # Apply learnable scaling and shifting
+        scaled_x = normalized_x * self.alpha + self.beta
+        scaled_x = scaled_x.transpose(1, 2) # (batch, 1, seq_len) => (batch, seq_len, 1)
+        return scaled_x
+
+
 class ResidualBlock1D(nn.Module):
     """
     Conv1D+Squeeze-Excite+RMSNorm residual block for sequence modeling
@@ -47,6 +84,7 @@ class AdvSeqDiscriminator(nn.Module):
         super(AdvSeqDiscriminator, self).__init__()
 
         self.proj = nn.Linear(num_channels, hidden_dim)
+        self.pre_norm = SequenceNormalization(num_channels)
         self.att_drop = nn.Dropout(att_dropout)
         self.drop1 = nn.Dropout(0.1)
         self.attention = MultiHeadAttention(hidden_dim, n_heads, alibi_alpha=1.5, start_i_increment=4, num_persistent=16)
@@ -73,6 +111,8 @@ class AdvSeqDiscriminator(nn.Module):
         x_mask = sequence_mask(x.size(1), seq_lens)
         att_mask = mask_to_attention_mask(x_mask)
         x = x.unsqueeze(-1)  # (batch, seq_len) => (batch, seq_len, 1)
+
+        x = self.pre_norm(x, seq_lens)
 
         x = self.proj(x) # (batch, seq_len, 1) => (batch, seq_len, hidden_dim)
         x_att = self.attention(x, x, x, mask=att_mask)

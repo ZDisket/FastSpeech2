@@ -18,6 +18,10 @@ from evaluate import evaluate
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
+def convert_to_magnitudes(durations):
+    total_duration = durations.sum(dim=1, keepdim=True)
+    magnitudes = durations / total_duration
+    return magnitudes
 
 def main(args, configs):
     print("Prepare training ...")
@@ -118,7 +122,9 @@ def main(args, configs):
                     seq_lens = batch[2 + 2]
 
                     # the attn_hard_dur is in the linear space, bring it to the log one
-                    durations_real = torch.log(durations_real.float() + 1)
+                    #durations_real = torch.log(durations_real.float() + 1)
+
+                    durations_fake = torch.exp(durations_fake) - 1
 
                     if step > discriminator_train_start_steps:
                         # train on real
