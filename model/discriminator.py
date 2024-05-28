@@ -4,7 +4,6 @@ import torch.optim as optim
 from .attentions import SEBlock1D, TransposeRMSNorm, MultiHeadAttention
 from .submodels import sequence_mask, mask_to_attention_mask
 
-
 class SequenceNormalization(nn.Module):
     """
     Masked sequence normalization with learned alpha and beta values

@@ -63,7 +63,7 @@ def main(args, configs):
     discriminator = DualDiscriminator(n_heads=0).to(device)
     discriminator.train()
     criterion_d = nn.BCEWithLogitsLoss()
-    optimizer_d = torch.optim.Adam(discriminator.parameters(), lr=0.002)
+    optimizer_d = torch.optim.Adam(discriminator.parameters(), lr=0.000012)
 
     model = nn.DataParallel(model)
     discriminator = nn.DataParallel(discriminator)
@@ -121,9 +121,8 @@ def main(args, configs):
                     durations_fake = output[4]
                     seq_lens = batch[2 + 2]
 
-                    # the attn_hard_dur is in the linear space, bring it to the log one
-                    #durations_real = torch.log(durations_real.float() + 1)
-
+                    # generate durations are log, bring them to the linear space
+                    # (having the discriminator differentiate between log durations is bad)
                     durations_fake = torch.exp(durations_fake) - 1
 
                     if step > discriminator_train_start_steps:
@@ -140,14 +139,16 @@ def main(args, configs):
                         loss_fake = criterion_d(outputs_fake, fake_labels)
 
                         loss_d = (loss_real + loss_fake) / 2
-
+                        loss_d /= grad_acc_step
                         scaler_d.scale(loss_d).backward()
-                        scaler_d.unscale_(optimizer_d)
-                        nn.utils.clip_grad_norm_(discriminator.parameters(), grad_clip_thresh)
 
-                        scaler_d.step(optimizer_d)
-                        scaler_d.update()
-                        optimizer_d.zero_grad()
+                        if step % grad_acc_step == 0:
+                            scaler_d.unscale_(optimizer_d)
+                            nn.utils.clip_grad_norm_(discriminator.parameters(), grad_clip_thresh)
+
+                            scaler_d.step(optimizer_d)
+                            scaler_d.update()
+                            optimizer_d.zero_grad()
                     else:
                         loss_d = torch.FloatTensor([0.0]).to(device)
 

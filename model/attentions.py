@@ -8,6 +8,7 @@ from torch.nn.utils import weight_norm
 import torchbnn
 from torchbnn import BayesConv1d
 
+
 class SwiGLUConvFFN(nn.Module):
     def __init__(
             self,
@@ -399,10 +400,12 @@ class TransformerDecoder(nn.Module):
 
         return x
 
+
 class SEBlock1D(nn.Module):
     """
     Lightweight Squeeze-Excite attention.
     """
+
     def __init__(self, in_channels, reduction=16):
         super(SEBlock1D, self).__init__()
         self.avg_pool = nn.AdaptiveAvgPool1d(1)
@@ -418,6 +421,7 @@ class SEBlock1D(nn.Module):
         y = self.avg_pool(x).view(b, c)
         y = self.fc(y).view(b, c, 1)
         return x * y.expand_as(x)
+
 
 class Chomp1d(nn.Module):
     def __init__(self, chomp_size):
@@ -487,7 +491,6 @@ class TransposeRMSNorm(nn.Module):
         return x
 
 
-
 class TransposeLayerNorm(nn.Module):
     def __init__(self, num_features, eps=1e-5, affine=True):
         super(TransposeLayerNorm, self).__init__()
@@ -504,24 +507,25 @@ class TransposeLayerNorm(nn.Module):
 
 
 def make_conv(bayesian, in_channels, out_channels, kernel_size, stride=1, padding=0, dilation=1):
-    return BayesConv1d(0.0,0.1, in_channels, out_channels, kernel_size,
-                                           stride=stride, padding=padding, dilation=dilation) \
+    return BayesConv1d(0.0, 0.1, in_channels, out_channels, kernel_size,
+                       stride=stride, padding=padding, dilation=dilation) \
         if bayesian else weight_norm(nn.Conv1d(in_channels, out_channels, kernel_size,
-                                           stride=stride, padding=padding, dilation=dilation))
+                                               stride=stride, padding=padding, dilation=dilation))
+
 
 class TemporalBlock(nn.Module):
     def __init__(self, n_inputs, n_outputs, kernel_size, stride, dilation, padding, dropout=0.2, use_se=False,
                  reduction=16, bayesian=False):
         super(TemporalBlock, self).__init__()
         self.conv1 = make_conv(bayesian, n_inputs, n_outputs, kernel_size,
-                                           stride=stride, padding=padding, dilation=dilation)
+                               stride=stride, padding=padding, dilation=dilation)
         self.chomp1 = Chomp1d(padding)
         self.ln1 = TransposeRMSNorm(n_outputs) if bayesian else nn.Identity()
         self.relu1 = nn.ReLU()
         self.dropout1 = nn.Dropout(dropout)
 
         self.conv2 = make_conv(bayesian, n_outputs, n_outputs, kernel_size,
-                                           stride=stride, padding=padding, dilation=dilation)
+                               stride=stride, padding=padding, dilation=dilation)
         self.chomp2 = Chomp1d(padding)
         self.ln2 = TransposeRMSNorm(n_outputs) if bayesian else nn.Identity()
         self.relu2 = nn.ReLU()
@@ -546,7 +550,8 @@ class TemporalBlock(nn.Module):
 
 
 class TemporalConvNet(nn.Module):
-    def __init__(self, num_inputs, num_channels, kernel_size=2, dropout=0.2, dilation_growth="exp", use_se=False, bayesian=False):
+    def __init__(self, num_inputs, num_channels, kernel_size=2, dropout=0.2, dilation_growth="exp", use_se=False,
+                 bayesian=False):
         super(TemporalConvNet, self).__init__()
         layers = []
         num_levels = len(num_channels)
@@ -569,12 +574,31 @@ class TemporalConvNet(nn.Module):
             in_channels = num_inputs if i == 0 else num_channels[i - 1]
             out_channels = num_channels[i]
             layers += [TemporalBlock(in_channels, out_channels, k_size, stride=1, dilation=dilation_size,
-                                     padding=(k_size - 1) * dilation_size, dropout=dropout, use_se=use_se, bayesian=bayesian)]
+                                     padding=(k_size - 1) * dilation_size, dropout=dropout, use_se=use_se,
+                                     bayesian=bayesian)]
 
         self.network = nn.Sequential(*layers)
 
     def forward(self, x):
         return self.network(x)
+
+
+def mask_to_causal_attention_mask(mask):
+    """
+    Turn a bool mask into a causal attention mask
+    :param mask: Bool sequence mask, True=padding size (batch, max_length)
+    :return: Causal attention mask size (batch, 1, seq_len, seq_len), True=valid
+    """
+    batch_size, seq_len = mask.shape
+    # Create a lower triangular matrix of ones
+    causal_mask = torch.tril(torch.ones((seq_len, seq_len), dtype=torch.bool), diagonal=0)
+    # Expand dimensions to fit the attention mask shape (batch, 1, seq_len, seq_len)
+    causal_mask = causal_mask.unsqueeze(0).unsqueeze(0).expand(batch_size, 1, seq_len, seq_len)
+    # Combine the causal mask with the input mask
+    attention_mask = mask.unsqueeze(1).unsqueeze(2) & mask.unsqueeze(1).unsqueeze(3) & causal_mask
+    # Flip the mask, our attention uses True=valid
+    attention_mask = ~attention_mask
+    return attention_mask
 
 
 def reduce_mask(mask):
@@ -593,10 +617,11 @@ class TCNAttentionBlock(nn.Module):
     Transformer-inspired TCNAttentionBlock:
 
     x + Drop(AllAttention(x)) => TemporalBlock => Drop(LayerNorm)
+    Optionally, cross-attention between context and x
     """
 
     def __init__(self, in_channels, out_channels, kernel_size, heads, att_dropout, dropout, dilation, alibi_alpha,
-                 start_i_increment=0, bayesian=False):
+                 start_i_increment=0, bayesian=False, cross_att_heads=0):
         """
         Initialize the TCNAttentionBlock
         :param in_channels: Input channels
@@ -608,15 +633,23 @@ class TCNAttentionBlock(nn.Module):
         :param dilation: Dilation in the conv kernel
         :param alibi_alpha: Alpha for ALiBi
         :param start_i_increment: Starting increment of ALiBi
+        :param cross_att_heads: Heads for cross-attention between x and context. Set to 0 for no cross-att
         """
         super(TCNAttentionBlock, self).__init__()
 
         self.heads = heads
+        self.cross_att_heads = cross_att_heads
+
         if self.heads > 0:
             self.attention = MultiHeadAttention(in_channels, heads, alibi_alpha=alibi_alpha,
                                                 start_i_increment=start_i_increment,
                                                 num_persistent=16)
             self.dropout1 = nn.Dropout(att_dropout)  # Dropout for attention
+
+        if self.cross_att_heads > 0:
+            self.cross_attention = MultiHeadAttention(in_channels, cross_att_heads, alibi_alpha=alibi_alpha,
+                                                      start_i_increment=start_i_increment,
+                                                      num_persistent=16)
 
         padding = (kernel_size - 1) * dilation  # Calculate padding based on dilation
         self.temporal_block = TemporalBlock(in_channels, out_channels, kernel_size, stride=1, dilation=dilation,
@@ -624,25 +657,31 @@ class TCNAttentionBlock(nn.Module):
         self.norm = nn.LayerNorm(out_channels)
         self.dropout2 = nn.Dropout(dropout)
 
-    def forward(self, x, mask):
+    def forward(self, x, mask, att_mask, context):
         """
         Args:
             x: Input tensor of shape (batch_size, seq_length, channels).
-            mask: Mask tensor of shape (batch_size, 1, seq_length, seq_length), where True is valid and False is invalid
+            mask: Mask tensor of shape (batch_size, 1, seq_length), where True is invalid (padding) and False is valid
+            att_mask: Attention mask of shape (batch_size, 1, seq_len, seq_len) where True is valid and False is invalid
+            (ideally, causal)
+            context: Context tensor for cross-attention, same shape and lengths as x
         """
-        # x = (batch, seq_len, channels)
         if self.heads > 0:
-            x_att = self.attention(x, x, x, mask)
+            x_att = self.attention(x, x, x, att_mask)
             x_att = self.dropout1(x_att)
             x = x + x_att  # Residual connection
+
+        if self.cross_att_heads > 0:
+            x_cross_att = self.cross_attention(context, context, x, att_mask)
+            x_cross_att = self.dropout1(x_cross_att)
+            x = x + x_cross_att
 
         x = x.transpose(1, 2)  # Switch dimensions for convolution
 
         # x = (batch, channels, seq_len)
         x = self.temporal_block(x)
 
-        conv_mask = reduce_mask(mask)
-        x = x.masked_fill(conv_mask == 0, 0)
+        x = x.masked_fill(mask, 0)
 
         x = x.transpose(1, 2)  # (batch, channels, seq_len) => (batch, seq_len, channels)
         x = self.norm(x)
@@ -662,14 +701,15 @@ class TCNAttention(nn.Module):
         if len(kernel_size) != len(num_channels):
             raise ValueError("The length of kernel_size must be equal to the length of num_channels")
 
-        # Initialize TCNAttentionBlocks with proper dilation rates
         current_channels = num_inputs
         for level, (out_channels, num_heads, k_size) in enumerate(zip(num_channels, heads, kernel_size)):
             dilation = 1  # we want max precision, dilation is detrimental.
+            is_last = level == len(num_channels) - 1
+
             self.layers.append(TCNAttentionBlock(current_channels, out_channels, k_size, num_heads,
                                                  att_dropout, dropout, dilation, alibi_alpha=alibi_alpha,
                                                  start_i_increment=start_i_increment + (level * num_heads),
-                                                 bayesian=bayesian
+                                                 bayesian=bayesian, cross_att_heads=2 if is_last else 0
                                                  )
                                )
             current_channels = out_channels  # The output of the current block is the input for the next
@@ -678,8 +718,13 @@ class TCNAttention(nn.Module):
         """
         Args:
             x: Input tensor of shape (batch_size, seq_length, channels).
-            mask: Mask tensor of shape (batch_size, 1, seq_length, seq_length), where True is valid and False is invalid
+            mask: Mask tensor of shape (batch_size, seq_length), where True is invalid (padding) and False is valid
         """
+
+        att_mask = mask_to_causal_attention_mask(mask)
+        mask = mask.unsqueeze(1)
+        context = x.clone()
+
         for layer in self.layers:
-            x = layer(x, mask)
+            x = layer(x, mask, att_mask, context)
         return x

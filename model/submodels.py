@@ -454,6 +454,11 @@ class SpectrogramDecoder(nn.Module):
 
 
 def mask_to_attention_mask(mask):
+    """
+    Turn a bool mask into an attention mask
+    :param mask: Bool sequence mask, True=padding size (batch, max_length)
+    :return: Attention mask size (batch, 1, seq_len, seq_len), True=valid
+    """
     attention_mask = mask.unsqueeze(1) & mask.unsqueeze(2)
     attention_mask = attention_mask.unsqueeze(1)
     # Flip the mask, our attention uses True=valid
@@ -517,23 +522,19 @@ class DynamicDurationPredictor(nn.Module):
         # Generate the appropriate mask for attention
         mask = sequence_mask(x.size(1), x_lengths)
 
-        # Create an attention mask (batch, 1, seq_len, seq_len)
-        attention_mask = mask_to_attention_mask(mask)
-
         if self.bidirectional:
             x_orig = x.clone()
 
         x = self.entry_dropout(x)
         # Pass input through the TCNAttention layer
-        x = self.tcn_attention(x, attention_mask)
+        x = self.tcn_attention(x, mask)
 
         if self.bidirectional:
             # Reverse input and mask for backward processing
             x_reversed = x_orig.flip(dims=[1])
             mask_reversed = mask.flip(dims=[1])
-            reverse_attention_mask = mask_to_attention_mask(mask_reversed)
 
-            x_reversed = self.backwards_tcn_attention(x_reversed, reverse_attention_mask)
+            x_reversed = self.backwards_tcn_attention(x_reversed, mask_reversed)
             x_reversed = self.backwards_drop(x_reversed)
 
             # flip back to align with x
