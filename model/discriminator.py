@@ -78,6 +78,7 @@ class AdvSeqDiscriminator(nn.Module):
     Proj+MultiHeadAttn => ResidualBlocks => Masked Global Pooling => Fully Connected => Out
 
     No sigmoid at the end, please use BCEWithLogitsLoss
+    Use n_heads=0 for no attention
     """
 
     def __init__(self, num_channels=1, num_conv_layers=3, conv_kernel_size=3, hidden_dim=128, dropout=0.3, n_heads=4, att_dropout=0.3):
@@ -87,8 +88,11 @@ class AdvSeqDiscriminator(nn.Module):
         self.pre_norm = SequenceNormalization(num_channels)
         self.att_drop = nn.Dropout(att_dropout)
         self.drop1 = nn.Dropout(0.1)
-        self.attention = MultiHeadAttention(hidden_dim, n_heads, alibi_alpha=1.5, start_i_increment=4, num_persistent=16)
-        self.norm = nn.LayerNorm(hidden_dim)
+        self.n_heads = n_heads
+
+        if self.n_heads > 0:
+            self.attention = MultiHeadAttention(hidden_dim, self.n_heads, alibi_alpha=1.5, start_i_increment=4, num_persistent=16)
+            self.norm = nn.LayerNorm(hidden_dim)
 
         in_channels = hidden_dim
 
@@ -115,10 +119,13 @@ class AdvSeqDiscriminator(nn.Module):
         x = self.pre_norm(x, seq_lens)
 
         x = self.proj(x) # (batch, seq_len, 1) => (batch, seq_len, hidden_dim)
-        x_att = self.attention(x, x, x, mask=att_mask)
-        x = x + self.att_drop(x_att)
-        x = self.norm(x)
-        x = self.drop1(x)
+
+        if self.n_heads > 0:
+            x_att = self.attention(x, x, x, mask=att_mask)
+            x = x + self.att_drop(x_att)
+            x = self.norm(x)
+            x = self.drop1(x)
+
 
         # Prepare for convs
         x = x.transpose(1,2) # (batch, seq_len, hidden_dim) => (batch, hidden_dim, seq_len)
@@ -157,6 +164,30 @@ class AdvSeqDiscriminator(nn.Module):
 
         return x
 
+
+class DualDiscriminator(nn.Module):
+    def __init__(self, num_channels=1, num_blocks=3, hidden_dim=128, n_heads=4, dropout=0.3):
+        super(DualDiscriminator, self).__init__()
+        self.sequence_discriminator = AdvSeqDiscriminator(num_channels, num_conv_layers=num_blocks,
+                                                          hidden_dim=hidden_dim, n_heads=n_heads, dropout=dropout)
+        self.difference_discriminator = AdvSeqDiscriminator(num_channels, num_conv_layers=num_blocks,
+                                                            hidden_dim=hidden_dim, n_heads=n_heads, dropout=dropout)
+
+    def forward(self, x, seq_lens):
+        # Forward pass through sequence discriminator
+        sequence_score = self.sequence_discriminator(x, seq_lens)
+
+        # Compute consecutive differences for the difference discriminator
+        diff_x = x[:, :1] - x[:, :-1]
+        diff_seq_lens = seq_lens - 1  # Adjust sequence lengths for differences
+
+        # Forward pass through difference discriminator
+        difference_score = self.difference_discriminator(diff_x, diff_seq_lens)
+
+        # Concatenate both scores
+        combined_score = torch.cat((sequence_score, difference_score), dim=1)
+
+        return combined_score
 
 class SeqDiscriminator(nn.Module):
     """
