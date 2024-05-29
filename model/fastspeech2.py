@@ -95,6 +95,7 @@ class FastSpeech2(nn.Module):
         )
 
         output = self.text_encoder(texts, src_lens)
+        encoded_text = output.clone()
 
         # src_masks -> [batch, mxlen] => [batch, 1, mxlen]
         if mels is not None:
@@ -153,6 +154,7 @@ class FastSpeech2(nn.Module):
             attn_hard,
             attn_soft,
             total_durs,
+            encoded_text,
         )
 
     def infer(

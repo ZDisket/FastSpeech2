@@ -104,11 +104,12 @@ class AdvSeqDiscriminator(nn.Module):
             nn.Linear(hidden_dim, 1),
         )
 
-    def forward(self, x, seq_lens):
+    def forward(self, x, seq_lens, hidden_in):
         """
         Forward pass through the sequence-level discriminator with masked global average pooling.
         :param x: Durations (real or fake), size (batch, seq_len)
         :param seq_lens: Int tensor of length for each batch, size (batch,)
+        :param hidden_in: Text hidden states, (batch, seq_len, channels)
         :return: Probability that each sequence is real, size (batch, 1).
         """
         x_mask = sequence_mask(x.size(1), seq_lens)
@@ -118,6 +119,7 @@ class AdvSeqDiscriminator(nn.Module):
         x = self.pre_norm(x, seq_lens)
 
         x = self.proj(x) # (batch, seq_len, 1) => (batch, seq_len, hidden_dim)
+        x = x + hidden_in[:, :x.size(1), :]
 
         if self.n_heads > 0:
             x_att = self.attention(x, x, x, mask=att_mask)
@@ -165,23 +167,35 @@ class AdvSeqDiscriminator(nn.Module):
 
 
 class DualDiscriminator(nn.Module):
-    def __init__(self, num_channels=1, num_blocks=3, hidden_dim=128, n_heads=4, dropout=0.3):
+    def __init__(self, text_hidden=256, num_channels=1, num_blocks=3, hidden_dim=128, n_heads=4, dropout=0.3):
         super(DualDiscriminator, self).__init__()
+        self.text_compress = nn.Conv1d(text_hidden, hidden_dim, 3, padding="same")
         self.sequence_discriminator = AdvSeqDiscriminator(num_channels, num_conv_layers=num_blocks,
                                                           hidden_dim=hidden_dim, n_heads=n_heads, dropout=dropout)
         self.difference_discriminator = AdvSeqDiscriminator(num_channels, num_conv_layers=num_blocks,
                                                             hidden_dim=hidden_dim, n_heads=n_heads, dropout=dropout)
 
-    def forward(self, x, seq_lens):
+    def forward(self, x, seq_lens, text_hidden):
+        """
+        Forward pass
+        :param x:
+        :param seq_lens:
+        :param text_hidden:
+        :return:
+        """
+        text_hidden = self.text_compress(
+            text_hidden.transpose(1,2)
+        ).transpose(1,2)
+
         # Forward pass through sequence discriminator
-        sequence_score = self.sequence_discriminator(x, seq_lens)
+        sequence_score = self.sequence_discriminator(x, seq_lens, text_hidden)
 
         # Compute consecutive differences for the difference discriminator
         diff_x = x[:, :1] - x[:, :-1]
         diff_seq_lens = seq_lens - 1  # Adjust sequence lengths for differences
 
         # Forward pass through difference discriminator
-        difference_score = self.difference_discriminator(diff_x, diff_seq_lens)
+        difference_score = self.difference_discriminator(diff_x, diff_seq_lens, text_hidden)
 
         # Concatenate both scores
         combined_score = torch.cat((sequence_score, difference_score), dim=1)

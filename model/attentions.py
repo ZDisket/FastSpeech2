@@ -9,6 +9,11 @@ import torchbnn
 from torchbnn import BayesConv1d
 
 
+class SwiGLUCNN(nn.Module):
+    def forward(self, x):
+        x, gate = x.chunk(2, dim=1)
+        return F.silu(gate) * x
+
 class SwiGLUConvFFN(nn.Module):
     def __init__(
             self,
@@ -521,14 +526,14 @@ class TemporalBlock(nn.Module):
                                stride=stride, padding=padding, dilation=dilation)
         self.chomp1 = Chomp1d(padding)
         self.ln1 = TransposeRMSNorm(n_outputs) if bayesian else nn.Identity()
-        self.relu1 = nn.ReLU()
+        self.relu1 = SwiGLUCNN()
         self.dropout1 = nn.Dropout(dropout)
 
         self.conv2 = make_conv(bayesian, n_outputs, n_outputs, kernel_size,
                                stride=stride, padding=padding, dilation=dilation)
         self.chomp2 = Chomp1d(padding)
         self.ln2 = TransposeRMSNorm(n_outputs) if bayesian else nn.Identity()
-        self.relu2 = nn.ReLU()
+        self.relu2 = SwiGLUCNN()
         self.dropout2 = nn.Dropout(dropout)
 
         self.net = nn.Sequential(self.conv1, self.chomp1, self.ln1, self.relu1, self.dropout1,
@@ -537,7 +542,7 @@ class TemporalBlock(nn.Module):
         self.downsample = make_conv(bayesian, n_inputs, n_outputs, 1) if n_inputs != n_outputs else None
 
         self.se_block = nn.Identity()
-        self.relu = nn.ReLU()
+        self.relu = SwiGLUCNN()
         if use_se:
             self.se_block = SEBlock1D(n_outputs, reduction)
 

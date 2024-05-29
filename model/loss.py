@@ -357,6 +357,7 @@ class FastSpeech3Loss(nn.Module):
             attn_hard,
             attn_soft,
             attn_hard_dur,
+            _,
         ) = predictions
 
         src_masks = ~src_masks

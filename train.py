@@ -61,11 +61,11 @@ def main(args, configs):
     if len(args.pretrained):
         load_pretrained_weights(model, args.pretrained)
 
-    discriminator = DualDiscriminator(n_heads=0, num_blocks=2).to(device)
+    discriminator = DualDiscriminator(n_heads=0, num_blocks=3).to(device)
     discriminator.train()
     criterion_lsgan = LSGANLoss()
     criterion_d = nn.BCEWithLogitsLoss()
-    optimizer_d = torch.optim.Adam(discriminator.parameters(), lr=0.001)
+    optimizer_d = torch.optim.Adam(discriminator.parameters(), lr=0.00003)
 
     model = nn.DataParallel(model)
     discriminator = nn.DataParallel(discriminator)
@@ -121,6 +121,7 @@ def main(args, configs):
 
                     durations_real = output[5].detach() # we don't want to optimize the AlignmentEncoder
                     durations_fake = output[4]
+                    text_enc = output[14].detach() # no optimizing the text-encoder
                     seq_lens = batch[2 + 2]
 
                     # generate durations are log, bring them to the linear space
@@ -129,10 +130,10 @@ def main(args, configs):
 
                     if step > discriminator_train_start_steps:
                         # train on real
-                        outputs_real = discriminator(durations_real, seq_lens)
+                        outputs_real = discriminator(durations_real, seq_lens, text_enc)
 
                         # train on fake
-                        outputs_fake = discriminator(durations_fake.detach(), seq_lens)
+                        outputs_fake = discriminator(durations_fake.detach(), seq_lens, text_enc)
 
                         loss_d = criterion_lsgan.discriminator_loss(outputs_real, outputs_fake)
                         loss_d /= grad_acc_step
@@ -154,7 +155,7 @@ def main(args, configs):
                     losses = Loss(batch, output, epoch, model.module)
 
                     if step > discriminator_train_start_steps:
-                        outputs_fake = discriminator(durations_fake, seq_lens)
+                        outputs_fake = discriminator(durations_fake, seq_lens, text_enc)
                         gan_loss = criterion_lsgan.generator_loss(outputs_fake)
                     else:
                         gan_loss = torch.FloatTensor([0.0]).to(device)
