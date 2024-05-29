@@ -5,8 +5,26 @@ import numpy as np
 from torch.nn import functional as F
 import torchbnn as bnn
 
+
+class LSGANLoss(nn.Module):
+    def __init__(self, real_label=1.0, fake_label=0.0):
+        super(LSGANLoss, self).__init__()
+        self.real_label = real_label
+        self.fake_label = fake_label
+        self.criterion = nn.MSELoss()
+
+    def discriminator_loss(self, real_output, fake_output):
+        real_loss = self.criterion(real_output, torch.full_like(real_output, self.real_label))
+        fake_loss = self.criterion(fake_output, torch.full_like(fake_output, self.fake_label))
+        return 0.5 * (real_loss + fake_loss)
+
+    def generator_loss(self, fake_output):
+        return self.criterion(fake_output, torch.full_like(fake_output, self.real_label))
+
+
 class CharbonnierLoss(nn.Module):
     """Charbonnier Loss (L1) - generalized to handle tensors of arbitrary shapes."""
+
     def __init__(self, eps=1e-6):
         super(CharbonnierLoss, self).__init__()
         self.eps = eps
@@ -21,12 +39,13 @@ class CharbonnierLoss(nn.Module):
 
         # Calculate the Charbonnier loss
         diff = x - y
-        loss = torch.sqrt(diff.pow(2) + self.eps**2).mean()  # Mean across all dimensions except batch
+        loss = torch.sqrt(diff.pow(2) + self.eps ** 2).mean()  # Mean across all dimensions except batch
         return loss
 
 
 class Charbonnier1D(nn.Module):
     """Charbonnier Loss for 1D sequences (batch_size, seq_len)."""
+
     def __init__(self, eps=1e-6):
         super(Charbonnier1D, self).__init__()
         self.eps = eps
@@ -51,12 +70,13 @@ class Charbonnier1D(nn.Module):
         diff = diff[~mask]  # Include only valid elements using the inverted mask
 
         # Charbonnier loss calculation
-        loss = torch.sqrt(diff.pow(2) + self.eps**2).mean()  # Mean across valid dimensions
+        loss = torch.sqrt(diff.pow(2) + self.eps ** 2).mean()  # Mean across valid dimensions
         return loss
 
 
 class MSE1D(nn.Module):
     """Mean Squared Error Loss for 1D sequences with masking (batch_size, seq_len)."""
+
     def __init__(self):
         super(MSE1D, self).__init__()
 
@@ -154,7 +174,6 @@ class ForwardSumLoss(torch.nn.modules.loss._Loss):
         self.ctc_loss = torch.nn.CTCLoss(zero_infinity=True)
         self.blank_logprob = blank_logprob
 
-
     def forward(self, attn_logprob, in_lens, out_lens):
         key_lens = in_lens
         query_lens = out_lens
@@ -169,8 +188,8 @@ class ForwardSumLoss(torch.nn.modules.loss._Loss):
             loss = self.ctc_loss(
                 curr_logprob,
                 target_seq,
-                input_lengths=query_lens[bid : bid + 1],
-                target_lengths=key_lens[bid : bid + 1],
+                input_lengths=query_lens[bid: bid + 1],
+                target_lengths=key_lens[bid: bid + 1],
             )
             total_loss += loss
 
@@ -255,7 +274,7 @@ class FastSpeech2Loss(nn.Module):
         duration_loss = self.mse_loss(log_duration_predictions, log_duration_targets)
 
         total_loss = (
-            mel_loss + postnet_mel_loss + duration_loss + pitch_loss + energy_loss
+                mel_loss + postnet_mel_loss + duration_loss + pitch_loss + energy_loss
         )
 
         return (
@@ -266,7 +285,6 @@ class FastSpeech2Loss(nn.Module):
             energy_loss,
             duration_loss,
         )
-
 
 
 def pad_tensor_to_max_width(tensor, lens_w):
@@ -281,6 +299,7 @@ def pad_tensor_to_max_width(tensor, lens_w):
         tensor = F.pad(tensor, padding, "constant", 0)  # Adding zero padding
 
     return tensor
+
 
 class FastSpeech3Loss(nn.Module):
     """ FastSpeech2+1 Loss """
@@ -301,7 +320,7 @@ class FastSpeech3Loss(nn.Module):
         self.bin_loss = BinLoss()
         self.mse2_loss = MSE1D()
         self.charb_loss = Charbonnier1D()
-        self.temp_loss = TemporalConsistencyLoss(1.0, True) # I tested 0.35, 0.5, 0.75, but 1.0 is best
+        self.temp_loss = TemporalConsistencyLoss(1.0, True)  # I tested 0.35, 0.5, 0.75, but 1.0 is best
         self.kl_loss = bnn.BKLLoss(reduction='mean', last_layer_only=False)
 
         self.duration_kl_loss_weight = 30.0
@@ -369,8 +388,8 @@ class FastSpeech3Loss(nn.Module):
             energy_predictions = energy_predictions.masked_select(mel_masks)
             energy_targets = energy_targets.masked_select(mel_masks)
 
-       # log_duration_predictions = log_duration_predictions.masked_select(src_masks)
-        #log_duration_targets = log_duration_targets.masked_select(src_masks)
+        # log_duration_predictions = log_duration_predictions.masked_select(src_masks)
+        # log_duration_targets = log_duration_targets.masked_select(src_masks)
 
         mel_predictions = mel_predictions.masked_select(mel_masks.unsqueeze(-1))
         postnet_mel_predictions = postnet_mel_predictions.masked_select(
@@ -427,10 +446,9 @@ class FastSpeech3Loss(nn.Module):
 
         total_kl = kl_duration + kl_pitch_energy
 
-
         total_loss = (
-            mel_loss + postnet_mel_loss + duration_loss + pitch_loss + energy_loss +
-            total_attn_loss + total_temporal + total_kl
+                mel_loss + postnet_mel_loss + duration_loss + pitch_loss + energy_loss +
+                total_attn_loss + total_temporal + total_kl
         )
 
         ret = (

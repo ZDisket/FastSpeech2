@@ -591,7 +591,7 @@ def mask_to_causal_attention_mask(mask):
     """
     batch_size, seq_len = mask.shape
     # Create a lower triangular matrix of ones
-    causal_mask = torch.tril(torch.ones((seq_len, seq_len), dtype=torch.bool), diagonal=0)
+    causal_mask = torch.tril(torch.ones((seq_len, seq_len), dtype=torch.bool), diagonal=0).to(mask.device)
     # Expand dimensions to fit the attention mask shape (batch, 1, seq_len, seq_len)
     causal_mask = causal_mask.unsqueeze(0).unsqueeze(0).expand(batch_size, 1, seq_len, seq_len)
     # Combine the causal mask with the input mask
@@ -621,7 +621,7 @@ class TCNAttentionBlock(nn.Module):
     """
 
     def __init__(self, in_channels, out_channels, kernel_size, heads, att_dropout, dropout, dilation, alibi_alpha,
-                 start_i_increment=0, bayesian=False, cross_att_heads=0):
+                 start_i_increment=0, bayesian=False, context_size=0, cross_att_heads=0):
         """
         Initialize the TCNAttentionBlock
         :param in_channels: Input channels
@@ -634,6 +634,7 @@ class TCNAttentionBlock(nn.Module):
         :param alibi_alpha: Alpha for ALiBi
         :param start_i_increment: Starting increment of ALiBi
         :param cross_att_heads: Heads for cross-attention between x and context. Set to 0 for no cross-att
+        :param context_size: Size, in channels, of context. Will use projection if different from in_channels
         """
         super(TCNAttentionBlock, self).__init__()
 
@@ -647,6 +648,8 @@ class TCNAttentionBlock(nn.Module):
             self.dropout1 = nn.Dropout(att_dropout)  # Dropout for attention
 
         if self.cross_att_heads > 0:
+            self.context_proj = nn.Linear(context_size, in_channels) if context_size != in_channels else nn.Identity()
+
             self.cross_attention = MultiHeadAttention(in_channels, cross_att_heads, alibi_alpha=alibi_alpha,
                                                       start_i_increment=start_i_increment,
                                                       num_persistent=16)
@@ -672,6 +675,7 @@ class TCNAttentionBlock(nn.Module):
             x = x + x_att  # Residual connection
 
         if self.cross_att_heads > 0:
+            context = self.context_proj(context)
             x_cross_att = self.cross_attention(context, context, x, att_mask)
             x_cross_att = self.dropout1(x_cross_att)
             x = x + x_cross_att
@@ -709,7 +713,8 @@ class TCNAttention(nn.Module):
             self.layers.append(TCNAttentionBlock(current_channels, out_channels, k_size, num_heads,
                                                  att_dropout, dropout, dilation, alibi_alpha=alibi_alpha,
                                                  start_i_increment=start_i_increment + (level * num_heads),
-                                                 bayesian=bayesian, cross_att_heads=2 if is_last else 0
+                                                 bayesian=bayesian, cross_att_heads=2 if is_last else 0,
+                                                 context_size=num_inputs,
                                                  )
                                )
             current_channels = out_channels  # The output of the current block is the input for the next

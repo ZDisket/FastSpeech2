@@ -470,7 +470,7 @@ def sequence_mask(max_length, x_lengths):
     """
     Make a bool sequence mask
     :param max_length: Max length of sequences
-    :param x_lengths: Tensor (batch,) indicating sequence lenghts
+    :param x_lengths: Tensor (batch,) indicating sequence lengths
     :return: Bool tensor size (batch, max_length) where True is padded and False is valid
     """
     mask = torch.arange(max_length).expand(len(x_lengths), max_length).to(x_lengths.device)
