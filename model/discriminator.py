@@ -1,7 +1,7 @@
 import torch
 import torch.nn as nn
 import torch.optim as optim
-from .attentions import SEBlock1D, TransposeRMSNorm, MultiHeadAttention
+from .attentions import SEBlock1D, TransposeRMSNorm, MultiHeadAttention, APTx, ResidualBlock1D
 from .submodels import sequence_mask, mask_to_attention_mask
 
 class SequenceNormalization(nn.Module):
@@ -40,37 +40,6 @@ class SequenceNormalization(nn.Module):
         scaled_x = scaled_x.transpose(1, 2) # (batch, 1, seq_len) => (batch, seq_len, 1)
         return scaled_x
 
-
-class ResidualBlock1D(nn.Module):
-    """
-    Conv1D+Squeeze-Excite+RMSNorm residual block for sequence modeling
-    """
-    def __init__(self, in_channels, out_channels, kernel_size=3, dropout=0.3):
-        super(ResidualBlock1D, self).__init__()
-        self.conv1 = nn.Conv1d(in_channels, out_channels, kernel_size, padding=kernel_size//2)
-        self.conv2 = nn.Conv1d(out_channels, out_channels, kernel_size, padding=kernel_size//2)
-        self.norm1 = TransposeRMSNorm(out_channels)
-        self.norm2 = TransposeRMSNorm(out_channels)
-        self.se = SEBlock1D(out_channels)
-        self.relu = nn.ReLU()
-        self.dropout = nn.Dropout(dropout)
-
-        self.residual = nn.Conv1d(in_channels, out_channels, kernel_size=1) if in_channels != out_channels else nn.Identity()
-
-    def forward(self, x):
-        residual = self.residual(x)
-        out = self.conv1(x)
-        out = self.norm1(out)
-        out = self.relu(out)
-        out = self.conv2(out)
-        out = self.norm2(out)
-        out = self.se(out)
-        out += residual
-        out = self.relu(out)
-        out = self.dropout(out)
-        return out
-
-
 class AdvSeqDiscriminator(nn.Module):
     """
     Sequence-level discriminator with masked global average pooling.
@@ -104,7 +73,7 @@ class AdvSeqDiscriminator(nn.Module):
             nn.Linear(hidden_dim, 1),
         )
 
-    def forward(self, x, seq_lens, hidden_in):
+    def forward(self, x, seq_lens, hidden_in=None):
         """
         Forward pass through the sequence-level discriminator with masked global average pooling.
         :param x: Durations (real or fake), size (batch, seq_len)
@@ -119,14 +88,15 @@ class AdvSeqDiscriminator(nn.Module):
         x = self.pre_norm(x, seq_lens)
 
         x = self.proj(x) # (batch, seq_len, 1) => (batch, seq_len, hidden_dim)
-        x = x + hidden_in[:, :x.size(1), :]
+
+        if hidden_in is not None:
+            x = x + hidden_in[:, :x.size(1), :]
 
         if self.n_heads > 0:
             x_att = self.attention(x, x, x, mask=att_mask)
             x = x + self.att_drop(x_att)
             x = self.norm(x)
             x = self.drop1(x)
-
 
         # Prepare for convs
         x = x.transpose(1,2) # (batch, seq_len, hidden_dim) => (batch, hidden_dim, seq_len)
@@ -169,13 +139,16 @@ class AdvSeqDiscriminator(nn.Module):
 class DualDiscriminator(nn.Module):
     def __init__(self, text_hidden=256, num_channels=1, num_blocks=3, hidden_dim=128, n_heads=4, dropout=0.3):
         super(DualDiscriminator, self).__init__()
-        self.text_compress = nn.Conv1d(text_hidden, hidden_dim, 3, padding="same")
+
+        if text_hidden > 0:
+            self.text_compress = nn.Conv1d(text_hidden, hidden_dim, 3, padding="same")
+
         self.sequence_discriminator = AdvSeqDiscriminator(num_channels, num_conv_layers=num_blocks,
                                                           hidden_dim=hidden_dim, n_heads=n_heads, dropout=dropout)
         self.difference_discriminator = AdvSeqDiscriminator(num_channels, num_conv_layers=num_blocks,
                                                             hidden_dim=hidden_dim, n_heads=n_heads, dropout=dropout)
 
-    def forward(self, x, seq_lens, text_hidden):
+    def forward(self, x, seq_lens, text_hidden=None):
         """
         Forward pass
         :param x:
@@ -183,9 +156,10 @@ class DualDiscriminator(nn.Module):
         :param text_hidden:
         :return:
         """
-        text_hidden = self.text_compress(
-            text_hidden.transpose(1,2)
-        ).transpose(1,2)
+        if text_hidden is not None:
+            text_hidden = self.text_compress(
+                text_hidden.transpose(1, 2)
+            ).transpose(1, 2)
 
         # Forward pass through sequence discriminator
         sequence_score = self.sequence_discriminator(x, seq_lens, text_hidden)

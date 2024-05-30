@@ -9,10 +9,23 @@ import torchbnn
 from torchbnn import BayesConv1d
 
 
-class SwiGLUCNN(nn.Module):
+class SwiGLU(nn.Module):
+    def __init__(self, dim):
+        super(SwiGLU, self).__init__()
+        self.fc1 = nn.Linear(dim, dim * 2)
+        self.fc2 = nn.Linear(dim, dim)
+
     def forward(self, x):
-        x, gate = x.chunk(2, dim=1)
-        return F.silu(gate) * x
+        """
+        Pass through simple SwiGLU
+        :param x:
+        :return:
+        """
+        x = x.transpose(1, 2)
+        x_proj = self.fc1(x)
+        x_proj, x_gate = x_proj.chunk(2, dim=-1)
+        x = x_proj * torch.sigmoid(x_gate)
+        return x.transpose(1,2)
 
 class SwiGLUConvFFN(nn.Module):
     def __init__(
@@ -517,23 +530,58 @@ def make_conv(bayesian, in_channels, out_channels, kernel_size, stride=1, paddin
         if bayesian else weight_norm(nn.Conv1d(in_channels, out_channels, kernel_size,
                                                stride=stride, padding=padding, dilation=dilation))
 
+class ReluSquared(nn.Module):
+    def forward(self, x):
+        return F.relu(x) ** 2
+
+class APTx(nn.Module):
+    """
+    APTx: Alpha Plus Tanh Times, an activation function that behaves like Mish,
+    but is 2x faster.
+
+    https://arxiv.org/abs/2209.06119
+    """
+    def __init__(self, alpha=1, beta=1, gamma=0.5):
+        super(APTx, self).__init__()
+        self.alpha = alpha
+        self.beta = beta
+        self.gamma = gamma
+
+    def forward(self, x):
+        return (self.alpha + torch.tanh(self.beta * x)) * self.gamma * x
+
 
 class TemporalBlock(nn.Module):
     def __init__(self, n_inputs, n_outputs, kernel_size, stride, dilation, padding, dropout=0.2, use_se=False,
-                 reduction=16, bayesian=False):
+                 reduction=16, bayesian=False, use_swiglu=False):
+        """
+        Initialize TemporalBlock for TCN
+        :param n_inputs: Number of input channels
+        :param n_outputs: Output channels
+        :param kernel_size: Kernel size
+        :param stride: Stride of convs
+        :param dilation: Dilation
+        :param padding: Padding
+        :param dropout: Dropout
+        :param use_se: Use Squeeze-Excite attention
+        :param reduction: Reduction for Squeeze-Excite, if enabled
+        :param bayesian: Use Bayesian convs, for nondeterminism. Will use RMSNorm instead of weight normalization
+        :param use_swiglu: Use SwiGLU for the final activation, and Mish for the intermediate ones
+        """
         super(TemporalBlock, self).__init__()
+        self.use_swiglu = use_swiglu
         self.conv1 = make_conv(bayesian, n_inputs, n_outputs, kernel_size,
                                stride=stride, padding=padding, dilation=dilation)
         self.chomp1 = Chomp1d(padding)
         self.ln1 = TransposeRMSNorm(n_outputs) if bayesian else nn.Identity()
-        self.relu1 = SwiGLUCNN()
+        self.relu1 = APTx() if use_swiglu else nn.ReLU()
         self.dropout1 = nn.Dropout(dropout)
 
         self.conv2 = make_conv(bayesian, n_outputs, n_outputs, kernel_size,
                                stride=stride, padding=padding, dilation=dilation)
         self.chomp2 = Chomp1d(padding)
         self.ln2 = TransposeRMSNorm(n_outputs) if bayesian else nn.Identity()
-        self.relu2 = SwiGLUCNN()
+        self.relu2 = APTx() if use_swiglu else nn.ReLU()
         self.dropout2 = nn.Dropout(dropout)
 
         self.net = nn.Sequential(self.conv1, self.chomp1, self.ln1, self.relu1, self.dropout1,
@@ -542,7 +590,10 @@ class TemporalBlock(nn.Module):
         self.downsample = make_conv(bayesian, n_inputs, n_outputs, 1) if n_inputs != n_outputs else None
 
         self.se_block = nn.Identity()
-        self.relu = SwiGLUCNN()
+        # When use_swiglu=True, the final activation is a SwiGLU, but the intermediate ones are Mish.
+        # SwiGLU is costly in terms of parameters and expands the capacity, Mish works well enough and doesn't
+        # add complexity.
+        self.relu = SwiGLU(n_outputs) if use_swiglu else nn.ReLU()
         if use_se:
             self.se_block = SEBlock1D(n_outputs, reduction)
 
@@ -660,8 +711,14 @@ class TCNAttentionBlock(nn.Module):
                                                       num_persistent=16)
 
         padding = (kernel_size - 1) * dilation  # Calculate padding based on dilation
+
+        # SwiGLU as the final act of the temporal block improves performance here, but worsens it considerably in the
+        # pitch&energy predictors. I have no solid explanation, but I theorize that in this case it benefits
+        # from the added complexity and smoothness compared to ReLU; given we have attention and normalization going on
         self.temporal_block = TemporalBlock(in_channels, out_channels, kernel_size, stride=1, dilation=dilation,
-                                            padding=padding, dropout=dropout, use_se=self.heads == 0, bayesian=bayesian)
+                                            padding=padding, dropout=dropout, use_se=self.heads == 0, bayesian=bayesian,
+                                            use_swiglu=True)
+
         self.norm = nn.LayerNorm(out_channels)
         self.dropout2 = nn.Dropout(dropout)
 
@@ -697,6 +754,37 @@ class TCNAttentionBlock(nn.Module):
         x = self.dropout2(x)
 
         return x
+
+
+class ResidualBlock1D(nn.Module):
+    """
+    Conv1D+Squeeze-Excite+RMSNorm residual block for sequence modeling
+    """
+    def __init__(self, in_channels, out_channels, kernel_size=3, dilation=1, dropout=0.3, act="relu"):
+        super(ResidualBlock1D, self).__init__()
+        self.conv1 = nn.Conv1d(in_channels, out_channels, kernel_size, dilation=dilation, padding="same")
+        self.conv2 = nn.Conv1d(out_channels, out_channels, kernel_size, dilation=dilation, padding="same")
+        self.norm1 = TransposeRMSNorm(out_channels)
+        self.norm2 = TransposeRMSNorm(out_channels)
+        self.se = SEBlock1D(out_channels)
+        self.relu = APTx() if act == "aptx" else nn.ReLU()
+        self.dropout = nn.Dropout(dropout)
+
+        self.residual = nn.Conv1d(in_channels, out_channels, kernel_size=1) if in_channels != out_channels else nn.Identity()
+
+    def forward(self, x):
+        residual = self.residual(x)
+        out = self.conv1(x)
+        out = self.norm1(out)
+        out = self.relu(out)
+        out = self.conv2(out)
+        out = self.norm2(out)
+        out = self.se(out)
+        out += residual
+        out = self.relu(out)
+        out = self.dropout(out)
+        return out
+
 
 
 class TCNAttention(nn.Module):
