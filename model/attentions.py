@@ -551,9 +551,27 @@ class APTx(nn.Module):
         return (self.alpha + torch.tanh(self.beta * x)) * self.gamma * x
 
 
+class SwiGLUCNN(nn.Module):
+    def __init__(self):
+        super(SwiGLUCNN, self).__init__()
+
+    def forward(self, x):
+        """
+        :param x: input tensor of shape (batch_size, dim, seq_length)
+        :return: output tensor of shape (batch_size, dim // 2, seq_length)
+        """
+        # Split the input tensor into two equal parts along the last dimension
+        x = x.transpose(1,2)
+        x_proj, x_gate = x.chunk(2, dim=-1)
+        # Apply the SwiGLU activation function
+        x = x_proj * torch.sigmoid(x_gate)
+        x = x.transpose(1, 2)
+        return x
+
+
 class TemporalBlock(nn.Module):
     def __init__(self, n_inputs, n_outputs, kernel_size, stride, dilation, padding, dropout=0.2, use_se=False,
-                 reduction=16, bayesian=False, use_swiglu=False):
+                 reduction=16, bayesian=False, use_swiglu=False, use_aptx=False):
         """
         Initialize TemporalBlock for TCN
         :param n_inputs: Number of input channels
@@ -566,43 +584,53 @@ class TemporalBlock(nn.Module):
         :param use_se: Use Squeeze-Excite attention
         :param reduction: Reduction for Squeeze-Excite, if enabled
         :param bayesian: Use Bayesian convs, for nondeterminism. Will use RMSNorm instead of weight normalization
-        :param use_swiglu: Use SwiGLU for the final activation, and Mish for the intermediate ones
+        :param use_swiglu: Use SwiGLU for the final activation
+        :param use_aptx: Use APTx for the acts
         """
         super(TemporalBlock, self).__init__()
         self.use_swiglu = use_swiglu
+
         self.conv1 = make_conv(bayesian, n_inputs, n_outputs, kernel_size,
                                stride=stride, padding=padding, dilation=dilation)
         self.chomp1 = Chomp1d(padding)
         self.ln1 = TransposeRMSNorm(n_outputs) if bayesian else nn.Identity()
-        self.relu1 = APTx() if use_swiglu else nn.ReLU()
+        self.relu1 = APTx() if use_aptx else nn.ReLU()
         self.dropout1 = nn.Dropout(dropout)
 
-        self.conv2 = make_conv(bayesian, n_outputs, n_outputs, kernel_size,
+        n_outputs_orig = n_outputs
+        n_final = n_outputs
+
+        if self.use_swiglu and n_inputs == n_outputs:
+            n_final = n_inputs * 2
+
+        self.conv2 = make_conv(bayesian, n_outputs, n_final, kernel_size,
                                stride=stride, padding=padding, dilation=dilation)
         self.chomp2 = Chomp1d(padding)
-        self.ln2 = TransposeRMSNorm(n_outputs) if bayesian else nn.Identity()
-        self.relu2 = APTx() if use_swiglu else nn.ReLU()
+        self.ln2 = TransposeRMSNorm(n_final) if bayesian else nn.Identity()
+        self.relu2 = APTx() if use_aptx else nn.ReLU()
         self.dropout2 = nn.Dropout(dropout)
 
         self.net = nn.Sequential(self.conv1, self.chomp1, self.ln1, self.relu1, self.dropout1,
                                  self.conv2, self.chomp2, self.ln2, self.relu2, self.dropout2)
 
-        self.downsample = make_conv(bayesian, n_inputs, n_outputs, 1) if n_inputs != n_outputs else None
+        n_outputs = n_final
 
-        self.se_block = nn.Identity()
-        # When use_swiglu=True, the final activation is a SwiGLU, but the intermediate ones are Mish.
-        # SwiGLU is costly in terms of parameters and expands the capacity, Mish works well enough and doesn't
-        # add complexity.
-        self.relu = SwiGLU(n_outputs) if use_swiglu else nn.ReLU()
-        if use_se:
-            self.se_block = SEBlock1D(n_outputs, reduction)
+        self.downsample = make_conv(bayesian, n_inputs, n_outputs, 1) if n_inputs != n_outputs else nn.Identity()
+
+        self.se_block = SEBlock1D(n_outputs, reduction) if use_se else nn.Identity()
+
+        if use_swiglu and n_inputs == n_outputs_orig:
+            self.relu = SwiGLUCNN()
+        else:
+            self.relu = APTx() if use_aptx else nn.ReLU()
 
     def forward(self, x):
         out = self.net(x)
-        res = x if self.downsample is None else self.downsample(x)
+        res = self.downsample(x)
         out = out + res
         out = self.se_block(out)
-        return self.relu(out)
+        out = self.relu(out)
+        return out
 
 
 class TemporalConvNet(nn.Module):
@@ -712,12 +740,9 @@ class TCNAttentionBlock(nn.Module):
 
         padding = (kernel_size - 1) * dilation  # Calculate padding based on dilation
 
-        # SwiGLU as the final act of the temporal block improves performance here, but worsens it considerably in the
-        # pitch&energy predictors. I have no solid explanation, but I theorize that in this case it benefits
-        # from the added complexity and smoothness compared to ReLU; given we have attention and normalization going on
         self.temporal_block = TemporalBlock(in_channels, out_channels, kernel_size, stride=1, dilation=dilation,
                                             padding=padding, dropout=dropout, use_se=self.heads == 0, bayesian=bayesian,
-                                            use_swiglu=True)
+                                            use_swiglu=False, use_aptx=True)
 
         self.norm = nn.LayerNorm(out_channels)
         self.dropout2 = nn.Dropout(dropout)
