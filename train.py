@@ -24,6 +24,13 @@ def convert_to_magnitudes(durations):
     magnitudes = durations / total_duration
     return magnitudes
 
+def weights_init_he(m):
+    if isinstance(m, nn.Conv1d) or isinstance(m, nn.Conv2d) or isinstance(m, nn.Linear):
+        nn.init.kaiming_normal_(m.weight, nonlinearity='relu')
+        if m.bias is not None:
+            nn.init.constant_(m.bias, 0)
+
+
 def main(args, configs):
     print("Prepare training ...")
 
@@ -63,12 +70,15 @@ def main(args, configs):
 
 
 
-    discriminator = DualDiscriminator(n_heads=0, num_blocks=3).to(device)
+    discriminator = DualDiscriminator(n_heads=0, hidden_dim=256, num_blocks=3).to(device)
+    discriminator.apply(weights_init_he)
     discriminator.train()
     criterion_lsgan = LSGANLoss()
-    optimizer_d = torch.optim.Adam(discriminator.parameters(), lr=0.00003)
+    optimizer_d = torch.optim.Adam(discriminator.parameters(), lr=0.00007)
     scheduler_d = torch.optim.lr_scheduler.ExponentialLR(optimizer_d, gamma=train_config["optimizer"]["gamma"],
                                                        last_epoch=last_epoch)
+
+
 
     if args.restore_step:
         ckpt_path = os.path.join(
@@ -116,7 +126,7 @@ def main(args, configs):
     scaler = GradScaler()
     scaler_d = GradScaler()
 
-    discriminator_train_start_steps = 0
+    discriminator_train_start_steps = -1
 
     while True:
         inner_bar = tqdm(total=len(loader), desc=f"Epoch {epoch}", position=1)
@@ -133,7 +143,7 @@ def main(args, configs):
 
                     attn_hard_dur = output[5].detach() # we don't want to optimize the AlignmentEncoder
                     durations_fake = output[4]
-                    text_enc = output[14].detach() # no optimizing the text-encoder
+                    text_enc = output[14] # no optimizing the text-encoder
                     seq_lens = batch[2 + 2]
 
                     # bring real durs to the log space
@@ -141,10 +151,10 @@ def main(args, configs):
 
                     if step > discriminator_train_start_steps:
                         # train on real
-                        outputs_real = discriminator(durations_real, seq_lens, text_enc)
+                        outputs_real = discriminator(durations_real, seq_lens, text_enc.detach())
 
                         # train on fake
-                        outputs_fake = discriminator(durations_fake.detach(), seq_lens, text_enc)
+                        outputs_fake = discriminator(durations_fake.detach(), seq_lens, text_enc.detach())
 
                         loss_d = criterion_lsgan.discriminator_loss(outputs_real, outputs_fake)
                         loss_d /= grad_acc_step
