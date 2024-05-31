@@ -53,7 +53,6 @@ class AdvSeqDiscriminator(nn.Module):
         super(AdvSeqDiscriminator, self).__init__()
 
         self.proj = nn.Linear(num_channels, hidden_dim)
-        self.pre_norm = SequenceNormalization(num_channels)
         self.att_drop = nn.Dropout(att_dropout)
         self.drop1 = nn.Dropout(0.1)
         self.n_heads = n_heads
@@ -84,8 +83,6 @@ class AdvSeqDiscriminator(nn.Module):
         x_mask = sequence_mask(x.size(1), seq_lens)
         att_mask = mask_to_attention_mask(x_mask)
         x = x.unsqueeze(-1)  # (batch, seq_len) => (batch, seq_len, 1)
-
-        x = self.pre_norm(x, seq_lens)
 
         x = self.proj(x) # (batch, seq_len, 1) => (batch, seq_len, hidden_dim)
 

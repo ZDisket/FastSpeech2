@@ -61,11 +61,23 @@ def main(args, configs):
     if len(args.pretrained):
         load_pretrained_weights(model, args.pretrained)
 
+
+
     discriminator = DualDiscriminator(n_heads=0, num_blocks=3).to(device)
     discriminator.train()
     criterion_lsgan = LSGANLoss()
-    criterion_d = nn.BCEWithLogitsLoss()
     optimizer_d = torch.optim.Adam(discriminator.parameters(), lr=0.00003)
+    scheduler_d = torch.optim.lr_scheduler.ExponentialLR(optimizer_d, gamma=train_config["optimizer"]["gamma"],
+                                                       last_epoch=last_epoch)
+
+    if args.restore_step:
+        ckpt_path = os.path.join(
+            train_config["path"]["ckpt_path"],
+            "D_{}.pth.tar".format(args.restore_step),
+        )
+        ckpt = torch.load(ckpt_path)
+        discriminator.load_state_dict(ckpt["model"])
+        optimizer_d.load_state_dict(ckpt["optimizer"])
 
     model = nn.DataParallel(model)
     discriminator = nn.DataParallel(discriminator)
@@ -104,7 +116,7 @@ def main(args, configs):
     scaler = GradScaler()
     scaler_d = GradScaler()
 
-    discriminator_train_start_steps = 2500
+    discriminator_train_start_steps = 0
 
     while True:
         inner_bar = tqdm(total=len(loader), desc=f"Epoch {epoch}", position=1)
@@ -119,14 +131,13 @@ def main(args, configs):
 
                     # =========================== DISCRIMINATOR ==================================
 
-                    durations_real = output[5].detach() # we don't want to optimize the AlignmentEncoder
+                    attn_hard_dur = output[5].detach() # we don't want to optimize the AlignmentEncoder
                     durations_fake = output[4]
                     text_enc = output[14].detach() # no optimizing the text-encoder
                     seq_lens = batch[2 + 2]
 
-                    # generate durations are log, bring them to the linear space
-                    # (having the discriminator differentiate between log durations is bad)
-                    durations_fake = torch.exp(durations_fake) - 1
+                    # bring real durs to the log space
+                    durations_real = torch.log(attn_hard_dur.float() + 1)
 
                     if step > discriminator_train_start_steps:
                         # train on real
@@ -270,6 +281,16 @@ def main(args, configs):
                             "{}.pth.tar".format(step),
                         ),
                     )
+                    torch.save(
+                        {
+                            "model": discriminator.module.state_dict(),
+                            "optimizer": optimizer_d.state_dict(),
+                        },
+                        os.path.join(
+                            train_config["path"]["ckpt_path"],
+                            "D_{}.pth.tar".format(step),
+                        ),
+                    )
 
                 if step == total_step:
                     quit()
@@ -278,6 +299,7 @@ def main(args, configs):
 
             inner_bar.update(1)
         scheduler.step()
+        scheduler_d.step()
         epoch += 1
 
 

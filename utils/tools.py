@@ -87,7 +87,7 @@ def log_attention_maps(logger, attention_tensor, widths, heights, step, tag_pref
         fig, ax = plt.subplots(figsize=(fig_width, fig_height))  # Create a matplotlib figure and axes.
         # Slice the attention tensor to the specified width and height
         attention_map = attention_tensor[i, :heights[i], :widths[i]].cpu().numpy()
-        im = ax.imshow(attention_map, cmap='hot', interpolation='nearest')
+        im = ax.imshow(attention_map, cmap='viridis', interpolation='nearest')
         # Adjust colorbar size by changing fraction and pad
         plt.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
         plt.title(f'Attention Map {i + 1}')
