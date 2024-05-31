@@ -551,6 +551,8 @@ class APTx(nn.Module):
         return (self.alpha + torch.tanh(self.beta * x)) * self.gamma * x
 
 
+
+
 class SwiGLUCNN(nn.Module):
     def __init__(self):
         super(SwiGLUCNN, self).__init__()
@@ -568,10 +570,26 @@ class SwiGLUCNN(nn.Module):
         x = x.transpose(1, 2)
         return x
 
+class CBAM(nn.Module):
+    def __init__(self, in_channels, reduction=16):
+        super(CBAM, self).__init__()
+        self.channel_attention = SEBlock1D(in_channels, reduction)
+        self.spatial_attention = nn.Sequential(
+            nn.Conv1d(in_channels, in_channels // reduction, kernel_size=7, padding=3),
+            nn.ReLU(inplace=True),
+            nn.Conv1d(in_channels // reduction, 1, kernel_size=7, padding=3),
+            nn.Sigmoid()
+        )
+
+    def forward(self, x):
+        x_out = self.channel_attention(x)
+        y = self.spatial_attention(x_out)
+        return x_out * y.expand_as(x_out)
+
 
 class TemporalBlock(nn.Module):
     def __init__(self, n_inputs, n_outputs, kernel_size, stride, dilation, padding, dropout=0.2, use_se=False,
-                 reduction=16, bayesian=False, use_swiglu=False, use_aptx=False):
+                 reduction=16, bayesian=False, use_swiglu=False, use_aptx=False, use_cbam=False):
         """
         Initialize TemporalBlock for TCN
         :param n_inputs: Number of input channels
@@ -617,7 +635,13 @@ class TemporalBlock(nn.Module):
 
         self.downsample = make_conv(bayesian, n_inputs, n_outputs, 1) if n_inputs != n_outputs else nn.Identity()
 
+        if use_cbam:
+            if use_se:
+                print("Cannot use SE and CBAM. Using CBAM")
+            use_se = False
+
         self.se_block = SEBlock1D(n_outputs, reduction) if use_se else nn.Identity()
+        self.cbam_block = CBAM(n_outputs, reduction) if use_cbam else nn.Identity()
 
         if use_swiglu and n_inputs == n_outputs_orig:
             self.relu = SwiGLUCNN()
@@ -629,6 +653,7 @@ class TemporalBlock(nn.Module):
         res = self.downsample(x)
         out = out + res
         out = self.se_block(out)
+        out = self.cbam_block(out)
         out = self.relu(out)
         return out
 
@@ -757,8 +782,8 @@ class TCNAttentionBlock(nn.Module):
         padding = (kernel_size - 1) * dilation  # Calculate padding based on dilation
 
         self.temporal_block = TemporalBlock(in_channels, out_channels, kernel_size, stride=1, dilation=dilation,
-                                            padding=padding, dropout=dropout, use_se=self.heads == 0, bayesian=bayesian,
-                                            use_swiglu=False, use_aptx=True)
+                                            padding=padding, dropout=dropout, use_se=True, bayesian=bayesian,
+                                            use_swiglu=False, use_aptx=True, use_cbam=True)
 
         # Gated skip connection, increases naturalness a bit
         self.gate = GatedRetention(in_channels, out_channels)
