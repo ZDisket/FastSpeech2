@@ -74,7 +74,7 @@ def main(args, configs):
     discriminator.apply(weights_init_he)
     discriminator.train()
     criterion_lsgan = LSGANLoss()
-    optimizer_d = torch.optim.Adam(discriminator.parameters(), lr=0.00007)
+    optimizer_d = torch.optim.Adam(discriminator.parameters(), lr=0.0001)
     scheduler_d = torch.optim.lr_scheduler.ExponentialLR(optimizer_d, gamma=train_config["optimizer"]["gamma"],
                                                        last_epoch=last_epoch)
 

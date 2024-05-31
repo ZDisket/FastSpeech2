@@ -138,7 +138,7 @@ class DualDiscriminator(nn.Module):
         super(DualDiscriminator, self).__init__()
 
         if text_hidden > 0:
-            self.text_compress = nn.Conv1d(text_hidden, hidden_dim, 3, padding="same")
+            self.text_compress = nn.Conv1d(text_hidden, hidden_dim, 3, padding="same") if text_hidden != hidden_dim else nn.Identity()
 
         self.sequence_discriminator = AdvSeqDiscriminator(num_channels, num_conv_layers=num_blocks,
                                                           hidden_dim=hidden_dim, n_heads=n_heads, dropout=dropout)
