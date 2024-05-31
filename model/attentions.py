@@ -696,11 +696,27 @@ def reduce_mask(mask):
     return reduced_mask
 
 
+class GatedRetention(nn.Module):
+    """
+    Allows the model to selectively retain or discard information based on the learned gate values.
+
+    https://github.com/Mr-Twave/YOCO-Groq-BitNet-KV-cache/tree/main?tab=readme-ov-file#the-math
+    """
+    def __init__(self, in_channels, hidden_size):
+        super(GatedRetention, self).__init__()
+        self.proj = nn.Linear(in_channels, hidden_size) if in_channels != hidden_size else nn.Identity()
+        self.gate = nn.Linear(hidden_size, hidden_size)
+
+    def forward(self, x):
+        x = self.proj(x)
+        gated_output = torch.sigmoid(self.gate(x)) * x
+        return gated_output
+
 class TCNAttentionBlock(nn.Module):
     """
     Transformer-inspired TCNAttentionBlock:
 
-    x + Drop(AllAttention(x)) => TemporalBlock => Drop(LayerNorm)
+    x + Drop(AllAttention(x)) => TemporalBlock => Gated Skip => Drop(LayerNorm)
     Optionally, cross-attention between context and x
     """
 
@@ -744,6 +760,8 @@ class TCNAttentionBlock(nn.Module):
                                             padding=padding, dropout=dropout, use_se=self.heads == 0, bayesian=bayesian,
                                             use_swiglu=False, use_aptx=True)
 
+        # Gated skip connection, increases naturalness a bit
+        self.gate = GatedRetention(in_channels, out_channels)
         self.norm = nn.LayerNorm(out_channels)
         self.dropout2 = nn.Dropout(dropout)
 
@@ -756,6 +774,8 @@ class TCNAttentionBlock(nn.Module):
             (ideally, causal)
             context: Context tensor for cross-attention, same shape and lengths as x
         """
+        x_orig = x
+
         if self.heads > 0:
             x_att = self.attention(x, x, x, att_mask)
             x_att = self.dropout1(x_att)
@@ -775,6 +795,8 @@ class TCNAttentionBlock(nn.Module):
         x = x.masked_fill(mask, 0)
 
         x = x.transpose(1, 2)  # (batch, channels, seq_len) => (batch, seq_len, channels)
+
+        x = x + self.gate(x_orig)
         x = self.norm(x)
         x = self.dropout2(x)
 

@@ -436,7 +436,7 @@ class VarianceAdaptor(nn.Module):
                 num_channels=model_config["duration_predictor"]["tcn_channels"],
                 kernel_sizes=model_config["duration_predictor"]["tcn_kernel_sizes"],
                 dropout=model_config["duration_predictor"]["dropout"],
-                start_i=1,
+                start_i=4,
                 att_dropout=model_config["duration_predictor"]["att_dropout"],
                 heads=model_config["duration_predictor"]["tcn_heads"],
                 bidirectional=model_config["duration_predictor"]["bidirectional"],
