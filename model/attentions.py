@@ -4,6 +4,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.nn.utils import weight_norm
+from rotary_embedding_torch import RotaryEmbedding
 
 import torchbnn
 from torchbnn import BayesConv1d
@@ -418,6 +419,21 @@ class TransformerDecoder(nn.Module):
 
         return x
 
+class APTx(nn.Module):
+    """
+    APTx: Alpha Plus Tanh Times, an activation function that behaves like Mish,
+    but is 2x faster.
+
+    https://arxiv.org/abs/2209.06119
+    """
+    def __init__(self, alpha=1, beta=1, gamma=0.5):
+        super(APTx, self).__init__()
+        self.alpha = alpha
+        self.beta = beta
+        self.gamma = gamma
+
+    def forward(self, x):
+        return (self.alpha + torch.tanh(self.beta * x)) * self.gamma * x
 
 class SEBlock1D(nn.Module):
     """
@@ -534,24 +550,6 @@ class ReluSquared(nn.Module):
     def forward(self, x):
         return F.relu(x) ** 2
 
-class APTx(nn.Module):
-    """
-    APTx: Alpha Plus Tanh Times, an activation function that behaves like Mish,
-    but is 2x faster.
-
-    https://arxiv.org/abs/2209.06119
-    """
-    def __init__(self, alpha=1, beta=1, gamma=0.5):
-        super(APTx, self).__init__()
-        self.alpha = alpha
-        self.beta = beta
-        self.gamma = gamma
-
-    def forward(self, x):
-        return (self.alpha + torch.tanh(self.beta * x)) * self.gamma * x
-
-
-
 
 class SwiGLUCNN(nn.Module):
     def __init__(self):
@@ -601,17 +599,19 @@ class TemporalBlock(nn.Module):
         :param dropout: Dropout
         :param use_se: Use Squeeze-Excite attention
         :param reduction: Reduction for Squeeze-Excite, if enabled
-        :param bayesian: Use Bayesian convs, for nondeterminism. Will use RMSNorm instead of weight normalization
+        :param bayesian: Use Bayesian convs, for nondeterminism. Will use LayerNorm instead of weight normalization
         :param use_swiglu: Use SwiGLU for the final activation
         :param use_aptx: Use APTx for the acts
+        :param use_cbam: Use CBAM at the final and at residual.
         """
         super(TemporalBlock, self).__init__()
+
         self.use_swiglu = use_swiglu
 
         self.conv1 = make_conv(bayesian, n_inputs, n_outputs, kernel_size,
                                stride=stride, padding=padding, dilation=dilation)
         self.chomp1 = Chomp1d(padding)
-        self.ln1 = nn.Identity()
+        self.ln1 = TransposeLayerNorm(n_outputs) if bayesian else nn.Identity()
         self.relu1 = APTx() if use_aptx else nn.ReLU()
         self.dropout1 = nn.Dropout(dropout)
 
@@ -624,7 +624,7 @@ class TemporalBlock(nn.Module):
         self.conv2 = make_conv(bayesian, n_outputs, n_final, kernel_size,
                                stride=stride, padding=padding, dilation=dilation)
         self.chomp2 = Chomp1d(padding)
-        self.ln2 = nn.Identity()
+        self.ln2 = TransposeLayerNorm(n_final) if bayesian else nn.Identity()
         self.relu2 = APTx() if use_aptx else nn.ReLU()
         self.dropout2 = nn.Dropout(dropout)
 
@@ -642,6 +642,7 @@ class TemporalBlock(nn.Module):
 
         self.se_block = SEBlock1D(n_outputs, reduction) if use_se else nn.Identity()
         self.cbam_block = CBAM(n_outputs, reduction) if use_cbam else nn.Identity()
+        self.res_cbam = CBAM(n_outputs, reduction) if use_cbam else nn.Identity()
 
         if use_swiglu and n_inputs == n_outputs_orig:
             self.relu = SwiGLUCNN()
@@ -651,7 +652,7 @@ class TemporalBlock(nn.Module):
     def forward(self, x):
         out = self.net(x)
         res = self.downsample(x)
-        out = out + res
+        out = out + self.res_cbam(res)
         out = self.se_block(out)
         out = self.cbam_block(out)
         out = self.relu(out)
@@ -741,7 +742,7 @@ class TCNAttentionBlock(nn.Module):
     """
     Transformer-inspired TCNAttentionBlock:
 
-    x + Drop(AllAttention(x)) => TemporalBlock => Gated Skip => Drop(LayerNorm)
+    x + Drop(AllAttention(x)) => LayerNorm => TemporalBlock => Gated Skip => Drop(LayerNorm)
     Optionally, cross-attention between context and x
     """
 
@@ -778,15 +779,18 @@ class TCNAttentionBlock(nn.Module):
             self.cross_attention = MultiHeadAttention(in_channels, cross_att_heads, alibi_alpha=alibi_alpha,
                                                       start_i_increment=start_i_increment,
                                                       num_persistent=16)
+        # A touch of insanity is all you need
+        self.rotary_emb = RotaryEmbedding(dim=in_channels // 2)
 
         padding = (kernel_size - 1) * dilation  # Calculate padding based on dilation
-
         self.temporal_block = TemporalBlock(in_channels, out_channels, kernel_size, stride=1, dilation=dilation,
                                             padding=padding, dropout=dropout, use_se=True, bayesian=bayesian,
                                             use_swiglu=False, use_aptx=True, use_cbam=True)
 
         # Gated skip connection, increases naturalness a bit
         self.gate = GatedRetention(in_channels, out_channels)
+        self.post_cross_att_norm = nn.LayerNorm(in_channels) if self.cross_att_heads > 0 else nn.Identity()
+        self.pre_norm = nn.LayerNorm(in_channels)
         self.norm = nn.LayerNorm(out_channels)
         self.dropout2 = nn.Dropout(dropout)
 
@@ -806,11 +810,20 @@ class TCNAttentionBlock(nn.Module):
             x_att = self.dropout1(x_att)
             x = x + x_att  # Residual connection
 
+        x = self.pre_norm(x)
+
         if self.cross_att_heads > 0:
             context = self.context_proj(context)
             x_cross_att = self.cross_attention(context, context, x, att_mask)
             x_cross_att = self.dropout1(x_cross_att)
             x = x + x_cross_att
+            x = self.post_cross_att_norm(x)
+
+        # Apply rotary embeddings before TCN
+        # Yes, this actually works.
+        x = self.rotary_emb.rotate_queries_or_keys(
+            x.unsqueeze(1) # (batch, 1, seq_len, channels)
+        ).squeeze(1) # (batch, seq_len, channels)
 
         x = x.transpose(1, 2)  # Switch dimensions for convolution
 
