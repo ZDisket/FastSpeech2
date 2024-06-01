@@ -611,7 +611,7 @@ class TemporalBlock(nn.Module):
         self.conv1 = make_conv(bayesian, n_inputs, n_outputs, kernel_size,
                                stride=stride, padding=padding, dilation=dilation)
         self.chomp1 = Chomp1d(padding)
-        self.ln1 = TransposeRMSNorm(n_outputs) if bayesian else nn.Identity()
+        self.ln1 = nn.Identity()
         self.relu1 = APTx() if use_aptx else nn.ReLU()
         self.dropout1 = nn.Dropout(dropout)
 
@@ -624,7 +624,7 @@ class TemporalBlock(nn.Module):
         self.conv2 = make_conv(bayesian, n_outputs, n_final, kernel_size,
                                stride=stride, padding=padding, dilation=dilation)
         self.chomp2 = Chomp1d(padding)
-        self.ln2 = TransposeRMSNorm(n_final) if bayesian else nn.Identity()
+        self.ln2 = nn.Identity()
         self.relu2 = APTx() if use_aptx else nn.ReLU()
         self.dropout2 = nn.Dropout(dropout)
 
