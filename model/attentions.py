@@ -461,9 +461,14 @@ class Chomp1d(nn.Module):
     def __init__(self, chomp_size):
         super(Chomp1d, self).__init__()
         self.chomp_size = chomp_size
+        self.x_mask = torch.zeros((1, 1 ,1))
 
+    def set_mask(self, in_mask):
+        self.x_mask = in_mask
     def forward(self, x):
-        return x[:, :, :-self.chomp_size].contiguous()
+        x = x[:, :, :-self.chomp_size].contiguous()
+        x = x.masked_fill(self.x_mask)
+        return x
 
 
 class RMSNorm(nn.Module):
@@ -649,13 +654,29 @@ class TemporalBlock(nn.Module):
         else:
             self.relu = APTx() if use_aptx else nn.ReLU()
 
-    def forward(self, x):
-        out = self.net(x)
-        res = self.downsample(x)
-        out = out + self.res_cbam(res)
-        out = self.se_block(out)
-        out = self.cbam_block(out)
-        out = self.relu(out)
+    def forward(self, x, mask=None):
+        """
+        Forward pass through the Temporal Block
+        :param x: Tensor size (batch, in_channels, seq_len)
+        :param mask: Bool mask size (batch, 1, seq_len), where True is padded and False is valid.
+                    If not passed, will assume all sequence is valid.
+        :return: Processed tensor size (batch, out_channels, seq_len)
+        """
+
+        if mask is None:
+            mask = torch.zeros(x.size()).bool().to(x.device)
+
+        self.chomp1.set_mask(mask)
+        self.chomp2.set_mask(mask)
+
+        out = self.net(x).masked_fill(mask, 0)
+
+        res = self.downsample(x).masked_fill(mask, 0)
+        out = out + self.res_cbam(res).masked_fill(mask, 0)
+
+        out = self.se_block(out).masked_fill(mask, 0)
+        out = self.cbam_block(out).masked_fill(mask, 0)
+        out = self.relu(out).masked_fill(mask, 0)
         return out
 
 
@@ -826,12 +847,12 @@ class TCNAttentionBlock(nn.Module):
         ).squeeze(1) # (batch, seq_len, channels)
 
         x = x.transpose(1, 2)  # Switch dimensions for convolution
-
-        # x = (batch, channels, seq_len)
-        x = self.temporal_block(x)
-
         x = x.masked_fill(mask, 0)
 
+        # x = (batch, channels, seq_len)
+        x = self.temporal_block(x, mask)
+
+        x = x.masked_fill(mask, 0)
         x = x.transpose(1, 2)  # (batch, channels, seq_len) => (batch, seq_len, channels)
 
         x = x + self.gate(x_orig)
