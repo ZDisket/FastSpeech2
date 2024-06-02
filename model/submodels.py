@@ -298,6 +298,7 @@ class TemporalVariancePredictor(nn.Module):
         self.final_drop = StochasticDropout(dropout)
         self.cond_input_size = cond_input_size
         self.input_channels = input_channels
+        self.post_norm = nn.LayerNorm(num_channels[-1])
 
         self.output_layer = nn.Linear(num_channels[-1], 1)
 
@@ -387,13 +388,14 @@ class TemporalVariancePredictor(nn.Module):
         x = x.transpose(1, 2)  # (batch, seq_len, channels) => (batch, channels, seq_len)
         x_mask = x_mask.unsqueeze(1)  # (batch, seq_len) => (batch, 1, seq_len)
 
-        x = self.tcn(x)  # x = (batch, channels, seq_len)
+        x = self.tcn(x, x_mask)  # x = (batch, channels, seq_len)
 
         if x_mask is not None:
             x = x.masked_fill(x_mask, 0.0)
 
         # linear pass
         x = x.transpose(1, 2)  # x = (batch, seq_len, channels)
+        x = self.post_norm(x)
 
         x = self.final_drop(x)
 

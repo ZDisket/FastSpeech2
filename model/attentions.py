@@ -467,7 +467,7 @@ class Chomp1d(nn.Module):
         self.x_mask = in_mask
     def forward(self, x):
         x = x[:, :, :-self.chomp_size].contiguous()
-        x = x.masked_fill(self.x_mask)
+        x = x.masked_fill(self.x_mask, 0)
         return x
 
 
@@ -648,6 +648,7 @@ class TemporalBlock(nn.Module):
         self.se_block = SEBlock1D(n_outputs, reduction) if use_se else nn.Identity()
         self.cbam_block = CBAM(n_outputs, reduction) if use_cbam else nn.Identity()
         self.res_cbam = CBAM(n_outputs, reduction) if use_cbam else nn.Identity()
+        self.drop = nn.Dropout(0.1)
 
         if use_swiglu and n_inputs == n_outputs_orig:
             self.relu = SwiGLUCNN()
@@ -664,7 +665,7 @@ class TemporalBlock(nn.Module):
         """
 
         if mask is None:
-            mask = torch.zeros(x.size()).bool().to(x.device)
+            mask = torch.zeros((x.size(0), 1, x.size(2))).bool().to(x.device)
 
         self.chomp1.set_mask(mask)
         self.chomp2.set_mask(mask)
@@ -673,9 +674,13 @@ class TemporalBlock(nn.Module):
 
         res = self.downsample(x).masked_fill(mask, 0)
         out = out + self.res_cbam(res).masked_fill(mask, 0)
+        out = self.drop(out)
 
+        # Only one of these will be valid
         out = self.se_block(out).masked_fill(mask, 0)
         out = self.cbam_block(out).masked_fill(mask, 0)
+        out = self.drop(out)
+
         out = self.relu(out).masked_fill(mask, 0)
         return out
 
@@ -710,8 +715,19 @@ class TemporalConvNet(nn.Module):
 
         self.network = nn.Sequential(*layers)
 
-    def forward(self, x):
-        return self.network(x)
+    def forward(self, x, mask):
+        """
+        :param x: Tensor size (batch, in_channels, seq_len)
+        :param mask: Bool mask size (batch, 1, seq_len), where True is padded and False is valid.
+                    If not passed, will assume all sequence is valid.
+        :return: Processed tensor size (batch, out_channels, seq_len)
+        """
+
+        # TODO: Refactor the Sequential into a ModuleList; we're doing this because transfer learning
+        for layer in self.network:
+            x = layer(x, mask)
+
+        return x
 
 
 def mask_to_causal_attention_mask(mask):

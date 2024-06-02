@@ -528,12 +528,12 @@ class VarianceAdaptor(nn.Module):
         self.pitch_embedding = nn.Embedding(
             n_bins, model_config["transformer"]["encoder_hidden"]
         )
-        # BatchNorm is better than LayerNorm at regularization, our main objective here
-        self.pitch_norm = TransposeBatchNorm(model_config["transformer"]["encoder_hidden"])
+
+        self.pitch_norm = nn.LayerNorm(model_config["transformer"]["encoder_hidden"])
         self.energy_embedding = nn.Embedding(
             n_bins, model_config["transformer"]["encoder_hidden"]
         )
-        self.energy_norm = TransposeBatchNorm(model_config["transformer"]["encoder_hidden"])
+        self.energy_norm = nn.LayerNorm(model_config["transformer"]["encoder_hidden"])
 
         self.pitch_energy_drop = nn.Dropout(model_config["variance_predictor"]["dropout_on_emb"])
 
