@@ -723,7 +723,7 @@ class TemporalConvNet(nn.Module):
         :return: Processed tensor size (batch, out_channels, seq_len)
         """
 
-        # TODO: Refactor the Sequential into a ModuleList; we're doing this because transfer learning
+        # Must do: Refactor the Sequential into a ModuleList; we're doing this because transfer learning
         for layer in self.network:
             x = layer(x, mask)
 

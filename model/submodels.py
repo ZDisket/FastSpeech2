@@ -388,6 +388,8 @@ class TemporalVariancePredictor(nn.Module):
         x = x.transpose(1, 2)  # (batch, seq_len, channels) => (batch, channels, seq_len)
         x_mask = x_mask.unsqueeze(1)  # (batch, seq_len) => (batch, 1, seq_len)
 
+        x = x.masked_fill(x_mask, 0.0)
+
         x = self.tcn(x, x_mask)  # x = (batch, channels, seq_len)
 
         if x_mask is not None:
