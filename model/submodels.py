@@ -298,7 +298,6 @@ class TemporalVariancePredictor(nn.Module):
         self.final_drop = StochasticDropout(dropout)
         self.cond_input_size = cond_input_size
         self.input_channels = input_channels
-        self.post_norm = nn.LayerNorm(num_channels[-1])
 
         self.output_layer = nn.Linear(num_channels[-1], 1)
 
@@ -397,7 +396,6 @@ class TemporalVariancePredictor(nn.Module):
 
         # linear pass
         x = x.transpose(1, 2)  # x = (batch, seq_len, channels)
-        x = self.post_norm(x)
 
         x = self.final_drop(x)
 

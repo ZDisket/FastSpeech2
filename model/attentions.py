@@ -1,4 +1,5 @@
 from math import sqrt
+from typing import Optional
 
 import torch
 import torch.nn as nn
@@ -9,6 +10,99 @@ from rotary_embedding_torch import RotaryEmbedding
 import torchbnn
 from torchbnn import BayesConv1d
 
+
+class PartialConv1d(torch.nn.Conv1d):
+    """
+    Zero padding creates a unique identifier for where the edge of the data is, such that the model can almost always identify
+    exactly where it is relative to either edge given a sufficient receptive field. Partial padding goes to some lengths to remove
+    this affect.
+    """
+
+    def __init__(self, *args, **kwargs):
+        super(PartialConv1d, self).__init__(*args, **kwargs)
+        weight_maskUpdater = torch.ones(1, 1, self.kernel_size[0])
+        self.register_buffer("weight_maskUpdater", weight_maskUpdater, persistent=False)
+        slide_winsize = torch.tensor(self.weight_maskUpdater.shape[1] * self.weight_maskUpdater.shape[2])
+        self.register_buffer("slide_winsize", slide_winsize, persistent=False)
+
+        if self.bias is not None:
+            bias_view = self.bias.view(1, self.out_channels, 1)
+            self.register_buffer('bias_view', bias_view, persistent=False)
+        # caching part
+        self.last_size = (-1, -1, -1)
+
+        update_mask = torch.ones(1, 1, 1)
+        self.register_buffer('update_mask', update_mask, persistent=False)
+        mask_ratio = torch.ones(1, 1, 1)
+        self.register_buffer('mask_ratio', mask_ratio, persistent=False)
+        self.partial: bool = True
+
+    def calculate_mask(self, input: torch.Tensor, mask_in: Optional[torch.Tensor]):
+        with torch.no_grad():
+            if mask_in is None:
+                mask = torch.ones(1, 1, input.shape[2], dtype=input.dtype, device=input.device)
+            else:
+                mask = mask_in
+            update_mask = F.conv1d(
+                mask,
+                self.weight_maskUpdater,
+                bias=None,
+                stride=self.stride,
+                padding=self.padding,
+                dilation=self.dilation,
+                groups=1,
+            )
+            # for mixed precision training, change 1e-8 to 1e-6
+            mask_ratio = self.slide_winsize / (update_mask + 1e-6)
+            update_mask = torch.clamp(update_mask, 0, 1)
+            mask_ratio = torch.mul(mask_ratio.to(update_mask), update_mask)
+            return torch.mul(input, mask), mask_ratio, update_mask
+
+    def forward_aux(self, input: torch.Tensor, mask_ratio: torch.Tensor, update_mask: torch.Tensor) -> torch.Tensor:
+        assert len(input.shape) == 3
+
+        raw_out = self._conv_forward(input, self.weight, self.bias)
+
+        if self.bias is not None:
+            output = torch.mul(raw_out - self.bias_view, mask_ratio) + self.bias_view
+            output = torch.mul(output, update_mask)
+        else:
+            output = torch.mul(raw_out, mask_ratio)
+
+        return output
+
+    @torch.jit.ignore
+    def forward_with_cache(self, input: torch.Tensor, mask_in: Optional[torch.Tensor] = None) -> torch.Tensor:
+        use_cache = not (torch.jit.is_tracing() or torch.onnx.is_in_onnx_export())
+        cache_hit = use_cache and mask_in is None and self.last_size == input.shape
+        if cache_hit:
+            mask_ratio = self.mask_ratio
+            update_mask = self.update_mask
+        else:
+            input, mask_ratio, update_mask = self.calculate_mask(input, mask_in)
+            if use_cache:
+                # if a mask is input, or tensor shape changed, update mask ratio
+                self.last_size = tuple(input.shape)
+                self.update_mask = update_mask
+                self.mask_ratio = mask_ratio
+        return self.forward_aux(input, mask_ratio, update_mask)
+
+    def forward_no_cache(self, input: torch.Tensor, mask_in: Optional[torch.Tensor] = None) -> torch.Tensor:
+        if self.partial:
+            input, mask_ratio, update_mask = self.calculate_mask(input, mask_in)
+            return self.forward_aux(input, mask_ratio, update_mask)
+        else:
+            if mask_in is not None:
+                input = torch.mul(input, mask_in)
+            return self._conv_forward(input, self.weight, self.bias)
+
+    def forward(self, input: torch.Tensor, mask_in: Optional[torch.Tensor] = None) -> torch.Tensor:
+        if self.partial:
+            return self.forward_with_cache(input, mask_in)
+        else:
+            if mask_in is not None:
+                input = torch.mul(input, mask_in).to(input.device)
+            return self._conv_forward(input, self.weight, self.bias)
 
 class SwiGLU(nn.Module):
     def __init__(self, dim):
@@ -27,6 +121,17 @@ class SwiGLU(nn.Module):
         x_proj, x_gate = x_proj.chunk(2, dim=-1)
         x = x_proj * torch.sigmoid(x_gate)
         return x.transpose(1,2)
+
+
+def reduce_mask(mask):
+    """
+    Reduce an attention mask to a normal one
+    :param mask: Attention mask shape (batch, 1, seq_length, seq_length)
+
+    :return: Reduced mask size (batch, 1, seq_length)
+    """
+    reduced_mask = mask[:, 0, :, 0].unsqueeze(1)
+    return reduced_mask
 
 class SwiGLUConvFFN(nn.Module):
     def __init__(
@@ -746,18 +851,6 @@ def mask_to_causal_attention_mask(mask):
     # Flip the mask, our attention uses True=valid
     attention_mask = ~attention_mask
     return attention_mask
-
-
-def reduce_mask(mask):
-    """
-    Reduce an attention mask to a normal one
-    :param mask: Attention mask shape (batch, 1, seq_length, seq_length)
-
-    :return: Reduced mask size (batch, 1, seq_length)
-    """
-    reduced_mask = mask[:, 0, :, 0].unsqueeze(1)
-    return reduced_mask
-
 
 class GatedRetention(nn.Module):
     """
