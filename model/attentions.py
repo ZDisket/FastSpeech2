@@ -278,6 +278,23 @@ class SwiGLUFFN(nn.Module):
         return self.w3(hidden)
 
 
+
+class GatedRetention(nn.Module):
+    """
+    Allows the model to selectively retain or discard information based on the learned gate values.
+
+    https://github.com/Mr-Twave/YOCO-Groq-BitNet-KV-cache/tree/main?tab=readme-ov-file#the-math
+    """
+    def __init__(self, in_channels, hidden_size):
+        super(GatedRetention, self).__init__()
+        self.proj = nn.Linear(in_channels, hidden_size) if in_channels != hidden_size else nn.Identity()
+        self.gate = nn.Linear(hidden_size, hidden_size)
+
+    def forward(self, x):
+        x = self.proj(x)
+        gated_output = torch.sigmoid(self.gate(x)) * x
+        return gated_output
+
 class MultiHeadAttention(nn.Module):
     """
     Modern Multi Head Attention. Contains:
@@ -285,13 +302,14 @@ class MultiHeadAttention(nn.Module):
     num_persistent: "Augmenting Self-attention with Persistent Memory" (https://arxiv.org/abs/1907.01470)
     use_talking_heads: "Talking-Heads Attention" (https://arxiv.org/abs/2003.02436)
     use_alibi: "Attention with Linear Biases" (https://ofir.io/train_short_test_long.pdf)
+    rma_inp_dim: Recurrent Memory Attention (my invention). Per-head dim for projection, if necessary.
 
     If num_persistent > 0, we call this an AllAttention layer.
 
     """
 
     def __init__(self, embed_size, heads, alibi_alpha=1.0, start_i_increment=0, use_alibi=True, use_talking_heads=True,
-                 num_persistent=0):
+                 num_persistent=0, rma_inp_dim=None):
         super(MultiHeadAttention, self).__init__()
         self.embed_size = embed_size
         self.heads = heads
@@ -322,18 +340,24 @@ class MultiHeadAttention(nn.Module):
             self.pre_softmax_talking_heads = nn.Conv2d(heads, heads, 1, bias=False)
             self.post_softmax_talking_heads = nn.Conv2d(heads, heads, 1, bias=False)
 
+        if rma_inp_dim is None:
+            rma_inp_dim = self.head_dim
+
         if self.num_persistent > 0:
             # persistent vectors:
-            # (num_persistent, heads, head_dim)
-            # Could shaping the persistent vectors like this also result in inter-head communication?
-            self.persistent_keys = nn.Parameter(torch.randn(self.num_persistent, self.heads, self.head_dim))
-            self.persistent_values = nn.Parameter(torch.randn(self.num_persistent, self.heads, self.head_dim))
+            # (num_persistent, 1, head_dim)
+            self.persistent_keys = nn.Parameter(torch.randn(self.num_persistent, 1, self.head_dim))
+            self.persistent_values = nn.Parameter(torch.randn(self.num_persistent, 1, self.head_dim))
 
             # Initialize persistent vectors
             nn.init.kaiming_uniform_(self.persistent_keys, a=sqrt(self.num_persistent))
             nn.init.kaiming_uniform_(self.persistent_values, a=sqrt(self.num_persistent))
 
-    def forward(self, values, keys, queries, mask=None):
+            self.rma_k_proj = GatedRetention(rma_inp_dim, self.head_dim)
+            self.rma_v_proj = GatedRetention(rma_inp_dim, self.head_dim)
+
+
+    def forward(self, values, keys, queries, mask=None, recurr_persistent=None):
         N = queries.shape[0]
         value_len, key_len, query_len = values.shape[1], keys.shape[1], queries.shape[1]
 
@@ -346,9 +370,26 @@ class MultiHeadAttention(nn.Module):
         keys = self.keys(keys)
         queries = self.queries(queries)
 
-        if self.num_persistent > 0:
-            expanded_persistent_keys = self.persistent_keys.unsqueeze(0).expand(N, -1, -1, -1)
-            expanded_persistent_values = self.persistent_values.unsqueeze(0).expand(N, -1, -1, -1)
+        current_persistent = self.num_persistent
+
+        if current_persistent > 0:
+            p_keys = self.persistent_keys
+            p_values = self.persistent_values
+
+            if recurr_persistent is not None:
+                recurr_keys, recurr_values = recurr_persistent
+
+                recurr_keys = self.rma_k_proj(recurr_keys)
+                recurr_values = self.rma_v_proj(recurr_values)
+
+                # Concat the recurrent ones before ours along the seq dim
+                p_keys = torch.cat([recurr_keys, p_keys], dim=0)
+                p_values = torch.cat([recurr_values, p_values], dim=0)
+
+                current_persistent = p_keys.size(0)
+
+            expanded_persistent_keys = p_keys.unsqueeze(0).expand(N, -1, self.heads, -1)
+            expanded_persistent_values = p_values.unsqueeze(0).expand(N, -1, self.heads, -1)
 
             # Concatenate persistent vectors to keys and values
             keys = torch.cat([keys, expanded_persistent_keys], dim=1)
@@ -364,9 +405,9 @@ class MultiHeadAttention(nn.Module):
             alibi_bias = (t_q.view(1, 1, -1, 1) - t_k.view(1, 1, 1, -1)).abs()
             alibi_bias = -alibi_bias * self.slopes
 
-            if self.num_persistent > 0:
+            if current_persistent > 0:
                 # Extend ALiBi bias for persistent vectors with zero bias (so that it is allowed to attend to everything)
-                extended_alibi_bias = F.pad(alibi_bias, (0, self.num_persistent), "constant", 0)
+                extended_alibi_bias = F.pad(alibi_bias, (0, current_persistent), "constant", 0)
                 extended_alibi_bias = extended_alibi_bias.to(energy.device)
                 alibi_bias = extended_alibi_bias
 
@@ -376,10 +417,10 @@ class MultiHeadAttention(nn.Module):
             energy = self.pre_softmax_talking_heads(energy)
 
         if mask is not None:
-            if self.num_persistent > 0:
+            if current_persistent > 0:
                 # Extend mask to include persistent vectors (always unmasked)
-                extended_mask = F.pad(mask, (0, self.num_persistent), value=1)
-                extended_mask = extended_mask.expand(N, self.heads, query_len, key_len + self.num_persistent)
+                extended_mask = F.pad(mask, (0, current_persistent), value=1)
+                extended_mask = extended_mask.expand(N, self.heads, query_len, key_len + current_persistent)
                 mask = extended_mask
                 # -1e4 for numerical stability with fp16
             energy = energy.masked_fill(mask == 0, float("-1e4"))
@@ -784,6 +825,7 @@ class TemporalBlock(nn.Module):
         # Only one of these will be valid
         out = self.se_block(out).masked_fill(mask, 0)
         out = self.cbam_block(out).masked_fill(mask, 0)
+
         out = self.drop(out)
 
         out = self.relu(out).masked_fill(mask, 0)
@@ -852,22 +894,6 @@ def mask_to_causal_attention_mask(mask):
     attention_mask = ~attention_mask
     return attention_mask
 
-class GatedRetention(nn.Module):
-    """
-    Allows the model to selectively retain or discard information based on the learned gate values.
-
-    https://github.com/Mr-Twave/YOCO-Groq-BitNet-KV-cache/tree/main?tab=readme-ov-file#the-math
-    """
-    def __init__(self, in_channels, hidden_size):
-        super(GatedRetention, self).__init__()
-        self.proj = nn.Linear(in_channels, hidden_size) if in_channels != hidden_size else nn.Identity()
-        self.gate = nn.Linear(hidden_size, hidden_size)
-
-    def forward(self, x):
-        x = self.proj(x)
-        gated_output = torch.sigmoid(self.gate(x)) * x
-        return gated_output
-
 class TCNAttentionBlock(nn.Module):
     """
     Transformer-inspired TCNAttentionBlock:
@@ -877,7 +903,7 @@ class TCNAttentionBlock(nn.Module):
     """
 
     def __init__(self, in_channels, out_channels, kernel_size, heads, att_dropout, dropout, dilation, alibi_alpha,
-                 start_i_increment=0, bayesian=False, context_size=0, cross_att_heads=0):
+                 start_i_increment=0, bayesian=False, context_size=0, cross_att_heads=0, rma_head_dim=None):
         """
         Initialize the TCNAttentionBlock
         :param in_channels: Input channels
@@ -891,6 +917,7 @@ class TCNAttentionBlock(nn.Module):
         :param start_i_increment: Starting increment of ALiBi
         :param cross_att_heads: Heads for cross-attention between x and context. Set to 0 for no cross-att
         :param context_size: Size, in channels, of context. Will use projection if different from in_channels
+        :param rma_head_dim: Head dim of last layer for Recurrent Memory Attention
         """
         super(TCNAttentionBlock, self).__init__()
 
@@ -900,7 +927,7 @@ class TCNAttentionBlock(nn.Module):
         if self.heads > 0:
             self.attention = MultiHeadAttention(in_channels, heads, alibi_alpha=alibi_alpha,
                                                 start_i_increment=start_i_increment,
-                                                num_persistent=16)
+                                                num_persistent=16, rma_inp_dim=rma_head_dim)
             self.dropout1 = nn.Dropout(att_dropout)  # Dropout for attention
 
         if self.cross_att_heads > 0:
@@ -924,19 +951,20 @@ class TCNAttentionBlock(nn.Module):
         self.norm = nn.LayerNorm(out_channels)
         self.dropout2 = nn.Dropout(dropout)
 
-    def forward(self, x, mask, att_mask, context):
+    def forward(self, x, mask, att_mask, context, recurr_kv):
         """
         Args:
             x: Input tensor of shape (batch_size, seq_length, channels).
             mask: Mask tensor of shape (batch_size, 1, seq_length), where True is invalid (padding) and False is valid
             att_mask: Attention mask of shape (batch_size, 1, seq_len, seq_len) where True is valid and False is invalid
             (ideally, causal)
+            recurr_kv: Tuple of recurrent consistent tokens for the attention (key, values)
             context: Context tensor for cross-attention, same shape and lengths as x
         """
         x_orig = x
 
         if self.heads > 0:
-            x_att = self.attention(x, x, x, att_mask)
+            x_att = self.attention(x, x, x, att_mask, recurr_kv)
             x_att = self.dropout1(x_att)
             x = x + x_att  # Residual connection
 
@@ -968,7 +996,7 @@ class TCNAttentionBlock(nn.Module):
         x = self.norm(x)
         x = self.dropout2(x)
 
-        return x
+        return x, (self.attention.persistent_keys, self.attention.persistent_values)
 
 
 class ResidualBlock1D(nn.Module):
@@ -1001,6 +1029,32 @@ class ResidualBlock1D(nn.Module):
         return out
 
 
+def reduce_sequence_length(input_tensor):
+    """
+    Reduces the sequence length of a tensor by half using 1D max pooling.
+
+    Args:
+    input_tensor (torch.Tensor): Input tensor of shape (seq_len, N, dim).
+
+    Returns:
+    torch.Tensor: Output tensor with reduced sequence length, shape (seq_len//2, N, dim).
+    """
+    seq_len, N, dim = input_tensor.shape
+
+    # Ensure seq_len is even for the 1D max pooling to reduce by half
+    assert seq_len % 2 == 0, "Sequence length should be even for halving with max pooling"
+
+    # Permute the tensor to (N, dim, seq_len) for 1D max pooling
+    input_tensor_permuted = input_tensor.permute(1, 2, 0)  # (N, dim, seq_len)
+
+    # Apply 1D max pooling with kernel size 2 and stride 2
+    output_tensor_permuted = F.max_pool1d(input_tensor_permuted, kernel_size=2, stride=2)
+
+    # Permute back to original dimensions (seq_len//2, N, dim)
+    output_tensor = output_tensor_permuted.permute(2, 0, 1)  # (seq_len//2, N, dim)
+
+    return output_tensor
+
 
 class TCNAttention(nn.Module):
     def __init__(self, num_inputs, num_channels, kernel_size=[2, 2, 2], dropout=0.2, att_dropout=0.3, heads=[2, 2, 2],
@@ -1008,12 +1062,18 @@ class TCNAttention(nn.Module):
         super(TCNAttention, self).__init__()
         self.layers = nn.ModuleList()
 
+        self.key_projs = nn.ModuleList()
+        self.val_projs = nn.ModuleList()
+
         if len(heads) != len(num_channels):
             raise ValueError("The length of heads must be equal to the length of num_channels")
         if len(kernel_size) != len(num_channels):
             raise ValueError("The length of kernel_size must be equal to the length of num_channels")
 
         current_channels = num_inputs
+        # Keep a global head dim so that we don't have to deal with varying head dimensions when collecting the recurrent states
+        self.global_head_dim = 64
+
         for level, (out_channels, num_heads, k_size) in enumerate(zip(num_channels, heads, kernel_size)):
             dilation = 1  # we want max precision, dilation is detrimental.
             is_last = level == len(num_channels) - 1
@@ -1022,10 +1082,28 @@ class TCNAttention(nn.Module):
                                                  att_dropout, dropout, dilation, alibi_alpha=alibi_alpha,
                                                  start_i_increment=start_i_increment + (level * num_heads),
                                                  bayesian=bayesian, cross_att_heads=2 if is_last else 0,
-                                                 context_size=num_inputs,
+                                                 context_size=num_inputs, rma_head_dim=self.global_head_dim
                                                  )
                                )
             current_channels = out_channels  # The output of the current block is the input for the next
+            layer_head_dim = self.layers[-1].attention.head_dim
+
+            self.key_projs.append(
+                nn.Sequential(
+                    nn.Linear(layer_head_dim,
+                              self.global_head_dim) if layer_head_dim != self.global_head_dim else nn.Identity(),
+                    nn.ReLU(inplace=True),
+                    nn.Dropout(0.1),
+                ),
+            )
+            self.val_projs.append(
+                nn.Sequential(
+                    nn.Linear(layer_head_dim,
+                              self.global_head_dim) if layer_head_dim != self.global_head_dim else nn.Identity(),
+                    nn.ReLU(inplace=True),
+                    nn.Dropout(0.1),
+                ),
+            )
 
     def forward(self, x, mask):
         """
@@ -1038,6 +1116,25 @@ class TCNAttention(nn.Module):
         mask = mask.unsqueeze(1)
         context = x.clone()
 
-        for layer in self.layers:
-            x = layer(x, mask, att_mask, context)
+        recurr_keys = None
+        recurr_values = None
+
+        for i, layer in enumerate(self.layers):
+            x, current_kv = layer(x, mask, att_mask, context, (recurr_keys, recurr_values) if recurr_keys is not None else None)
+
+            key_r, val_r = current_kv
+
+            # prevent backpropagation into the previous layers
+            # otherwise, it tries to optimize each attention layer for the next
+            # faster and better loss
+            key_r = self.key_projs[i](key_r.detach())
+            val_r = self.val_projs[i](val_r.detach())
+
+            key_r = reduce_sequence_length(key_r)
+            val_r = reduce_sequence_length(val_r)
+
+            # Collect recurrent key-values
+            recurr_keys = key_r if recurr_keys is None else torch.cat([recurr_keys, key_r], dim=0)
+            recurr_values = val_r if recurr_values is None else torch.cat([recurr_values, val_r], dim=0)
+
         return x
