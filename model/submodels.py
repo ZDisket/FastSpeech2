@@ -1,6 +1,6 @@
 import torch
 import torch.nn as nn
-from .attentions import TransformerEncoder, TransformerDecoder, TemporalConvNet, TCNAttention, MultiHeadAttention, mask_to_causal_attention_mask
+from .attentions import TransformerEncoder, TransformerDecoder, TemporalConvNet, TCNAttention, MultiHeadAttention, mask_to_causal_attention_mask, TransposeLayerNorm
 from torch.nn.utils.rnn import pack_padded_sequence, pad_packed_sequence
 import torch.nn.functional as F
 
@@ -425,7 +425,7 @@ class SpectrogramDecoder(nn.Module):
         self.dec = TransformerEncoder(filter_channels, heads=heads, num_layers=depth,
                                       forward_expansion=forward_expansion, dropout=dropout,
                                       alibi_alpha=alibi_alpha, start_i=4, kernel_size=kernel_sizes,
-                                      act="aptx")
+                                      act="aptx", rma_mem_dim=32, conv_att=True)
 
        # self.dec = TransformerDecoder(filter_channels,
         #                              heads=heads, num_layers=depth,

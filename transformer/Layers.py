@@ -7,7 +7,7 @@ from torch.nn import functional as F
 
 from .SubLayers import MultiHeadAttention, PositionwiseFeedForward
 from model.attentions import SwiGLUConvFFN
-
+from model.attentions import CBAM
 from model.attentions import SwiGLUFFN
 
 class FFTBlock(torch.nn.Module):
@@ -43,6 +43,7 @@ class ConvNorm(torch.nn.Module):
         dilation=1,
         bias=True,
         w_init_gain="linear",
+        use_cbam=False,
     ):
         super(ConvNorm, self).__init__()
 
@@ -59,9 +60,12 @@ class ConvNorm(torch.nn.Module):
             dilation=dilation,
             bias=bias,
         )
+        self.cbam = CBAM(out_channels) if use_cbam else nn.Identity()
+
 
     def forward(self, signal):
         conv_signal = self.conv(signal)
+        conv_signal = self.cbam(conv_signal)
 
         return conv_signal
 
@@ -108,6 +112,7 @@ class PostNet(nn.Module):
                         padding=int((postnet_kernel_size - 1) / 2),
                         dilation=1,
                         w_init_gain="tanh",
+                        use_cbam=True,
                     ),
                     nn.BatchNorm1d(postnet_embedding_dim),
                 )

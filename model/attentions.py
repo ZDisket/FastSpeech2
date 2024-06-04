@@ -137,6 +137,41 @@ class SwiGLU(nn.Module):
         x = x_proj * torch.sigmoid(x_gate)
         return x.transpose(1,2)
 
+#Note: Not actually lightweight
+class LightweightConvAttention(nn.Module):
+    def __init__(self, in_channels, out_channels, kernel_size=5):
+        super(LightweightConvAttention, self).__init__()
+        self.depthwise_conv = nn.Conv1d(in_channels, in_channels, kernel_size=kernel_size,
+                                        groups=in_channels, padding=kernel_size // 2)
+        self.pointwise_conv = nn.Conv1d(in_channels, out_channels, kernel_size=1)
+        self.channel_attention = nn.Sequential(
+            nn.AdaptiveAvgPool1d(1),
+            nn.Conv1d(out_channels, out_channels // 16, kernel_size=1),
+            nn.ReLU(),
+            nn.Conv1d(out_channels // 16, out_channels, kernel_size=1),
+            nn.Sigmoid()
+        )
+        self.spatial_attention = nn.Sequential(
+            nn.Conv1d(2, 1, kernel_size=7, padding=3),
+            nn.Sigmoid()
+        )
+
+    def forward(self, x):
+        out = self.depthwise_conv(x)
+        out = self.pointwise_conv(out)
+
+        # Channel attention
+        ca = self.channel_attention(out)
+        out = out * ca
+
+        # Spatial attention
+        max_pool = torch.max(out, dim=1, keepdim=True)[0]
+        avg_pool = torch.mean(out, dim=1, keepdim=True)
+        sa = self.spatial_attention(torch.cat([max_pool, avg_pool], dim=1))
+        out = out * sa
+
+        return out
+
 
 def reduce_mask(mask):
     """
@@ -159,6 +194,7 @@ class SwiGLUConvFFN(nn.Module):
             bias: bool = True,
             causal: bool = False,
             act = "swiglu",
+            conv_att = False,
     ):
         """
         Initializes the SwiGLU feed-forward network with Conv1D layers.
@@ -209,6 +245,7 @@ class SwiGLUConvFFN(nn.Module):
 
         self.conv1 = nn.Conv1d(in_features, expand, kernel_size[0], bias=bias)
         self.conv2 = nn.Conv1d(hidden_features, out_features, kernel_size[1], bias=bias)
+        self.lwa = nn.Sequential(CBAM(expand), nn.Dropout(0.1)) if conv_att else nn.Identity()
 
     def _swiglu(self, x):
         x1, x2 = x.chunk(2, dim=1)
@@ -297,6 +334,7 @@ class SwiGLUConvFFN(nn.Module):
         x = self.apply_mask(x, mask)
 
         x12 = self.conv1(self.padding(x, self.kernel_size[0]))
+        x12 = self.lwa(x12)
 
         hidden = self.act_fn(x12)
 
@@ -497,12 +535,15 @@ class MultiHeadAttention(nn.Module):
 
 # pre-LN transformer Encoder with SwiGLUFFN
 class TransformerEncoderLayer(nn.Module):
-    def __init__(self, embed_size, heads, forward_expansion, dropout, alibi_alpha=1.0, start_i_increment=0, kernel_size=3, act="swiglu"):
+    def __init__(self, embed_size, heads, forward_expansion, dropout, alibi_alpha=1.0, start_i_increment=0, kernel_size=3, act="swiglu",
+                 rma_mem_dim=0, conv_att=False):
         super(TransformerEncoderLayer, self).__init__()
         self.norm1 = nn.LayerNorm(embed_size)
         self.norm2 = nn.LayerNorm(embed_size)
+        self.use_rma = rma_mem_dim > 0
         self.attention = MultiHeadAttention(embed_size, heads, alibi_alpha=alibi_alpha,
-                                            start_i_increment=start_i_increment)
+                                            start_i_increment=start_i_increment, num_persistent=rma_mem_dim,
+                                            rma_inp_dim=embed_size // heads if self.use_rma else 0)
         self.feed_forward = SwiGLUConvFFN(
             in_features=embed_size,
             hidden_features=forward_expansion * embed_size,
@@ -510,17 +551,19 @@ class TransformerEncoderLayer(nn.Module):
             kernel_size=kernel_size,
             drop=0.1,
             act=act,
+            conv_att=conv_att,
         )
         self.dropout = nn.Dropout(dropout)
 
-    def forward(self, value, key, query, mask, conv_mask=None):
+
+    def forward(self, value, key, query, mask, conv_mask=None, mem_kv=None):
         # Normalize inputs
         query_norm = self.norm1(query)
         key_norm = self.norm1(key)
         value_norm = self.norm1(value)
 
         # Multi-head attention using normalized values
-        x = self.attention(value_norm, key_norm, query_norm, mask)
+        x = self.attention(value_norm, key_norm, query_norm, mask, mem_kv)
         # Apply dropout and add the residual (skip connection)
         x = query + self.dropout(x)
 
@@ -531,19 +574,32 @@ class TransformerEncoderLayer(nn.Module):
         # Apply dropout and add the residual (skip connection)
         x = query + self.dropout(x)
 
-        return x
+        kv_ret = (self.attention.persistent_keys, self.attention.persistent_values) if self.use_rma else None
+        return x, kv_ret
 
 
 class TransformerEncoder(nn.Module):
     def __init__(self, embed_size, heads, num_layers, forward_expansion, dropout, alibi_alpha=1.0, start_i=0,
-                 kernel_size=3, act="swiglu"):
+                 kernel_size=3, act="swiglu", rma_mem_dim=0, conv_att=False):
         super(TransformerEncoder, self).__init__()
+        self.use_conv_att = conv_att
         self.encoder_layers = nn.ModuleList([  # Index-Ramped ALiBi
             TransformerEncoderLayer(embed_size, heads, forward_expansion, dropout, alibi_alpha=alibi_alpha,
-                                    start_i_increment=start_i + (i * heads), kernel_size=kernel_size, act=act)
+                                    start_i_increment=start_i + (i * heads), kernel_size=kernel_size, act=act,
+                                    rma_mem_dim=rma_mem_dim, conv_att=self.use_conv_att and i == num_layers - 1)
             for i in range(num_layers)
         ])
+        self.head_dim = embed_size // heads
+        self.rma_mem_dim = rma_mem_dim
         self.dropout = nn.Dropout(dropout)
+        self.use_rma = self.rma_mem_dim > 0
+
+        if self.use_rma:
+            self.kv_proj = nn.Sequential(
+                nn.ReLU(inplace=True),
+                nn.Dropout(0.1),
+            )
+
 
     def forward(self, x, mask, conv_mask=None):
         """
@@ -555,8 +611,28 @@ class TransformerEncoder(nn.Module):
             The output of the last encoder layer.
         """
         # Pass the input through each encoder layer in sequence
+
+        recurr_keys = None
+        recurr_values = None
+
         for layer in self.encoder_layers:
-            x = layer(x, x, x, mask, conv_mask)  # Here x serves as query, key, and value
+            x, current_kv = layer(x, x, x, mask, conv_mask, (recurr_keys, recurr_values) if recurr_keys is not None else None)  # Here x serves as query, key, and value
+
+            if self.use_rma:
+                key_r, val_r = current_kv
+
+                # prevent backpropagation into the previous layers
+                # otherwise, it tries to optimize each attention layer for the next
+                # faster and better loss
+                key_r = self.kv_proj(key_r.detach())
+                val_r = self.kv_proj(val_r.detach())
+
+                key_r = reduce_sequence_length(key_r)
+                val_r = reduce_sequence_length(val_r)
+
+                # Collect recurrent key-values
+                recurr_keys = key_r if recurr_keys is None else torch.cat([recurr_keys, key_r], dim=0)
+                recurr_values = val_r if recurr_values is None else torch.cat([recurr_values, val_r], dim=0)
 
         return x
 
@@ -623,6 +699,7 @@ class TransformerDecoder(nn.Module):
     def forward(self, x, src_encodings, src_mask, tgt_mask):
         for layer in self.layers:
             x = layer(x, src_encodings, src_encodings, src_mask, tgt_mask)
+
 
         return x
 
