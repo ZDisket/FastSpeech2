@@ -10,6 +10,21 @@ from rotary_embedding_torch import RotaryEmbedding
 import torchbnn
 from torchbnn import BayesConv1d
 
+class APTx(nn.Module):
+    """
+    APTx: Alpha Plus Tanh Times, an activation function that behaves like Mish,
+    but is 2x faster.
+
+    https://arxiv.org/abs/2209.06119
+    """
+    def __init__(self, alpha=1, beta=1, gamma=0.5):
+        super(APTx, self).__init__()
+        self.alpha = alpha
+        self.beta = beta
+        self.gamma = gamma
+
+    def forward(self, x):
+        return (self.alpha + torch.tanh(self.beta * x)) * self.gamma * x
 
 class PartialConv1d(torch.nn.Conv1d):
     """
@@ -142,7 +157,8 @@ class SwiGLUConvFFN(nn.Module):
             kernel_size: int = 3,
             drop: float = 0.0,
             bias: bool = True,
-            causal: bool = False
+            causal: bool = False,
+            act = "swiglu",
     ):
         """
         Initializes the SwiGLU feed-forward network with Conv1D layers.
@@ -151,28 +167,64 @@ class SwiGLUConvFFN(nn.Module):
             in_features (int): Input dimension of the FFN.
             hidden_features (int, optional): Inner dimension of the FFN. Defaults to in_features.
             out_features (int, optional): Output dimension of the FFN. Defaults to in_features.
-            kernel_size (int, optional): Kernel size for convolution layers. Defaults to 3.
+            kernel_size (int, optional): Kernel size for convolution layers. Defaults to 3. Can also pass a 2-elem list
             drop (float, optional): Dropout rate. Defaults to 0.0.
             bias (bool, optional): Whether to use bias in convolution layers. Defaults to True.
             causal (bool, optional): Whether to use causal padding. Defaults to False.
+            act: What activation to use. Options are "swiglu", "relu2", "relu", and "aptx"
         """
         super().__init__()
         out_features = out_features or in_features
         hidden_features = hidden_features or in_features
 
+        valid_acts = ["swiglu", "relu2", "aptx", "relu"]
+
+        if act not in valid_acts:
+            raise ValueError(f"Unknown activation {act}. Valid activations are {valid_acts}")
+
+        if not isinstance(kernel_size, list):
+            kernel_size = [kernel_size] * 2
+
         self.kernel_size = kernel_size
         self.causal = causal
         self.drop = nn.Dropout(drop)
+        self.act = act
+        self.aptx = APTx() if act == "aptx" else nn.Identity()
+
+        if act == "swiglu":
+            self.act_fn = self._swiglu
+        elif act == "relu2":
+            self.act_fn = self._relu2
+        elif act == "aptx":
+            self.act_fn = self._aptx
+        elif act == "relu":
+            self.act_fn = self._relu
 
         if causal:
             self.padding = self._causal_padding
         else:
             self.padding = self._same_padding
 
-        self.conv1 = nn.Conv1d(in_features, 2 * hidden_features, kernel_size, bias=bias)
-        self.conv2 = nn.Conv1d(hidden_features, out_features, kernel_size, bias=bias)
+        expand = 2 * hidden_features if act == "swiglu" else hidden_features
 
-    def _causal_padding(self, x: torch.Tensor) -> torch.Tensor:
+        self.conv1 = nn.Conv1d(in_features, expand, kernel_size[0], bias=bias)
+        self.conv2 = nn.Conv1d(hidden_features, out_features, kernel_size[1], bias=bias)
+
+    def _swiglu(self, x):
+        x1, x2 = x.chunk(2, dim=1)
+        x = F.silu(x1) * x2
+        return x
+
+    def _relu2(self, x):
+        return F.relu(x) ** 2
+
+    def _aptx(self, x):
+        return self.aptx(x)
+
+    def _relu(self, x):
+        return F.relu(x)
+
+    def _causal_padding(self, x: torch.Tensor, kernel_size) -> torch.Tensor:
         """
         Applies causal padding to the input tensor.
 
@@ -182,13 +234,13 @@ class SwiGLUConvFFN(nn.Module):
         Returns:
             torch.Tensor: Padded tensor.
         """
-        if self.kernel_size == 1:
+        if kernel_size == 1:
             return x
-        pad_left = self.kernel_size - 1
+        pad_left = kernel_size - 1
         pad_right = 0
         return F.pad(x, (pad_left, pad_right))
 
-    def _same_padding(self, x: torch.Tensor) -> torch.Tensor:
+    def _same_padding(self, x: torch.Tensor, kernel_size) -> torch.Tensor:
         """
         Applies same padding to the input tensor.
 
@@ -198,10 +250,10 @@ class SwiGLUConvFFN(nn.Module):
         Returns:
             torch.Tensor: Padded tensor.
         """
-        if self.kernel_size == 1:
+        if kernel_size == 1:
             return x
-        pad_left = (self.kernel_size - 1) // 2
-        pad_right = self.kernel_size // 2
+        pad_left = (kernel_size - 1) // 2
+        pad_right = kernel_size // 2
         return F.pad(x, (pad_left, pad_right))
 
     def apply_mask(self, x: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
@@ -216,6 +268,11 @@ class SwiGLUConvFFN(nn.Module):
             torch.Tensor: Masked input tensor of shape (batch_size, channels, seq_length).
         """
         batch_size, channels, seq_length = x.shape
+
+        if mask.shape == (batch_size, 1, seq_length):
+            x = x.masked_fill(mask, 0)
+            return x
+
         if mask is not None:
             assert mask.shape == (batch_size, 1, 1, seq_length), f"Mask shape mismatch: {mask.shape}"
             mask = mask.squeeze(1)  # Reduce to (batch_size, 1, seq_length)
@@ -239,16 +296,16 @@ class SwiGLUConvFFN(nn.Module):
         # Apply mask before the first convolution
         x = self.apply_mask(x, mask)
 
-        x12 = self.conv1(self.padding(x))
-        x1, x2 = x12.chunk(2, dim=1)
+        x12 = self.conv1(self.padding(x, self.kernel_size[0]))
 
-        hidden = F.silu(x1) * x2
+        hidden = self.act_fn(x12)
+
         hidden = self.drop(hidden)
 
         # Apply mask before the second convolution
         hidden = self.apply_mask(hidden, mask)
 
-        out = self.conv2(self.padding(hidden))
+        out = self.conv2(self.padding(hidden, self.kernel_size[1]))
         out = self.drop(out)
 
         # Transpose back to (batch_size, seq_length, out_features)
@@ -440,7 +497,7 @@ class MultiHeadAttention(nn.Module):
 
 # pre-LN transformer Encoder with SwiGLUFFN
 class TransformerEncoderLayer(nn.Module):
-    def __init__(self, embed_size, heads, forward_expansion, dropout, alibi_alpha=1.0, start_i_increment=0):
+    def __init__(self, embed_size, heads, forward_expansion, dropout, alibi_alpha=1.0, start_i_increment=0, kernel_size=3, act="swiglu"):
         super(TransformerEncoderLayer, self).__init__()
         self.norm1 = nn.LayerNorm(embed_size)
         self.norm2 = nn.LayerNorm(embed_size)
@@ -450,12 +507,13 @@ class TransformerEncoderLayer(nn.Module):
             in_features=embed_size,
             hidden_features=forward_expansion * embed_size,
             out_features=embed_size,
-            kernel_size=3,
+            kernel_size=kernel_size,
             drop=0.1,
+            act=act,
         )
         self.dropout = nn.Dropout(dropout)
 
-    def forward(self, value, key, query, mask):
+    def forward(self, value, key, query, mask, conv_mask=None):
         # Normalize inputs
         query_norm = self.norm1(query)
         key_norm = self.norm1(key)
@@ -469,7 +527,7 @@ class TransformerEncoderLayer(nn.Module):
         # Normalize before the feed-forward network
         x = self.norm2(x)
         # Feed-forward network
-        x = self.feed_forward(x, mask)
+        x = self.feed_forward(x, mask if conv_mask is None else conv_mask)
         # Apply dropout and add the residual (skip connection)
         x = query + self.dropout(x)
 
@@ -477,26 +535,28 @@ class TransformerEncoderLayer(nn.Module):
 
 
 class TransformerEncoder(nn.Module):
-    def __init__(self, embed_size, heads, num_layers, forward_expansion, dropout, alibi_alpha=1.0, start_i=0):
+    def __init__(self, embed_size, heads, num_layers, forward_expansion, dropout, alibi_alpha=1.0, start_i=0,
+                 kernel_size=3, act="swiglu"):
         super(TransformerEncoder, self).__init__()
         self.encoder_layers = nn.ModuleList([  # Index-Ramped ALiBi
             TransformerEncoderLayer(embed_size, heads, forward_expansion, dropout, alibi_alpha=alibi_alpha,
-                                    start_i_increment=start_i + (i * heads))
+                                    start_i_increment=start_i + (i * heads), kernel_size=kernel_size, act=act)
             for i in range(num_layers)
         ])
         self.dropout = nn.Dropout(dropout)
 
-    def forward(self, x, mask):
+    def forward(self, x, mask, conv_mask=None):
         """
         Args:
             x: Input tensor of shape (batch_size, seq_length, embed_size).
             mask: Mask tensor of shape (batch_size, 1, seq_length, seq_length) or similar.
+            conv_mask: Convolutional mask size (batch, 1, seq_length) where True is padded and False is valid
         Returns:
             The output of the last encoder layer.
         """
         # Pass the input through each encoder layer in sequence
         for layer in self.encoder_layers:
-            x = layer(x, x, x, mask)  # Here x serves as query, key, and value
+            x = layer(x, x, x, mask, conv_mask)  # Here x serves as query, key, and value
 
         return x
 
@@ -526,6 +586,7 @@ class TransformerDecoderLayer(nn.Module):
                 kernel_size=kernel_size,
                 drop=0.1,
                 causal=True,
+                act="relu2"
             )
         else:
             raise TypeError(f"Invalid FFN type for TransformerDecoderLayer: {mode}. Valid are linear and conv")
@@ -565,21 +626,7 @@ class TransformerDecoder(nn.Module):
 
         return x
 
-class APTx(nn.Module):
-    """
-    APTx: Alpha Plus Tanh Times, an activation function that behaves like Mish,
-    but is 2x faster.
 
-    https://arxiv.org/abs/2209.06119
-    """
-    def __init__(self, alpha=1, beta=1, gamma=0.5):
-        super(APTx, self).__init__()
-        self.alpha = alpha
-        self.beta = beta
-        self.gamma = gamma
-
-    def forward(self, x):
-        return (self.alpha + torch.tanh(self.beta * x)) * self.gamma * x
 
 class SEBlock1D(nn.Module):
     """

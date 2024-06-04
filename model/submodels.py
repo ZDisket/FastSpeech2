@@ -1,6 +1,6 @@
 import torch
 import torch.nn as nn
-from .attentions import TransformerEncoder, TransformerDecoder, TemporalConvNet, TCNAttention, MultiHeadAttention
+from .attentions import TransformerEncoder, TransformerDecoder, TemporalConvNet, TCNAttention, MultiHeadAttention, mask_to_causal_attention_mask
 from torch.nn.utils.rnn import pack_padded_sequence, pad_packed_sequence
 import torch.nn.functional as F
 
@@ -413,7 +413,7 @@ class TemporalVariancePredictor(nn.Module):
 
 class SpectrogramDecoder(nn.Module):
     def __init__(self, input_size, filter_channels, mel_channels, depth, heads, kernel_sizes, dropout=0.1,
-                 alibi_alpha=1.0, forward_expansion=3):
+                 alibi_alpha=1.0, forward_expansion=4):
         super(SpectrogramDecoder, self).__init__()
 
         self.input_size = input_size
@@ -422,35 +422,47 @@ class SpectrogramDecoder(nn.Module):
         if input_size != filter_channels:
             self.pre_fc = nn.Linear(input_size, filter_channels)
 
-        self.dec = TransformerDecoder(filter_channels,
-                                      heads=heads, num_layers=depth,
-                                      forward_expansion=forward_expansion, dropout=dropout, alibi_alpha=alibi_alpha,
-                                      mode="conv", kernel_sizes=kernel_sizes)
+        self.dec = TransformerEncoder(filter_channels, heads=heads, num_layers=depth,
+                                      forward_expansion=forward_expansion, dropout=dropout,
+                                      alibi_alpha=alibi_alpha, start_i=4, kernel_size=kernel_sizes,
+                                      act="aptx")
+
+       # self.dec = TransformerDecoder(filter_channels,
+        #                              heads=heads, num_layers=depth,
+         #                             forward_expansion=forward_expansion, dropout=dropout, alibi_alpha=alibi_alpha,
+          #                            mode="conv", kernel_size=kernel_sizes, start_i=4)
 
         self.mel_fc = nn.Linear(filter_channels, mel_channels)
 
     # x_mask : True=exclude mask size (batch, mel_lens)
     # x: (batch, mel_lens, channels)
     def forward(self, x, x_mask):
-
         orig_mask = x_mask.clone()
 
+        conv_mask = x_mask.bool()
+        causal_mask = mask_to_causal_attention_mask(conv_mask)
+
         # (batch, mel_lens) -> (batch, 1, mel_lens)
-        x_mask = x_mask.unsqueeze(1)
+        x_mask = x_mask.float().unsqueeze(1)
         # True=exclude => True=Include
         x_mask = ~x_mask
-
-        src_mask, tgt_mask = generate_masks_from_float_mask(x_mask)
 
         # Decoder pass
 
         if self.input_size != self.filter_channels:
             x = self.pre_fc(x)
 
-        x = self.dec(x, x, src_mask,
-                     tgt_mask)
+        x_mask = x_mask.transpose(1, 2)
+
+        x = x * x_mask
+
+        x = self.dec(x, causal_mask, conv_mask.unsqueeze(1))
+
+        x = x * x_mask
 
         x = self.mel_fc(x)
+
+        x = x * x_mask
 
         return x, orig_mask
 
