@@ -19,10 +19,12 @@ from evaluate import evaluate
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
+
 def convert_to_magnitudes(durations):
     total_duration = durations.sum(dim=1, keepdim=True)
     magnitudes = durations / total_duration
     return magnitudes
+
 
 def weights_init_he(m):
     if isinstance(m, nn.Conv1d) or isinstance(m, nn.Conv2d) or isinstance(m, nn.Linear):
@@ -68,18 +70,11 @@ def main(args, configs):
     if len(args.pretrained):
         load_pretrained_weights(model, args.pretrained)
 
-
-
     discriminator = DualDiscriminator(n_heads=0, hidden_dim=256, num_blocks=3).to(device)
     discriminator.apply(weights_init_he)
     discriminator.train()
     criterion_lsgan = LSGANLoss()
     optimizer_d = torch.optim.Adam(discriminator.parameters(), lr=0.0001)
-    scheduler_d = torch.optim.lr_scheduler.ExponentialLR(optimizer_d, gamma=train_config["optimizer"]["gamma"],
-                                                       last_epoch=last_epoch)
-
-
-
     if args.restore_step:
         ckpt_path = os.path.join(
             train_config["path"]["ckpt_path"],
@@ -88,6 +83,9 @@ def main(args, configs):
         ckpt = torch.load(ckpt_path)
         discriminator.load_state_dict(ckpt["model"])
         optimizer_d.load_state_dict(ckpt["optimizer"])
+
+    scheduler_d = torch.optim.lr_scheduler.ExponentialLR(optimizer_d, gamma=train_config["optimizer"]["gamma"],
+                                                         last_epoch=last_epoch)
 
     model = nn.DataParallel(model)
     discriminator = nn.DataParallel(discriminator)
@@ -126,7 +124,7 @@ def main(args, configs):
     scaler = GradScaler()
     scaler_d = GradScaler()
 
-    discriminator_train_start_steps = -1
+    discriminator_train_start_steps = 555555555555
 
     while True:
         inner_bar = tqdm(total=len(loader), desc=f"Epoch {epoch}", position=1)
@@ -141,9 +139,9 @@ def main(args, configs):
 
                     # =========================== DISCRIMINATOR ==================================
 
-                    attn_hard_dur = output[5].detach() # we don't want to optimize the AlignmentEncoder
+                    attn_hard_dur = output[5].detach()  # we don't want to optimize the AlignmentEncoder
                     durations_fake = output[4]
-                    text_enc = output[14] # no optimizing the text-encoder
+                    text_enc = output[14]  # no optimizing the text-encoder
                     seq_lens = batch[2 + 2]
 
                     # bring real durs to the log space
@@ -169,7 +167,6 @@ def main(args, configs):
                             optimizer_d.zero_grad()
                     else:
                         loss_d = torch.FloatTensor([0.0]).to(device)
-
 
                     # =========================== END DISCRIMINATOR ==================================
 
@@ -203,13 +200,14 @@ def main(args, configs):
                 if step % log_step == 0:
                     losses = [l.item() for l in losses]
                     message1 = "Step {}/{}, ".format(step, total_step)
-                    message2 = ("Total Loss: {:.4f}, Mel Loss: {:.4f}, Mel PostNet Loss: {:.4f}, Pitch Loss: {:.4f}, Energy Loss: {:.4f}, Duration Loss: {:.4f},"
-                                " Attention Loss: {:.4f}, Duration Temporal Loss: {:.4f}, Total Temporal Loss: {:.4f},"
-                                "Duration KL Divergence Loss: {:.4f}, Pitch-Energy KL Loss: {:.4f}, Dur Discriminator Loss: {:.4f}"
-                                ", Duration GAN Loss: {:.4f}"
-                                ).format(
-                                    *losses
-                                )
+                    message2 = (
+                        "Total Loss: {:.4f}, Mel Loss: {:.4f}, Mel PostNet Loss: {:.4f}, Pitch Loss: {:.4f}, Energy Loss: {:.4f}, Duration Loss: {:.4f},"
+                        " Attention Loss: {:.4f}, Duration Temporal Loss: {:.4f}, Total Temporal Loss: {:.4f},"
+                        "Duration KL Divergence Loss: {:.4f}, Pitch-Energy KL Loss: {:.4f}, Dur Discriminator Loss: {:.4f}"
+                        ", Duration GAN Loss: {:.4f}"
+                        ).format(
+                        *losses
+                    )
 
                     with open(os.path.join(train_log_path, "log.txt"), "a") as f:
                         f.write(message1 + message2 + "\n")

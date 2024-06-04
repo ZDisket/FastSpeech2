@@ -443,12 +443,11 @@ class SpectrogramDecoder(nn.Module):
         causal_mask = mask_to_causal_attention_mask(conv_mask)
 
         # (batch, mel_lens) -> (batch, 1, mel_lens)
-        x_mask = x_mask.float().unsqueeze(1)
         # True=exclude => True=Include
-        x_mask = ~x_mask
+        x_mask = ~conv_mask
+        x_mask = x_mask.float().unsqueeze(1)
 
         # Decoder pass
-
         if self.input_size != self.filter_channels:
             x = self.pre_fc(x)
 
