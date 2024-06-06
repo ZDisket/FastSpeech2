@@ -506,7 +506,7 @@ class DynamicDurationPredictor(nn.Module):
         self.bidirectional = bidirectional
 
         self.tcn_attention = TCNAttention(num_inputs, num_channels, kernel_sizes, dropout, att_dropout, heads,
-                                          alibi_alpha=alibi_alpha, start_i_increment=start_i, bayesian=True)
+                                          alibi_alpha=alibi_alpha, start_i_increment=start_i, bayesian=True, integrated=True)
         if self.bidirectional:
             # Widen the backwards attention bias in order to compensate for the lesser heads
             backwards_start_i = start_i * ( (sum(heads) - sum(backwards_heads)) // 2 )
@@ -516,7 +516,8 @@ class DynamicDurationPredictor(nn.Module):
 
             self.backwards_tcn_attention = TCNAttention(num_inputs, backwards_channels, backwards_kernel_sizes, dropout, att_dropout,
                                                         backwards_heads,
-                                                        alibi_alpha=alibi_alpha, start_i_increment=backwards_start_i, bayesian=True)
+                                                        alibi_alpha=alibi_alpha, start_i_increment=backwards_start_i, bayesian=True,
+                                                        integrated=True)
 
             self.bw_tcn_output_channels = backwards_channels[-1]
 

@@ -453,6 +453,15 @@ class MultiHeadAttention(nn.Module):
 
 
     def forward(self, values, keys, queries, mask=None, recurr_persistent=None):
+        """
+        Do attention
+        :param values: Values
+        :param keys: Keys
+        :param queries: Queries
+        :param mask: Attention mask
+        :param recurr_persistent: Packed tuple (keys, values) of recurrent persistent memory
+        :return: Attentioned tensor
+        """
         N = queries.shape[0]
         value_len, key_len, query_len = values.shape[1], keys.shape[1], queries.shape[1]
 
@@ -860,6 +869,126 @@ class CBAM(nn.Module):
         return x_out * y.expand_as(x_out)
 
 
+class SuperTemporalBlock(nn.Module):
+    def __init__(self, n_inputs, n_outputs, kernel_size, stride, dilation, padding, dropout=0.2, bayesian=False, use_aptx=False,
+                 reduction=16, heads=4, start_i_increment=0, cross_att_heads=0, alibi_alpha=1.2, rma_head_dim=0, att_dropout=0.1,
+                 context_size=0):
+        """
+        Initialize SuperTemporalBlock for TCN
+        :param n_inputs: Number of input channels
+        :param n_outputs: Output channels
+        :param kernel_size: Kernel size
+        :param stride: Stride of convs
+        :param dilation: Dilation
+        :param padding: Padding
+        :param dropout: Dropout
+        :param use_se: Use Squeeze-Excite attention
+        :param bayesian: Use Bayesian convs, for nondeterminism. Will use LayerNorm instead of weight normalization
+        :param use_aptx: Use APTx for the acts
+        """
+        super(SuperTemporalBlock, self).__init__()
+
+        print(n_inputs, n_outputs)
+        self.conv1 = make_conv(bayesian, n_inputs, n_outputs, kernel_size,
+                               stride=stride, padding=padding, dilation=dilation)
+        self.chomp1 = Chomp1d(padding)
+        self.ln1 = TransposeLayerNorm(n_outputs) if bayesian else nn.Identity()
+        self.relu1 = APTx() if use_aptx else nn.ReLU()
+        self.dropout1 = nn.Dropout(dropout)
+
+        n_final = n_outputs
+
+        self.conv2 = make_conv(bayesian, n_outputs, n_final, kernel_size,
+                               stride=stride, padding=padding, dilation=dilation)
+        self.chomp2 = Chomp1d(padding)
+        self.ln2 = TransposeLayerNorm(n_final) if bayesian else nn.Identity()
+        self.relu2 = APTx() if use_aptx else nn.ReLU()
+        self.dropout2 = nn.Dropout(dropout)
+
+        self.net_part_1 = nn.Sequential(self.conv1, self.chomp1, self.ln1, self.relu1, self.dropout1)
+        self.net_part_2 = nn.Sequential(self.conv2, self.chomp2, self.ln2, self.relu2, self.dropout2)
+
+        n_outputs = n_final
+
+        self.downsample = make_conv(False, n_inputs, n_outputs, 1) if n_inputs != n_outputs else nn.Identity()
+
+        self.cbam_block = CBAM(n_outputs, reduction)
+        self.res_cbam = CBAM(n_outputs, reduction)
+        self.drop = nn.Dropout(0.1)
+
+        self.relu = APTx() if use_aptx else nn.ReLU()
+
+        self.heads = heads
+        self.cross_att_heads = cross_att_heads
+
+        if self.heads > 0:
+            self.attention = MultiHeadAttention(n_outputs, heads, alibi_alpha=alibi_alpha,
+                                                start_i_increment=start_i_increment,
+                                                num_persistent=16, rma_inp_dim=rma_head_dim)
+            self.att_drop = nn.Dropout(att_dropout)  # Dropout for attention
+
+        if self.cross_att_heads > 0:
+            self.context_proj = nn.Linear(context_size, n_outputs) if context_size != n_outputs else nn.Identity()
+
+            self.cross_attention = MultiHeadAttention(n_outputs, cross_att_heads, alibi_alpha=alibi_alpha,
+                                                      start_i_increment=start_i_increment,
+                                                      num_persistent=16)
+
+
+    def forward(self, x, mask=None, att_mask=None, context=None, packed_kv=None):
+        """
+        Forward pass through the Temporal Block
+        :param x: Tensor size (batch, seq_len, in_channels)
+        :param mask: Bool mask size (batch, 1, seq_len), where True is padded and False is valid.
+                    If not passed, will assume all sequence is valid.
+        :param context: Context tensor same shape as x for cross attention
+        :packed_kv: (key, value) packed for RMA
+        :return: Processed tensor size (batch, seq_len, in_channels)
+        """
+
+        if mask is None:
+            mask = torch.zeros((x.size(0), 1, x.size(2))).bool().to(x.device)
+
+        self.chomp1.set_mask(mask)
+        self.chomp2.set_mask(mask)
+
+        x = x.transpose(1,2)
+
+        # keep orig for residual block
+        x0 = x
+
+        x = self.net_part_1(x).masked_fill(mask, 0)
+
+        if self.heads > 0:
+            x = x.transpose(1, 2)
+            x_att = self.attention(x, x, x, att_mask, packed_kv)
+            x_att = self.att_drop(x_att)
+            x = x + x_att
+            x = x.transpose(1, 2)
+
+        x = self.net_part_2(x.masked_fill(mask, 0))
+
+        res = self.downsample(x0).masked_fill(mask, 0)
+        x = x + self.res_cbam(res).masked_fill(mask, 0)
+        x = self.drop(x)
+
+        x = self.cbam_block(x).masked_fill(mask, 0)
+
+        x = self.drop(x)
+
+        if self.cross_att_heads > 0:
+            x = x.transpose(1, 2)
+            context = self.context_proj(context)
+            x_cross_att = self.cross_attention(context, context, x, att_mask)
+            x_cross_att = self.att_drop(x_cross_att)
+            x = x + x_cross_att
+            x = x.transpose(1, 2)
+
+        x = self.relu(x).masked_fill(mask, 0)
+        x = x.transpose(1, 2)
+        return x, (self.attention.persistent_keys, self.attention.persistent_values)
+
+
 class TemporalBlock(nn.Module):
     def __init__(self, n_inputs, n_outputs, kernel_size, stride, dilation, padding, dropout=0.2, use_se=False,
                  reduction=16, bayesian=False, use_swiglu=False, use_aptx=False, use_cbam=False):
@@ -911,8 +1040,6 @@ class TemporalBlock(nn.Module):
         self.downsample = make_conv(bayesian, n_inputs, n_outputs, 1) if n_inputs != n_outputs else nn.Identity()
 
         if use_cbam:
-            if use_se:
-                print("Cannot use SE and CBAM. Using CBAM")
             use_se = False
 
         self.se_block = SEBlock1D(n_outputs, reduction) if use_se else nn.Identity()
@@ -1101,12 +1228,6 @@ class TCNAttentionBlock(nn.Module):
             x = x + x_cross_att
             x = self.post_cross_att_norm(x)
 
-        # Apply rotary embeddings before TCN
-        # Yes, this actually works.
-        x = self.rotary_emb.rotate_queries_or_keys(
-            x.unsqueeze(1) # (batch, 1, seq_len, channels)
-        ).squeeze(1) # (batch, seq_len, channels)
-
         x = x.transpose(1, 2)  # Switch dimensions for convolution
         x = x.masked_fill(mask, 0)
 
@@ -1182,7 +1303,7 @@ def reduce_sequence_length(input_tensor):
 
 class TCNAttention(nn.Module):
     def __init__(self, num_inputs, num_channels, kernel_size=[2, 2, 2], dropout=0.2, att_dropout=0.3, heads=[2, 2, 2],
-                 alibi_alpha=1.25, start_i_increment=1, bayesian=False):
+                 alibi_alpha=1.25, start_i_increment=1, bayesian=False, integrated=False):
         super(TCNAttention, self).__init__()
         self.layers = nn.ModuleList()
 
@@ -1198,17 +1319,30 @@ class TCNAttention(nn.Module):
         # Keep a global head dim so that we don't have to deal with varying head dimensions when collecting the recurrent states
         self.global_head_dim = 64
 
+        if integrated:
+            print("Using SuperTemporalBlocks")
+
         for level, (out_channels, num_heads, k_size) in enumerate(zip(num_channels, heads, kernel_size)):
             dilation = 1  # we want max precision, dilation is detrimental.
             is_last = level == len(num_channels) - 1
+            curr_i_increment = start_i_increment + (level * num_heads)
+            c_att_heads = 2 if is_last else 0
 
-            self.layers.append(TCNAttentionBlock(current_channels, out_channels, k_size, num_heads,
-                                                 att_dropout, dropout, dilation, alibi_alpha=alibi_alpha,
-                                                 start_i_increment=start_i_increment + (level * num_heads),
-                                                 bayesian=bayesian, cross_att_heads=2 if is_last else 0,
-                                                 context_size=num_inputs, rma_head_dim=self.global_head_dim
-                                                 )
-                               )
+            if not integrated:
+                self.layers.append(TCNAttentionBlock(current_channels, out_channels, k_size, num_heads,
+                                                     att_dropout, dropout, dilation, alibi_alpha=alibi_alpha,
+                                                     start_i_increment=curr_i_increment,
+                                                     bayesian=bayesian, cross_att_heads=2 if is_last else 0,
+                                                     context_size=num_inputs, rma_head_dim=self.global_head_dim
+                                                     )
+                                   )
+            else:
+                self.layers.append(SuperTemporalBlock(current_channels, out_channels, k_size, 1, dilation, padding = (k_size - 1) * dilation,
+                                                      dropout=dropout, bayesian=bayesian, use_aptx=True, reduction=16, heads=num_heads,
+                                                      start_i_increment=curr_i_increment, cross_att_heads=c_att_heads, alibi_alpha=alibi_alpha,
+                                                      rma_head_dim=self.global_head_dim,att_dropout=att_dropout, context_size=num_inputs)
+                                   )
+
             current_channels = out_channels  # The output of the current block is the input for the next
             layer_head_dim = self.layers[-1].attention.head_dim
 
