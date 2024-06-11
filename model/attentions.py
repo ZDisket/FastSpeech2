@@ -10,6 +10,7 @@ from rotary_embedding_torch import RotaryEmbedding
 import torchbnn
 from torchbnn import BayesConv1d
 
+
 class APTx(nn.Module):
     """
     APTx: Alpha Plus Tanh Times, an activation function that behaves like Mish,
@@ -17,6 +18,7 @@ class APTx(nn.Module):
 
     https://arxiv.org/abs/2209.06119
     """
+
     def __init__(self, alpha=1, beta=1, gamma=0.5):
         super(APTx, self).__init__()
         self.alpha = alpha
@@ -25,6 +27,7 @@ class APTx(nn.Module):
 
     def forward(self, x):
         return (self.alpha + torch.tanh(self.beta * x)) * self.gamma * x
+
 
 class PartialConv1d(torch.nn.Conv1d):
     """
@@ -119,6 +122,7 @@ class PartialConv1d(torch.nn.Conv1d):
                 input = torch.mul(input, mask_in).to(input.device)
             return self._conv_forward(input, self.weight, self.bias)
 
+
 class SwiGLU(nn.Module):
     def __init__(self, dim):
         super(SwiGLU, self).__init__()
@@ -135,9 +139,10 @@ class SwiGLU(nn.Module):
         x_proj = self.fc1(x)
         x_proj, x_gate = x_proj.chunk(2, dim=-1)
         x = x_proj * torch.sigmoid(x_gate)
-        return x.transpose(1,2)
+        return x.transpose(1, 2)
 
-#Note: Not actually lightweight
+
+# Note: Not actually lightweight
 class LightweightConvAttention(nn.Module):
     def __init__(self, in_channels, out_channels, kernel_size=5):
         super(LightweightConvAttention, self).__init__()
@@ -183,6 +188,7 @@ def reduce_mask(mask):
     reduced_mask = mask[:, 0, :, 0].unsqueeze(1)
     return reduced_mask
 
+
 class SwiGLUConvFFN(nn.Module):
     def __init__(
             self,
@@ -193,8 +199,8 @@ class SwiGLUConvFFN(nn.Module):
             drop: float = 0.0,
             bias: bool = True,
             causal: bool = False,
-            act = "swiglu",
-            conv_att = False,
+            act="swiglu",
+            conv_att=False,
     ):
         """
         Initializes the SwiGLU feed-forward network with Conv1D layers.
@@ -227,6 +233,8 @@ class SwiGLUConvFFN(nn.Module):
         self.act = act
         self.aptx = APTx() if act == "aptx" else nn.Identity()
 
+        # wall of if statements
+        # I swear im not yanderedev
         if act == "swiglu":
             self.act_fn = self._swiglu
         elif act == "relu2":
@@ -373,13 +381,13 @@ class SwiGLUFFN(nn.Module):
         return self.w3(hidden)
 
 
-
 class GatedRetention(nn.Module):
     """
     Allows the model to selectively retain or discard information based on the learned gate values.
 
     https://github.com/Mr-Twave/YOCO-Groq-BitNet-KV-cache/tree/main?tab=readme-ov-file#the-math
     """
+
     def __init__(self, in_channels, hidden_size):
         super(GatedRetention, self).__init__()
         self.proj = nn.Linear(in_channels, hidden_size) if in_channels != hidden_size else nn.Identity()
@@ -389,6 +397,7 @@ class GatedRetention(nn.Module):
         x = self.proj(x)
         gated_output = torch.sigmoid(self.gate(x)) * x
         return gated_output
+
 
 class MultiHeadAttention(nn.Module):
     """
@@ -450,7 +459,6 @@ class MultiHeadAttention(nn.Module):
 
             self.rma_k_proj = GatedRetention(rma_inp_dim, self.head_dim)
             self.rma_v_proj = GatedRetention(rma_inp_dim, self.head_dim)
-
 
     def forward(self, values, keys, queries, mask=None, recurr_persistent=None):
         """
@@ -544,7 +552,8 @@ class MultiHeadAttention(nn.Module):
 
 # pre-LN transformer Encoder with SwiGLUFFN
 class TransformerEncoderLayer(nn.Module):
-    def __init__(self, embed_size, heads, forward_expansion, dropout, alibi_alpha=1.0, start_i_increment=0, kernel_size=3, act="swiglu",
+    def __init__(self, embed_size, heads, forward_expansion, dropout, alibi_alpha=1.0, start_i_increment=0,
+                 kernel_size=3, act="swiglu",
                  rma_mem_dim=0, conv_att=False):
         super(TransformerEncoderLayer, self).__init__()
         self.norm1 = nn.LayerNorm(embed_size)
@@ -563,7 +572,6 @@ class TransformerEncoderLayer(nn.Module):
             conv_att=conv_att,
         )
         self.dropout = nn.Dropout(dropout)
-
 
     def forward(self, value, key, query, mask, conv_mask=None, mem_kv=None):
         # Normalize inputs
@@ -609,7 +617,6 @@ class TransformerEncoder(nn.Module):
                 nn.Dropout(0.1),
             )
 
-
     def forward(self, x, mask, conv_mask=None):
         """
         Args:
@@ -625,7 +632,8 @@ class TransformerEncoder(nn.Module):
         recurr_values = None
 
         for layer in self.encoder_layers:
-            x, current_kv = layer(x, x, x, mask, conv_mask, (recurr_keys, recurr_values) if recurr_keys is not None else None)  # Here x serves as query, key, and value
+            x, current_kv = layer(x, x, x,
+                                  mask, conv_mask, (recurr_keys, recurr_values) if recurr_keys is not None else None)  # Here x serves as query, key, and value
 
             if self.use_rma:
                 key_r, val_r = current_kv
@@ -709,9 +717,7 @@ class TransformerDecoder(nn.Module):
         for layer in self.layers:
             x = layer(x, src_encodings, src_encodings, src_mask, tgt_mask)
 
-
         return x
-
 
 
 class SEBlock1D(nn.Module):
@@ -740,10 +746,11 @@ class Chomp1d(nn.Module):
     def __init__(self, chomp_size):
         super(Chomp1d, self).__init__()
         self.chomp_size = chomp_size
-        self.x_mask = torch.zeros((1, 1 ,1))
+        self.x_mask = torch.zeros((1, 1, 1))
 
     def set_mask(self, in_mask):
         self.x_mask = in_mask
+
     def forward(self, x):
         x = x[:, :, :-self.chomp_size].contiguous()
         x = x.masked_fill(self.x_mask, 0)
@@ -830,6 +837,7 @@ def make_conv(bayesian, in_channels, out_channels, kernel_size, stride=1, paddin
         if bayesian else weight_norm(nn.Conv1d(in_channels, out_channels, kernel_size,
                                                stride=stride, padding=padding, dilation=dilation))
 
+
 class ReluSquared(nn.Module):
     def forward(self, x):
         return F.relu(x) ** 2
@@ -845,12 +853,13 @@ class SwiGLUCNN(nn.Module):
         :return: output tensor of shape (batch_size, dim // 2, seq_length)
         """
         # Split the input tensor into two equal parts along the last dimension
-        x = x.transpose(1,2)
+        x = x.transpose(1, 2)
         x_proj, x_gate = x.chunk(2, dim=-1)
         # Apply the SwiGLU activation function
         x = x_proj * torch.sigmoid(x_gate)
         x = x.transpose(1, 2)
         return x
+
 
 class CBAM(nn.Module):
     def __init__(self, in_channels, reduction=16):
@@ -870,8 +879,10 @@ class CBAM(nn.Module):
 
 
 class SuperTemporalBlock(nn.Module):
-    def __init__(self, n_inputs, n_outputs, kernel_size, stride, dilation, padding, dropout=0.2, bayesian=False, use_aptx=False,
-                 reduction=16, heads=4, start_i_increment=0, cross_att_heads=0, alibi_alpha=1.2, rma_head_dim=0, att_dropout=0.1,
+    def __init__(self, n_inputs, n_outputs, kernel_size, stride, dilation, padding, dropout=0.2, bayesian=False,
+                 use_aptx=False,
+                 reduction=16, heads=4, start_i_increment=0, cross_att_heads=0, alibi_alpha=1.2, rma_head_dim=0,
+                 att_dropout=0.1,
                  context_size=0):
         """
         Initialize SuperTemporalBlock for TCN
@@ -934,7 +945,6 @@ class SuperTemporalBlock(nn.Module):
                                                       start_i_increment=start_i_increment,
                                                       num_persistent=16)
 
-
     def forward(self, x, mask=None, att_mask=None, context=None, packed_kv=None):
         """
         Forward pass through the Temporal Block
@@ -952,7 +962,7 @@ class SuperTemporalBlock(nn.Module):
         self.chomp1.set_mask(mask)
         self.chomp2.set_mask(mask)
 
-        x = x.transpose(1,2)
+        x = x.transpose(1, 2)
 
         # keep orig for residual block
         x0 = x
@@ -1145,6 +1155,7 @@ def mask_to_causal_attention_mask(mask):
     attention_mask = ~attention_mask
     return attention_mask
 
+
 class TCNAttentionBlock(nn.Module):
     """
     Transformer-inspired TCNAttentionBlock:
@@ -1248,6 +1259,7 @@ class ResidualBlock1D(nn.Module):
     """
     Conv1D+Squeeze-Excite+RMSNorm residual block for sequence modeling
     """
+
     def __init__(self, in_channels, out_channels, kernel_size=3, dilation=1, dropout=0.3, act="relu"):
         super(ResidualBlock1D, self).__init__()
         self.conv1 = nn.Conv1d(in_channels, out_channels, kernel_size, dilation=dilation, padding="same")
@@ -1258,7 +1270,8 @@ class ResidualBlock1D(nn.Module):
         self.relu = APTx() if act == "aptx" else nn.ReLU()
         self.dropout = nn.Dropout(dropout)
 
-        self.residual = nn.Conv1d(in_channels, out_channels, kernel_size=1) if in_channels != out_channels else nn.Identity()
+        self.residual = nn.Conv1d(in_channels, out_channels,
+                                  kernel_size=1) if in_channels != out_channels else nn.Identity()
 
     def forward(self, x):
         residual = self.residual(x)
@@ -1337,10 +1350,14 @@ class TCNAttention(nn.Module):
                                                      )
                                    )
             else:
-                self.layers.append(SuperTemporalBlock(current_channels, out_channels, k_size, 1, dilation, padding = (k_size - 1) * dilation,
-                                                      dropout=dropout, bayesian=bayesian, use_aptx=True, reduction=16, heads=num_heads,
-                                                      start_i_increment=curr_i_increment, cross_att_heads=c_att_heads, alibi_alpha=alibi_alpha,
-                                                      rma_head_dim=self.global_head_dim,att_dropout=att_dropout, context_size=num_inputs)
+                self.layers.append(SuperTemporalBlock(current_channels, out_channels, k_size, 1, dilation,
+                                                      padding=(k_size - 1) * dilation,
+                                                      dropout=dropout, bayesian=bayesian, use_aptx=True, reduction=16,
+                                                      heads=num_heads,
+                                                      start_i_increment=curr_i_increment, cross_att_heads=c_att_heads,
+                                                      alibi_alpha=alibi_alpha,
+                                                      rma_head_dim=self.global_head_dim, att_dropout=att_dropout,
+                                                      context_size=num_inputs)
                                    )
 
             current_channels = out_channels  # The output of the current block is the input for the next
@@ -1378,7 +1395,8 @@ class TCNAttention(nn.Module):
         recurr_values = None
 
         for i, layer in enumerate(self.layers):
-            x, current_kv = layer(x, mask, att_mask, context, (recurr_keys, recurr_values) if recurr_keys is not None else None)
+            x, current_kv = layer(x, mask, att_mask, context,
+                                  (recurr_keys, recurr_values) if recurr_keys is not None else None)
 
             key_r, val_r = current_kv
 

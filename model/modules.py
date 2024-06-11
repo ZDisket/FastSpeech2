@@ -10,11 +10,12 @@ import numpy as np
 import torch.nn.functional as F
 
 from utils.tools import get_mask_from_lengths, pad
-from .attentions import PartialConv1d
+from .attentions import PartialConv1d, CBAM, TransposeLayerNorm, TransposeRMSNorm
 from .submodels import VariantDurationPredictor, TemporalVariancePredictor, DynamicDurationPredictor, NormalizedEmbedding
 
 from typing import Optional, Tuple
 from numba import jit, prange
+from rotary_embedding_torch import RotaryEmbedding
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
@@ -94,6 +95,8 @@ class ConvNorm(torch.nn.Module):
             use_partial_padding: bool = False,
             use_weight_norm: bool = False,
             norm_fn=None,
+            use_cbam=False,
+            drop=None,
     ):
         super(ConvNorm, self).__init__()
         if padding is None:
@@ -116,13 +119,16 @@ class ConvNorm(torch.nn.Module):
         if norm_fn is not None:
             self.norm = norm_fn(out_channels, affine=True)
         else:
-            self.norm = None
+            self.norm = nn.Identity()
         self.conv = conv
+        self.cbam = CBAM(out_channels) if use_cbam else nn.Identity()
+        self.drop = nn.Dropout(drop) if drop is not None else nn.Identity()
 
     def forward(self, input: torch.Tensor, mask_in: Optional[torch.Tensor] = None) -> torch.Tensor:
         ret = self.conv(input, mask_in)
-        if self.norm is not None:
-            ret = self.norm(ret)
+        ret = self.cbam(ret)
+        ret = self.norm(ret)
+        ret = self.drop(ret)
         return ret
 
 
@@ -170,17 +176,18 @@ class AlignmentEncoder(torch.nn.Module):
         self.temperature = temperature
         self.softmax = SafeSoftmax(dim=3)
         self.log_softmax = SafeLogSoftmax(dim=3)
+        self.rotary_emb = RotaryEmbedding(n_att_channels // 2)
 
         self.key_proj = nn.Sequential(
-            ConvNorm(n_text_channels, n_text_channels * 2, kernel_size=3, bias=True, w_init_gain='relu'),
+            ConvNorm(n_text_channels, n_text_channels * 2, kernel_size=3, bias=True, w_init_gain='relu', use_cbam=False, drop=0.1),
             torch.nn.ReLU(),
             ConvNorm(n_text_channels * 2, n_att_channels, kernel_size=1, bias=True),
         )
 
         self.query_proj = nn.Sequential(
-            ConvNorm(n_mel_channels, n_mel_channels * 2, kernel_size=3, bias=True, w_init_gain='relu'),
+            ConvNorm(n_mel_channels, n_mel_channels * 2, kernel_size=3, bias=True, w_init_gain='relu', use_cbam=True, drop=0.1),
             torch.nn.ReLU(),
-            ConvNorm(n_mel_channels * 2, n_mel_channels, kernel_size=1, bias=True),
+            ConvNorm(n_mel_channels * 2, n_mel_channels, kernel_size=1, bias=True, drop=0.1),
             torch.nn.ReLU(),
             ConvNorm(n_mel_channels, n_att_channels, kernel_size=1, bias=True),
         )
@@ -297,6 +304,17 @@ class AlignmentEncoder(torch.nn.Module):
 
         keys_enc = self.key_proj(keys)  # B x n_attn_dims x T2
         queries_enc = self.query_proj(queries)  # B x n_attn_dims x T1
+
+        # (batch, att_channels, seq_len) => (batch, seq_len, att_channels) =>> (batch, 1, seq_len, att_channels)
+
+        keys_enc = keys_enc.transpose(1,2).unsqueeze(1)
+        queries_enc = queries_enc.transpose(1,2).unsqueeze(1)
+
+        keys_enc = self.rotary_emb.rotate_queries_or_keys(keys_enc)
+        queries_enc = self.rotary_emb.rotate_queries_or_keys(queries_enc)
+
+        keys_enc = keys_enc.squeeze(1).transpose(1,2)
+        queries_enc = queries_enc.squeeze(1).transpose(1,2)
 
         # Simplistic Gaussian Isotopic Attention
         attn = (queries_enc[:, :, :, None] - keys_enc[:, :, None]) ** 2  # B x n_attn_dims x T1 x T2

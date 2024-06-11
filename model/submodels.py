@@ -522,12 +522,12 @@ class DynamicDurationPredictor(nn.Module):
             self.bw_tcn_output_channels = backwards_channels[-1]
 
             # prevent model from overrelying on backwards features
-            self.backwards_drop = nn.Dropout(att_dropout)
+            self.backwards_drop = nn.Dropout(0.25)
             self.fw_projection = nn.Linear(self.tcn_output_channels + self.bw_tcn_output_channels, self.tcn_output_channels)
 
         self.final_drop = nn.Dropout(0.1)
         self.linear_projection = nn.Linear(self.tcn_output_channels, 1)
-        self.entry_dropout = nn.Dropout(0.5)
+        self.entry_dropout = nn.Dropout(0.1)
 
     def forward(self, x, x_lengths):
         """
