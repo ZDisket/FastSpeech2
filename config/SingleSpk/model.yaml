@@ -9,7 +9,7 @@ transformer:
   conv_kernel_size: [9, 1]
   encoder_dropout: 0.1
   decoder_dropout: 0.15
-
+  decoder_kernel_sizes: [3, 3, 5, 5, 7, 7]
 
 variance_predictor:
   filter_size: [256, 384, 256]

@@ -424,7 +424,7 @@ class SpectrogramDecoder(nn.Module):
 
         self.dec = TransformerEncoder(filter_channels, heads=heads, num_layers=depth,
                                       forward_expansion=forward_expansion, dropout=dropout,
-                                      alibi_alpha=alibi_alpha, start_i=4, kernel_size=[3, 3, 5, 5, 7, 7],
+                                      alibi_alpha=alibi_alpha, start_i=4, kernel_size=kernel_sizes,
                                       act="aptx", rma_mem_dim=32, conv_att=True, multi_scale=True)
 
        # self.dec = TransformerDecoder(filter_channels,

@@ -40,7 +40,7 @@ class FastSpeech2(nn.Module):
                                           preprocess_config["preprocessing"]["mel"]["n_mel_channels"],
                                           model_config["transformer"]["decoder_layer"],
                                           model_config["transformer"]["decoder_head"],
-                                          model_config["transformer"]["conv_kernel_size"],
+                                          model_config["transformer"]["decoder_kernel_sizes"],
                                           model_config["transformer"]["decoder_dropout"],
                                           alibi_alpha=1.25)
        # self.mel_linear = nn.Linear(
