@@ -597,12 +597,12 @@ class TransformerEncoderLayer(nn.Module):
 
 class TransformerEncoder(nn.Module):
     def __init__(self, embed_size, heads, num_layers, forward_expansion, dropout, alibi_alpha=1.0, start_i=0,
-                 kernel_size=3, act="swiglu", rma_mem_dim=0, conv_att=False):
+                 kernel_size=3, act="swiglu", rma_mem_dim=0, conv_att=False, multi_scale=False):
         super(TransformerEncoder, self).__init__()
         self.use_conv_att = conv_att
         self.encoder_layers = nn.ModuleList([  # Index-Ramped ALiBi
             TransformerEncoderLayer(embed_size, heads, forward_expansion, dropout, alibi_alpha=alibi_alpha,
-                                    start_i_increment=start_i + (i * heads), kernel_size=kernel_size, act=act,
+                                    start_i_increment=start_i + (i * heads), kernel_size=[kernel_size[i], 1] if multi_scale else kernel_size, act=act,
                                     rma_mem_dim=rma_mem_dim, conv_att=self.use_conv_att and i == num_layers - 1)
             for i in range(num_layers)
         ])

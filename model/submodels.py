@@ -58,7 +58,7 @@ class TextEncoder(nn.Module):
         self.embed = nn.Embedding(vocab_size, embed_size)
         self.emb_norm = nn.LayerNorm(embed_size)
         self.encoder = TransformerEncoder(embed_size, num_heads, num_layers, forward_expansion, dropout,
-                                          alibi_alpha=alibi_alpha, start_i=start_i)
+                                          alibi_alpha=alibi_alpha, start_i=start_i, kernel_size=[3, 1])
         self.dropout = StochasticDropout(dropout)
         self.layer_norm = nn.LayerNorm(embed_size)
 
@@ -424,8 +424,8 @@ class SpectrogramDecoder(nn.Module):
 
         self.dec = TransformerEncoder(filter_channels, heads=heads, num_layers=depth,
                                       forward_expansion=forward_expansion, dropout=dropout,
-                                      alibi_alpha=alibi_alpha, start_i=4, kernel_size=kernel_sizes,
-                                      act="aptx", rma_mem_dim=32, conv_att=True)
+                                      alibi_alpha=alibi_alpha, start_i=4, kernel_size=[3, 3, 5, 5, 7, 7],
+                                      act="aptx", rma_mem_dim=32, conv_att=True, multi_scale=True)
 
        # self.dec = TransformerDecoder(filter_channels,
         #                              heads=heads, num_layers=depth,
