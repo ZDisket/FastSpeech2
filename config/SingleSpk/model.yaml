@@ -20,7 +20,7 @@ variance_predictor:
 duration_predictor:
   type: "tcn" # support tcn (TCN-Attention) or lstm (Conv+Decoder+LSTM)
   bidirectional: true # both: bidirectional
-  att_dropout: 0.25 # only applies to TCN duration pred, dropout applied to attention
+  att_dropout: 0.1 # only applies to TCN duration pred, dropout applied to attention
   tcn_channels: [256, 384 , 256] # only applies to TCN duration pred
   tcn_heads: [2, 4, 2] #tcn: attention heads for each layer. you can use 0 to disable multi-head and use squeeze-excite
   tcn_kernel_sizes: [2, 3, 3] #tcn: kernel sizes for each layer

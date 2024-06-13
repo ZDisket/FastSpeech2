@@ -29,6 +29,45 @@ class APTx(nn.Module):
         return (self.alpha + torch.tanh(self.beta * x)) * self.gamma * x
 
 
+class DPReLU(nn.Module):
+    """
+    DPReLU: A dynamic ReLU variant:
+
+    "There are four additional learnable parameters compared to the vanilla ReLU. alpha and beta are the slopes of the negative
+    and positive parts in the function, respectively. Here, a negative or positive case is determined when comparing input
+    x to the threshold. The threshold makes DPReLU shift on the x-axis in comparison to the original ReLU. The bias
+    determines the alignment of the function with respect to the y-axis. These four parameters are all learnable and interact
+    with each other during the training phase"
+
+    https://link.springer.com/article/10.1007/s44196-023-00186-w
+
+    By default, alpha and beta are 0.5 and 0.9, which yielded best results according to the paper. Threshold and bias = 0.
+
+    Important: Please use He or their custom initialization!
+
+    Converted from Tensorflow from https://github.com/KienMN/Activation-Experiments/tree/master
+    """
+    def __init__(self, alpha_init=0.5, beta_init=0.9, threshold_init=0.0, bias_init=0.0, shared_axes=None):
+        super(DPReLU, self).__init__()
+
+        self.alpha = nn.Parameter(torch.tensor(alpha_init))
+        self.beta = nn.Parameter(torch.tensor(beta_init))
+        self.threshold = nn.Parameter(torch.tensor(threshold_init))
+        self.bias = nn.Parameter(torch.tensor(bias_init))
+
+        self.shared_axes = shared_axes
+        if self.shared_axes is not None and not isinstance(self.shared_axes, (list, tuple)):
+            self.shared_axes = [self.shared_axes]
+
+    def forward(self, inputs):
+        neg = -self.alpha * torch.relu(-inputs + self.threshold)
+        pos = self.beta * torch.relu(inputs - self.threshold)
+        return pos + neg + self.bias
+
+    def extra_repr(self):
+        return f'alpha={self.alpha.item()}, beta={self.beta.item()}, threshold={self.threshold.item()}, bias={self.bias.item()}, shared_axes={self.shared_axes}'
+
+
 class PartialConv1d(torch.nn.Conv1d):
     """
     Zero padding creates a unique identifier for where the edge of the data is, such that the model can almost always identify
@@ -219,7 +258,7 @@ class SwiGLUConvFFN(nn.Module):
         out_features = out_features or in_features
         hidden_features = hidden_features or in_features
 
-        valid_acts = ["swiglu", "relu2", "aptx", "relu"]
+        valid_acts = ["swiglu", "relu2", "aptx", "relu", "dprelu"]
 
         if act not in valid_acts:
             raise ValueError(f"Unknown activation {act}. Valid activations are {valid_acts}")
@@ -231,7 +270,9 @@ class SwiGLUConvFFN(nn.Module):
         self.causal = causal
         self.drop = nn.Dropout(drop)
         self.act = act
+
         self.aptx = APTx() if act == "aptx" else nn.Identity()
+        self.dprelu = DPReLU() if act == "dprelu" else nn.Identity()
 
         # wall of if statements
         # I swear im not yanderedev
@@ -243,6 +284,9 @@ class SwiGLUConvFFN(nn.Module):
             self.act_fn = self._aptx
         elif act == "relu":
             self.act_fn = self._relu
+        elif act == "dprelu":
+            self.act_fn = self._dprelu
+
 
         if causal:
             self.padding = self._causal_padding
@@ -268,6 +312,9 @@ class SwiGLUConvFFN(nn.Module):
 
     def _relu(self, x):
         return F.relu(x)
+
+    def _dprelu(self, x):
+        return self.dprelu(x)
 
     def _causal_padding(self, x: torch.Tensor, kernel_size) -> torch.Tensor:
         """
@@ -878,12 +925,16 @@ class CBAM(nn.Module):
         return x_out * y.expand_as(x_out)
 
 
+def perturb(x, mul=0.1):
+    return F.dropout(x, mul, training=True)
+
+
 class SuperTemporalBlock(nn.Module):
     def __init__(self, n_inputs, n_outputs, kernel_size, stride, dilation, padding, dropout=0.2, bayesian=False,
                  use_aptx=False,
                  reduction=16, heads=4, start_i_increment=0, cross_att_heads=0, alibi_alpha=1.2, rma_head_dim=0,
                  att_dropout=0.1,
-                 context_size=0):
+                 context_size=0, noise_scale=0.3):
         """
         Initialize SuperTemporalBlock for TCN
         :param n_inputs: Number of input channels
@@ -896,10 +947,13 @@ class SuperTemporalBlock(nn.Module):
         :param use_se: Use Squeeze-Excite attention
         :param bayesian: Use Bayesian convs, for nondeterminism. Will use LayerNorm instead of weight normalization
         :param use_aptx: Use APTx for the acts
+        :param noise_scale: Scale of noise to perturb inputs for increased variability. Set to 0 if not using Bayesian
+        (Not functional)
         """
         super(SuperTemporalBlock, self).__init__()
 
-        print(n_inputs, n_outputs)
+        self.noise_scale = noise_scale
+
         self.conv1 = make_conv(bayesian, n_inputs, n_outputs, kernel_size,
                                stride=stride, padding=padding, dilation=dilation)
         self.chomp1 = Chomp1d(padding)
@@ -937,6 +991,7 @@ class SuperTemporalBlock(nn.Module):
                                                 start_i_increment=start_i_increment,
                                                 num_persistent=16, rma_inp_dim=rma_head_dim)
             self.att_drop = nn.Dropout(att_dropout)  # Dropout for attention
+            self.att_norm = nn.LayerNorm(n_outputs)
 
         if self.cross_att_heads > 0:
             self.context_proj = nn.Linear(context_size, n_outputs) if context_size != n_outputs else nn.Identity()
@@ -944,6 +999,7 @@ class SuperTemporalBlock(nn.Module):
             self.cross_attention = MultiHeadAttention(n_outputs, cross_att_heads, alibi_alpha=alibi_alpha,
                                                       start_i_increment=start_i_increment,
                                                       num_persistent=16)
+
 
     def forward(self, x, mask=None, att_mask=None, context=None, packed_kv=None):
         """
@@ -974,9 +1030,11 @@ class SuperTemporalBlock(nn.Module):
             x_att = self.attention(x, x, x, att_mask, packed_kv)
             x_att = self.att_drop(x_att)
             x = x + x_att
+            x = self.att_norm(x)
             x = x.transpose(1, 2)
 
-        x = self.net_part_2(x.masked_fill(mask, 0))
+        x = x.masked_fill(mask, 0)
+        x = self.net_part_2(x)
 
         res = self.downsample(x0).masked_fill(mask, 0)
         x = x + self.res_cbam(res).masked_fill(mask, 0)
