@@ -272,7 +272,7 @@ def main(args, configs):
 
                     for i, sent in enumerate(test_sentences):
                         _, (blocks, hid, _) = zephyr_model.predict_emotions(sent)
-                        t_aud = test_one_fs2(model.module, vocoder, sent, blocks, hid)
+                        t_aud = test_one_fs2(model.module, vocoder, sent, blocks.cpu().numpy(), hid.cpu().numpy())
                         if t_aud is None:
                             continue
                         log(

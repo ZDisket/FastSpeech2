@@ -17,7 +17,7 @@ from text import text_to_sequence, sequence_to_text, cleaned_text_to_sequence
 
 
 def to_device(data, device):
-    if len(data) == 11:
+    if len(data) == 11 + 3:
         (
             ids,
             raw_texts,
@@ -30,6 +30,9 @@ def to_device(data, device):
             max_mel_len,
             pitches,
             energies,
+            emotion_blocks,
+            emotion_hiddens,
+            emotion_lens,
         ) = data
 
         speakers = torch.from_numpy(speakers).long().to(device)
@@ -39,6 +42,9 @@ def to_device(data, device):
         mel_lens = torch.from_numpy(mel_lens).to(device)
         pitches = torch.from_numpy(pitches).float().to(device)
         energies = torch.from_numpy(energies).to(device)
+        emotion_blocks = torch.from_numpy(emotion_blocks).to(device)
+        emotion_hiddens = torch.from_numpy(emotion_hiddens).to(device)
+        emotion_lens = torch.from_numpy(emotion_lens).to(device)
 
         return (
             ids,
@@ -52,6 +58,9 @@ def to_device(data, device):
             max_mel_len,
             pitches,
             energies,
+            emotion_blocks,
+            emotion_hiddens,
+            emotion_lens,
         )
 
     if len(data) == 6:

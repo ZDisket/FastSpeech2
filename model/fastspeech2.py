@@ -89,12 +89,12 @@ class FastSpeech2(nn.Module):
         max_mel_len=None,
         p_targets=None,
         e_targets=None,
-        p_control=1.0,
-        e_control=1.0,
-        d_control=1.0,
         em_blocks=None,
         em_hidden=None,
         em_lens=None,
+        p_control=1.0,
+        e_control=1.0,
+        d_control=1.0,
     ):
         src_masks = get_mask_from_lengths(src_lens, max_src_len)
         mel_masks = (
@@ -172,12 +172,12 @@ class FastSpeech2(nn.Module):
         texts,
         src_lens,
         max_src_len,
-        p_control=1.0,
-        e_control=1.0,
-        d_control=1.0,
         em_blocks=None,
         em_hidden=None,
         em_lens=None,
+        p_control=1.0,
+        e_control=1.0,
+        d_control=1.0,
     ):
         src_masks = get_mask_from_lengths(src_lens, max_src_len)
         mel_masks = None

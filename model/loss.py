@@ -341,6 +341,9 @@ class FastSpeech3Loss(nn.Module):
             _,
             pitch_targets,
             energy_targets,
+            _,
+            _,
+            _,
         ) = inputs[6:]
         (
             mel_predictions,

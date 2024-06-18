@@ -82,15 +82,16 @@ class TextEncoder(nn.Module):
         max_len = token_ids.size(1)
         mask = torch.arange(max_len, device=seq_lens.device).expand(len(seq_lens), max_len) >= seq_lens.unsqueeze(1)
 
-        x_mask, y_mask = sequence_mask(max(seq_lens), seq_lens), sequence_mask(max(em_lens), em_lens)
+        x_mask, y_mask = sequence_mask(max_len, seq_lens), sequence_mask(em_blocks.size(2), em_lens)
 
         #   ======================== ZEPHYR CONDITIONING ========================
         # em_blocks = [batch, n_blocks, seq_len, hidden]
 
-        em_blocks = em_blocks.transpose(1, 3) # ==> (batch, hidden, n_blocks, seq_len)
+        em_blocks = em_blocks.transpose(1, 3) # ==> (batch, hidden, seq_len, n_blocks)
         y = self.em_proj(em_blocks)
 
-        y = y.permute(0, 3, 2, 1) # ==> (batch, seq_len, n_blocks, hidden)
+        # Attention-on-Blocks
+        y = y.permute(0, 2, 3, 1) # ==> (batch, seq_len, n_blocks, hidden)
         xy_att_mask = expand_masks(x_mask, y_mask)
 
         xy_att = self.cond_att(y, y, x, mask=xy_att_mask)
