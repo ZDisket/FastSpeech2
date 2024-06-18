@@ -6,7 +6,7 @@ from text.numbers import normalize_numbers
 
 
 class EmotionProcessor:
-    def __init__(self, filepath):
+    def __init__(self, filepath=""):
         self.filepath = filepath
         self._punctuation = "!'(),.:;?~!*&\" "
         self._letters = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz"

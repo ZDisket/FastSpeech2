@@ -33,7 +33,6 @@ class FastSpeech2(nn.Module):
             3,
         )
         self.variance_adaptor = VarianceAdaptor(preprocess_config, model_config)
-        #self.decoder = Decoder(model_config)
 
         self.decoder = SpectrogramDecoder(model_config["transformer"]["encoder_hidden"],
                                           model_config["transformer"]["decoder_hidden"],
@@ -43,10 +42,6 @@ class FastSpeech2(nn.Module):
                                           model_config["transformer"]["decoder_kernel_sizes"],
                                           model_config["transformer"]["decoder_dropout"],
                                           alibi_alpha=1.25)
-       # self.mel_linear = nn.Linear(
-        #    model_config["transformer"]["decoder_hidden"],
-         #   preprocess_config["preprocessing"]["mel"]["n_mel_channels"],
-        #)
 
         self.mel_linear = nn.Identity()
 
@@ -97,6 +92,9 @@ class FastSpeech2(nn.Module):
         p_control=1.0,
         e_control=1.0,
         d_control=1.0,
+        em_blocks=None,
+        em_hidden=None,
+        em_lens=None,
     ):
         src_masks = get_mask_from_lengths(src_lens, max_src_len)
         mel_masks = (
@@ -105,7 +103,7 @@ class FastSpeech2(nn.Module):
             else None
         )
 
-        output = self.text_encoder(texts, src_lens)
+        output = self.text_encoder(texts, src_lens, em_blocks, em_lens)
         encoded_text = output.clone()
 
         # src_masks -> [batch, mxlen] => [batch, 1, mxlen]
@@ -177,12 +175,14 @@ class FastSpeech2(nn.Module):
         p_control=1.0,
         e_control=1.0,
         d_control=1.0,
+        em_blocks=None,
+        em_hidden=None,
+        em_lens=None,
     ):
         src_masks = get_mask_from_lengths(src_lens, max_src_len)
         mel_masks = None
-        
 
-        output = self.text_encoder(texts, src_lens)
+        output = self.text_encoder(texts, src_lens, em_blocks, em_lens)
 
         attn_soft, attn_logprob, attn_hard, attn_hard_dur = torch.zeros(1), torch.zeros(1), torch.zeros(1), torch.zeros(1)
 

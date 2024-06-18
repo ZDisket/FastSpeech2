@@ -302,6 +302,43 @@ def plot_mel(data, stats, titles):
     return fig
 
 
+def pad_zephyr_outputs(hidden_blocks_list, final_hids_list):
+    """
+    Zero-pads lists of numpy arrays along the sequence length dimension and returns their lengths.
+
+    Args:
+        hidden_blocks_list (list of np.ndarray): List of arrays with shape (1, 4, seq_len, hidden_dim).
+        final_hids_list (list of np.ndarray): List of arrays with shape (1, seq_len, hidden_dim).
+
+    Returns:
+        tuple: Two numpy arrays, zero-padded along the sequence length dimension, and an array of lengths.
+    """
+    # Determine the maximum sequence length in both lists
+    max_seq_len = max(arr.shape[2] for arr in hidden_blocks_list)
+
+    # Get lengths of each sequence
+    lengths = np.array([arr.shape[2] for arr in hidden_blocks_list])
+
+    # Pad hidden_blocks_list
+    padded_hidden_blocks = []
+    for arr in hidden_blocks_list:
+        pad_width = ((0, 0), (0, 0), (0, max_seq_len - arr.shape[2]), (0, 0))
+        padded_arr = np.pad(arr, pad_width, mode='constant', constant_values=0)
+        padded_hidden_blocks.append(padded_arr)
+
+    # Pad final_hids_list
+    padded_final_hids = []
+    for arr in final_hids_list:
+        pad_width = ((0, 0), (0, max_seq_len - arr.shape[1]), (0, 0))
+        padded_arr = np.pad(arr, pad_width, mode='constant', constant_values=0)
+        padded_final_hids.append(padded_arr)
+
+    # Convert lists to numpy arrays
+    padded_hidden_blocks = np.concatenate(padded_hidden_blocks, axis=0)
+    padded_final_hids = np.concatenate(padded_final_hids, axis=0)
+
+    return padded_hidden_blocks, padded_final_hids, lengths
+
 def pad_1D(inputs, PAD=0):
     def pad_data(x, length, PAD):
         x_padded = np.pad(
@@ -364,10 +401,14 @@ def preproc_text(in_txt, cleaners = ["english_cleaners2"]):
     return txt_arr
 
 
-def fs2_infer(inmodel, text):
+def fs2_infer(inmodel, text, in_blocks, in_hid):
     src_len = torch.from_numpy(np.array([text.shape[1]])).to(device)
     text = torch.IntTensor(text).to(device)
-    predictions = inmodel.infer([0], text, src_len, src_len[0])
+    em_len = torch.from_numpy(np.array([in_hid.shape[1]])).to(device)
+    in_blocks = torch.from_numpy(in_blocks).to(device)
+    in_hid = torch.from_numpy(in_hid).to(device)
+
+    predictions = inmodel.infer([0], text, src_len, src_len[0], in_blocks, in_hid, em_len)
     mel, mel_postnet = predictions[0], predictions[1]
 
     mel_torch = mel.transpose(1, 2).detach()
@@ -378,14 +419,14 @@ def fs2_infer(inmodel, text):
     return mel, mel_postnet, mel_torch, mel_postnet_torch
 
 
-def test_one_fs2(inmodel, invocoder, in_txt):
+def test_one_fs2(inmodel, invocoder, in_txt, in_blocks, in_hid):
     with torch.no_grad():
         txt = preproc_text(in_txt)
         # [text_len] => [1, text_len]
 
         txt = np.expand_dims(txt, 0)
         try:
-            mel, mel_postnet, mel_torch, mel_postnet_torch = fs2_infer(inmodel, txt)
+            mel, mel_postnet, mel_torch, mel_postnet_torch = fs2_infer(inmodel, txt, in_blocks, in_hid)
         except RuntimeError:
             print(f"Error inferring {txt}")
             return None

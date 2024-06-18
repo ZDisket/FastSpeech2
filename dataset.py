@@ -6,7 +6,7 @@ import numpy as np
 from torch.utils.data import Dataset
 
 from text import text_to_sequence, cleaned_text_to_sequence
-from utils.tools import pad_1D, pad_2D
+from utils.tools import pad_1D, pad_2D, pad_zephyr_outputs
 
 
 class Dataset(Dataset):
@@ -54,6 +54,20 @@ class Dataset(Dataset):
         )
         energy = np.load(energy_path)
 
+        emotion_block_path = os.path.join(
+            self.preprocessed_path,
+            "emotion",
+            f"{speaker}-blocks-{basename}.npy",
+        )
+
+        emotion_hidden_path = os.path.join(
+            self.preprocessed_path,
+            "emotion",
+            f"{speaker}-hid-{basename}.npy",
+        )
+
+        emotion_blocks, emotion_hidden = np.load(emotion_block_path), np.load(emotion_hidden_path)
+
 
         sample = {
             "id": basename,
@@ -63,6 +77,8 @@ class Dataset(Dataset):
             "mel": mel,
             "pitch": pitch,
             "energy": energy,
+            "em_blocks": emotion_blocks,
+            "em_hidden": emotion_hidden,
         }
 
         return sample
@@ -91,6 +107,8 @@ class Dataset(Dataset):
         mels = [data[idx]["mel"] for idx in idxs]
         pitches = [data[idx]["pitch"] for idx in idxs]
         energies = [data[idx]["energy"] for idx in idxs]
+        emotion_blocks = [data[idx]["em_blocks"] for idx in idxs]
+        emotion_hiddens = [data[idx]["em_hidden"] for idx in idxs]
 
         text_lens = np.array([text.shape[0] for text in texts])
         mel_lens = np.array([mel.shape[0] for mel in mels])
@@ -100,6 +118,7 @@ class Dataset(Dataset):
         mels = pad_2D(mels)
         pitches = pad_1D(pitches)
         energies = pad_1D(energies)
+        emotion_blocks, emotion_hiddens, emotion_lens = pad_zephyr_outputs(emotion_blocks, emotion_hiddens)
 
         return (
             ids,
@@ -113,6 +132,9 @@ class Dataset(Dataset):
             max(mel_lens),
             pitches,
             energies,
+            emotion_blocks,
+            emotion_hiddens,
+            emotion_lens,
         )
 
     def collate_fn(self, data):

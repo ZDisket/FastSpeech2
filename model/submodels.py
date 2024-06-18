@@ -53,7 +53,7 @@ class StochasticDropout(nn.Module):
 
 class TextEncoder(nn.Module):
     def __init__(self, vocab_size, embed_size, num_heads, num_layers, forward_expansion, dropout, alibi_alpha=1.0,
-                 start_i=0):
+                 start_i=0, emotion_channels=256):
         super(TextEncoder, self).__init__()
         self.embed = nn.Embedding(vocab_size, embed_size)
         self.emb_norm = nn.LayerNorm(embed_size)
@@ -61,8 +61,18 @@ class TextEncoder(nn.Module):
                                           alibi_alpha=alibi_alpha, start_i=start_i, kernel_size=[3, 1])
         self.dropout = StochasticDropout(dropout)
         self.layer_norm = nn.LayerNorm(embed_size)
+        self.cond_heads = 4
+        self.cond_head_size = embed_size // self.cond_heads
 
-    def forward(self, token_ids, seq_lens):
+        self.em_proj = nn.Sequential(
+            nn.Conv2d(emotion_channels, self.cond_head_size, 1, padding="same"),
+            nn.ReLU(),
+            nn.Dropout(0.1),
+        )
+        self.cond_att = MultiHeadAttention(embed_size, self.cond_heads, alibi_alpha=1.5, start_i_increment=4, num_persistent=16)
+        self.cond_drop = nn.Dropout(0.25)
+
+    def forward(self, token_ids, seq_lens, em_blocks, em_lens):
         # Embed token_ids
         x = self.embed(token_ids)  # Shape: (batch, max_seq_len, embed_size)
         x = self.emb_norm(x)
@@ -71,6 +81,23 @@ class TextEncoder(nn.Module):
         # Create a mask based on sequence lengths
         max_len = token_ids.size(1)
         mask = torch.arange(max_len, device=seq_lens.device).expand(len(seq_lens), max_len) >= seq_lens.unsqueeze(1)
+
+        x_mask, y_mask = sequence_mask(max(seq_lens), seq_lens), sequence_mask(max(em_lens), em_lens)
+
+        #   ======================== ZEPHYR CONDITIONING ========================
+        # em_blocks = [batch, n_blocks, seq_len, hidden]
+
+        em_blocks = em_blocks.transpose(1, 3) # ==> (batch, hidden, n_blocks, seq_len)
+        y = self.em_proj(em_blocks)
+
+        y = y.permute(0, 3, 2, 1) # ==> (batch, seq_len, n_blocks, hidden)
+        xy_att_mask = expand_masks(x_mask, y_mask)
+
+        xy_att = self.cond_att(y, y, x, mask=xy_att_mask)
+        xy_att = self.cond_drop(xy_att)
+        x = x + xy_att
+
+        #   ======================== ZEPHYR CONDITIONING ========================
 
         # Pass through the transformer encoder
         x = self.encoder(x, mask.unsqueeze(1).unsqueeze(2))

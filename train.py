@@ -14,6 +14,8 @@ from model import FastSpeech3Loss, DualDiscriminator, AdvSeqDiscriminator
 from model.loss import LSGANLoss
 from dataset import Dataset
 from torch.cuda.amp import GradScaler, autocast
+from zephyrfe import ZephyrFrontEnd
+from preprocessor.emotion import EmotionProcessor
 
 from evaluate import evaluate
 
@@ -95,6 +97,10 @@ def main(args, configs):
 
     # Load vocoder
     vocoder = get_vocoder(model_config, device)
+
+    if len(preprocess_config["preprocessing"]["zephyr_model"]):
+        proc_em = EmotionProcessor()
+        zephyr_model = ZephyrFrontEnd(model_path=preprocess_config["preprocessing"]["zephyr_model"], processor=proc_em)
 
     # Init logger
     for p in train_config["path"].values():
@@ -265,7 +271,8 @@ def main(args, configs):
                         "Now I see. Black human beings dislike the sound of rubbing glass probably the sound wave of the whistle"]
 
                     for i, sent in enumerate(test_sentences):
-                        t_aud = test_one_fs2(model.module, vocoder, sent)
+                        _, (blocks, hid, _) = zephyr_model.predict_emotions(sent)
+                        t_aud = test_one_fs2(model.module, vocoder, sent, blocks, hid)
                         if t_aud is None:
                             continue
                         log(

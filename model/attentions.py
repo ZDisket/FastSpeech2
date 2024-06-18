@@ -11,6 +11,27 @@ import torchbnn
 from torchbnn import BayesConv1d
 
 
+class APTxS1(nn.Module):
+    """
+    APTx Stage 1:
+
+    - Trainable beta and gamma (allows model to dynamically adjust upwards slope and scaling)
+    - Squaring output, inspired by Squared ReLU.
+
+    Both of these modifications have proven to increase accuracy in small tests (4-layer encoder on IMDB)
+    """
+    def __init__(self, alpha=1.0, beta=1.0, gamma=0.5, trainable=False):
+        super(APTxS1, self).__init__()
+        self.alpha = alpha
+        if trainable:
+            self.beta = nn.Parameter(torch.tensor(beta, dtype=torch.float32))
+            self.gamma = nn.Parameter(torch.tensor(gamma, dtype=torch.float32))
+        else:
+            self.beta = beta
+            self.gamma = gamma
+    def forward(self, x):
+        return ((self.alpha + torch.tanh(self.beta * x)) * self.gamma * x) ** 2
+
 class APTx(nn.Module):
     """
     APTx: Alpha Plus Tanh Times, an activation function that behaves like Mish,
@@ -19,11 +40,22 @@ class APTx(nn.Module):
     https://arxiv.org/abs/2209.06119
     """
 
-    def __init__(self, alpha=1, beta=1, gamma=0.5):
+    def __init__(self, alpha=1, beta=1, gamma=0.5, trainable=False):
+        """
+        Initialize APTx initialization.
+        :param alpha: Alpha
+        :param beta: Beta
+        :param gamma: Gamma
+        :param trainable: Makes beta and gamma trainable, dynamically optimizing the upwards slope and scaling
+        """
         super(APTx, self).__init__()
         self.alpha = alpha
-        self.beta = beta
-        self.gamma = gamma
+        if trainable:
+            self.beta = nn.Parameter(torch.tensor(beta, dtype=torch.float32))
+            self.gamma = nn.Parameter(torch.tensor(gamma, dtype=torch.float32))
+        else:
+            self.beta = beta
+            self.gamma = gamma
 
     def forward(self, x):
         return (self.alpha + torch.tanh(self.beta * x)) * self.gamma * x
@@ -271,7 +303,7 @@ class SwiGLUConvFFN(nn.Module):
         self.drop = nn.Dropout(drop)
         self.act = act
 
-        self.aptx = APTx() if act == "aptx" else nn.Identity()
+        self.aptx = APTx(trainable=True) if act == "aptx" else nn.Identity()
         self.dprelu = DPReLU() if act == "dprelu" else nn.Identity()
 
         # wall of if statements
@@ -491,9 +523,6 @@ class MultiHeadAttention(nn.Module):
             self.pre_softmax_talking_heads = nn.Conv2d(heads, heads, 1, bias=False)
             self.post_softmax_talking_heads = nn.Conv2d(heads, heads, 1, bias=False)
 
-        if rma_inp_dim is None:
-            rma_inp_dim = self.head_dim
-
         if self.num_persistent > 0:
             # persistent vectors:
             # (num_persistent, 1, head_dim)
@@ -504,8 +533,10 @@ class MultiHeadAttention(nn.Module):
             nn.init.kaiming_uniform_(self.persistent_keys, a=sqrt(self.num_persistent))
             nn.init.kaiming_uniform_(self.persistent_values, a=sqrt(self.num_persistent))
 
-            self.rma_k_proj = GatedRetention(rma_inp_dim, self.head_dim)
-            self.rma_v_proj = GatedRetention(rma_inp_dim, self.head_dim)
+            if rma_inp_dim is not None:
+                self.rma_k_proj = GatedRetention(rma_inp_dim, self.head_dim)
+                self.rma_v_proj = GatedRetention(rma_inp_dim, self.head_dim)
+
 
     def forward(self, values, keys, queries, mask=None, recurr_persistent=None):
         """
@@ -600,8 +631,7 @@ class MultiHeadAttention(nn.Module):
 # pre-LN transformer Encoder with SwiGLUFFN
 class TransformerEncoderLayer(nn.Module):
     def __init__(self, embed_size, heads, forward_expansion, dropout, alibi_alpha=1.0, start_i_increment=0,
-                 kernel_size=3, act="swiglu",
-                 rma_mem_dim=0, conv_att=False):
+                 kernel_size=3, act="swiglu", rma_mem_dim=0, conv_att=False):
         super(TransformerEncoderLayer, self).__init__()
         self.norm1 = nn.LayerNorm(embed_size)
         self.norm2 = nn.LayerNorm(embed_size)
@@ -981,7 +1011,7 @@ class SuperTemporalBlock(nn.Module):
         self.res_cbam = CBAM(n_outputs, reduction)
         self.drop = nn.Dropout(0.1)
 
-        self.relu = APTx() if use_aptx else nn.ReLU()
+        self.relu = APTx(trainable=True) if use_aptx else nn.ReLU()
 
         self.heads = heads
         self.cross_att_heads = cross_att_heads
