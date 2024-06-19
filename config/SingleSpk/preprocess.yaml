@@ -8,7 +8,7 @@ path:
 
 preprocessing:
   val_size: 512 # ignored
-  zephyr_model: "./zephyr/zephyr_v5_emotion.pth.tar"
+  zephyr_model: "./zephyr/zephyrv2_emotion.pth.tar"
   text:
     text_cleaners: ["english_cleaners2"]
     language: "en"

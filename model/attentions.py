@@ -9,110 +9,10 @@ from rotary_embedding_torch import RotaryEmbedding
 
 import torchbnn
 from torchbnn import BayesConv1d
+from .attblocks import *
+from .subatts import *
 
 
-class AttentionPooling(nn.Module):
-    def __init__(self, hidden_dim):
-        super(AttentionPooling, self).__init__()
-        self.attention_weights = nn.Parameter(torch.Tensor(hidden_dim, 1))
-        nn.init.xavier_uniform_(self.attention_weights)
-
-    def forward(self, x, mask):
-        # x: (batch, seq_len, hidden_dim)
-        # mask: (batch, seq_len)
-        attn_scores = torch.matmul(x, self.attention_weights).squeeze(-1)  # (batch, seq_len)
-        attn_scores = attn_scores.masked_fill(mask, float('-inf'))
-        attn_weights = torch.softmax(attn_scores, dim=-1).unsqueeze(-1)  # (batch, seq_len, 1)
-        context = torch.sum(attn_weights * x, dim=1)  # (batch, hidden_dim)
-        return context, attn_weights
-
-class APTxS1(nn.Module):
-    """
-    APTx Stage 1:
-
-    - Trainable beta and gamma (allows model to dynamically adjust upwards slope and scaling)
-    - Squaring output, inspired by Squared ReLU.
-
-    Both of these modifications have proven to increase accuracy in small tests (4-layer encoder on IMDB)
-    """
-    def __init__(self, alpha=1.0, beta=1.0, gamma=0.5, trainable=False):
-        super(APTxS1, self).__init__()
-        self.alpha = alpha
-        if trainable:
-            self.beta = nn.Parameter(torch.tensor(beta, dtype=torch.float32))
-            self.gamma = nn.Parameter(torch.tensor(gamma, dtype=torch.float32))
-        else:
-            self.beta = beta
-            self.gamma = gamma
-    def forward(self, x):
-        return ((self.alpha + torch.tanh(self.beta * x)) * self.gamma * x) ** 2
-
-class APTx(nn.Module):
-    """
-    APTx: Alpha Plus Tanh Times, an activation function that behaves like Mish,
-    but is 2x faster.
-
-    https://arxiv.org/abs/2209.06119
-    """
-
-    def __init__(self, alpha=1, beta=1, gamma=0.5, trainable=False):
-        """
-        Initialize APTx initialization.
-        :param alpha: Alpha
-        :param beta: Beta
-        :param gamma: Gamma
-        :param trainable: Makes beta and gamma trainable, dynamically optimizing the upwards slope and scaling
-        """
-        super(APTx, self).__init__()
-        self.alpha = alpha
-        if trainable:
-            self.beta = nn.Parameter(torch.tensor(beta, dtype=torch.float32))
-            self.gamma = nn.Parameter(torch.tensor(gamma, dtype=torch.float32))
-        else:
-            self.beta = beta
-            self.gamma = gamma
-
-    def forward(self, x):
-        return (self.alpha + torch.tanh(self.beta * x)) * self.gamma * x
-
-
-class DPReLU(nn.Module):
-    """
-    DPReLU: A dynamic ReLU variant:
-
-    "There are four additional learnable parameters compared to the vanilla ReLU. alpha and beta are the slopes of the negative
-    and positive parts in the function, respectively. Here, a negative or positive case is determined when comparing input
-    x to the threshold. The threshold makes DPReLU shift on the x-axis in comparison to the original ReLU. The bias
-    determines the alignment of the function with respect to the y-axis. These four parameters are all learnable and interact
-    with each other during the training phase"
-
-    https://link.springer.com/article/10.1007/s44196-023-00186-w
-
-    By default, alpha and beta are 0.5 and 0.9, which yielded best results according to the paper. Threshold and bias = 0.
-
-    Important: Please use He or their custom initialization!
-
-    Converted from Tensorflow from https://github.com/KienMN/Activation-Experiments/tree/master
-    """
-    def __init__(self, alpha_init=0.5, beta_init=0.9, threshold_init=0.0, bias_init=0.0, shared_axes=None):
-        super(DPReLU, self).__init__()
-
-        self.alpha = nn.Parameter(torch.tensor(alpha_init))
-        self.beta = nn.Parameter(torch.tensor(beta_init))
-        self.threshold = nn.Parameter(torch.tensor(threshold_init))
-        self.bias = nn.Parameter(torch.tensor(bias_init))
-
-        self.shared_axes = shared_axes
-        if self.shared_axes is not None and not isinstance(self.shared_axes, (list, tuple)):
-            self.shared_axes = [self.shared_axes]
-
-    def forward(self, inputs):
-        neg = -self.alpha * torch.relu(-inputs + self.threshold)
-        pos = self.beta * torch.relu(inputs - self.threshold)
-        return pos + neg + self.bias
-
-    def extra_repr(self):
-        return f'alpha={self.alpha.item()}, beta={self.beta.item()}, threshold={self.threshold.item()}, bias={self.bias.item()}, shared_axes={self.shared_axes}'
 
 
 class PartialConv1d(torch.nn.Conv1d):
@@ -207,61 +107,6 @@ class PartialConv1d(torch.nn.Conv1d):
             if mask_in is not None:
                 input = torch.mul(input, mask_in).to(input.device)
             return self._conv_forward(input, self.weight, self.bias)
-
-
-class SwiGLU(nn.Module):
-    def __init__(self, dim):
-        super(SwiGLU, self).__init__()
-        self.fc1 = nn.Linear(dim, dim * 2)
-        self.fc2 = nn.Linear(dim, dim)
-
-    def forward(self, x):
-        """
-        Pass through simple SwiGLU
-        :param x:
-        :return:
-        """
-        x = x.transpose(1, 2)
-        x_proj = self.fc1(x)
-        x_proj, x_gate = x_proj.chunk(2, dim=-1)
-        x = x_proj * torch.sigmoid(x_gate)
-        return x.transpose(1, 2)
-
-
-# Note: Not actually lightweight
-class LightweightConvAttention(nn.Module):
-    def __init__(self, in_channels, out_channels, kernel_size=5):
-        super(LightweightConvAttention, self).__init__()
-        self.depthwise_conv = nn.Conv1d(in_channels, in_channels, kernel_size=kernel_size,
-                                        groups=in_channels, padding=kernel_size // 2)
-        self.pointwise_conv = nn.Conv1d(in_channels, out_channels, kernel_size=1)
-        self.channel_attention = nn.Sequential(
-            nn.AdaptiveAvgPool1d(1),
-            nn.Conv1d(out_channels, out_channels // 16, kernel_size=1),
-            nn.ReLU(),
-            nn.Conv1d(out_channels // 16, out_channels, kernel_size=1),
-            nn.Sigmoid()
-        )
-        self.spatial_attention = nn.Sequential(
-            nn.Conv1d(2, 1, kernel_size=7, padding=3),
-            nn.Sigmoid()
-        )
-
-    def forward(self, x):
-        out = self.depthwise_conv(x)
-        out = self.pointwise_conv(out)
-
-        # Channel attention
-        ca = self.channel_attention(out)
-        out = out * ca
-
-        # Spatial attention
-        max_pool = torch.max(out, dim=1, keepdim=True)[0]
-        avg_pool = torch.mean(out, dim=1, keepdim=True)
-        sa = self.spatial_attention(torch.cat([max_pool, avg_pool], dim=1))
-        out = out * sa
-
-        return out
 
 
 def reduce_mask(mask):
@@ -452,45 +297,8 @@ class SwiGLUConvFFN(nn.Module):
         return out.transpose(1, 2)
 
 
-class SwiGLUFFN(nn.Module):
-    def __init__(
-            self,
-            in_features,
-            hidden_features=None,
-            out_features=None,
-            act_layer=None,
-            drop=0.0,
-            bias=True,
-    ):
-        super().__init__()
-        out_features = out_features or in_features
-        hidden_features = hidden_features or in_features
-        self.w12 = nn.Linear(in_features, 2 * hidden_features, bias=bias)
-        self.w3 = nn.Linear(hidden_features, out_features, bias=bias)
-
-    def forward(self, x):
-        x12 = self.w12(x)
-        x1, x2 = x12.chunk(2, dim=-1)
-        hidden = F.silu(x1) * x2
-        return self.w3(hidden)
 
 
-class GatedRetention(nn.Module):
-    """
-    Allows the model to selectively retain or discard information based on the learned gate values.
-
-    https://github.com/Mr-Twave/YOCO-Groq-BitNet-KV-cache/tree/main?tab=readme-ov-file#the-math
-    """
-
-    def __init__(self, in_channels, hidden_size):
-        super(GatedRetention, self).__init__()
-        self.proj = nn.Linear(in_channels, hidden_size) if in_channels != hidden_size else nn.Identity()
-        self.gate = nn.Linear(hidden_size, hidden_size)
-
-    def forward(self, x):
-        x = self.proj(x)
-        gated_output = torch.sigmoid(self.gate(x)) * x
-        return gated_output
 
 
 class MultiHeadAttention(nn.Module):
@@ -812,163 +620,11 @@ class TransformerDecoder(nn.Module):
         return x
 
 
-class SEBlock1D(nn.Module):
-    """
-    Lightweight Squeeze-Excite attention.
-    """
-
-    def __init__(self, in_channels, reduction=16):
-        super(SEBlock1D, self).__init__()
-        self.avg_pool = nn.AdaptiveAvgPool1d(1)
-        self.fc = nn.Sequential(
-            nn.Linear(in_channels, in_channels // reduction, bias=False),
-            nn.ReLU(inplace=True),
-            nn.Linear(in_channels // reduction, in_channels, bias=False),
-            nn.Sigmoid()
-        )
-
-    def forward(self, x):
-        b, c, _ = x.size()
-        y = self.avg_pool(x).view(b, c)
-        y = self.fc(y).view(b, c, 1)
-        return x * y.expand_as(x)
-
-
-class Chomp1d(nn.Module):
-    def __init__(self, chomp_size):
-        super(Chomp1d, self).__init__()
-        self.chomp_size = chomp_size
-        self.x_mask = torch.zeros((1, 1, 1))
-
-    def set_mask(self, in_mask):
-        self.x_mask = in_mask
-
-    def forward(self, x):
-        x = x[:, :, :-self.chomp_size].contiguous()
-        x = x.masked_fill(self.x_mask, 0)
-        return x
-
-
-class RMSNorm(nn.Module):
-    def __init__(self, d, p=-1., eps=1e-8, bias=False):
-        """
-            Root Mean Square Layer Normalization
-        :param d: model size
-        :param p: partial RMSNorm, valid value [0, 1], default -1.0 (disabled)
-        :param eps:  epsilon value, default 1e-8
-        :param bias: whether use bias term for RMSNorm, disabled by
-            default because RMSNorm doesn't enforce re-centering invariance.
-        """
-        super(RMSNorm, self).__init__()
-
-        self.eps = eps
-        self.d = d
-        self.p = p
-        self.bias = bias
-
-        self.scale = nn.Parameter(torch.ones(d))
-        self.register_parameter("scale", self.scale)
-
-        if self.bias:
-            self.offset = nn.Parameter(torch.zeros(d))
-            self.register_parameter("offset", self.offset)
-
-    def forward(self, x):
-        if self.p < 0. or self.p > 1.:
-            norm_x = x.norm(2, dim=-1, keepdim=True)
-            d_x = self.d
-        else:
-            partial_size = int(self.d * self.p)
-            partial_x, _ = torch.split(x, [partial_size, self.d - partial_size], dim=-1)
-
-            norm_x = partial_x.norm(2, dim=-1, keepdim=True)
-            d_x = partial_size
-
-        rms_x = norm_x * d_x ** (-1. / 2)
-        x_normed = x / (rms_x + self.eps)
-
-        if self.bias:
-            return self.scale * x_normed + self.offset
-
-        return self.scale * x_normed
-
-
-class TransposeRMSNorm(nn.Module):
-    def __init__(self, num_features, eps=1e-5, affine=True):
-        super(TransposeRMSNorm, self).__init__()
-        self.ln = RMSNorm(num_features, eps=eps)
-
-    def forward(self, x):
-        # Transpose from (batch, channels, seq_len) to (batch, seq_len, channels)
-        x = x.transpose(1, 2)
-        # Apply RMSNorm
-        x = self.ln(x)
-        # Transpose back from (batch, seq_len, channels) to (batch, channels, seq_len)
-        x = x.transpose(1, 2)
-        return x
-
-
-class TransposeLayerNorm(nn.Module):
-    def __init__(self, num_features, eps=1e-5, affine=True):
-        super(TransposeLayerNorm, self).__init__()
-        self.ln = nn.LayerNorm(num_features, eps, affine)
-
-    def forward(self, x):
-        # Transpose from (batch, channels, seq_len) to (batch, seq_len, channels)
-        x = x.transpose(1, 2)
-        # Apply LayerNorm
-        x = self.ln(x)
-        # Transpose back from (batch, seq_len, channels) to (batch, channels, seq_len)
-        x = x.transpose(1, 2)
-        return x
-
-
 def make_conv(bayesian, in_channels, out_channels, kernel_size, stride=1, padding=0, dilation=1):
     return BayesConv1d(0.0, 0.1, in_channels, out_channels, kernel_size,
                        stride=stride, padding=padding, dilation=dilation) \
         if bayesian else weight_norm(nn.Conv1d(in_channels, out_channels, kernel_size,
                                                stride=stride, padding=padding, dilation=dilation))
-
-
-class ReluSquared(nn.Module):
-    def forward(self, x):
-        return F.relu(x) ** 2
-
-
-class SwiGLUCNN(nn.Module):
-    def __init__(self):
-        super(SwiGLUCNN, self).__init__()
-
-    def forward(self, x):
-        """
-        :param x: input tensor of shape (batch_size, dim, seq_length)
-        :return: output tensor of shape (batch_size, dim // 2, seq_length)
-        """
-        # Split the input tensor into two equal parts along the last dimension
-        x = x.transpose(1, 2)
-        x_proj, x_gate = x.chunk(2, dim=-1)
-        # Apply the SwiGLU activation function
-        x = x_proj * torch.sigmoid(x_gate)
-        x = x.transpose(1, 2)
-        return x
-
-
-class CBAM(nn.Module):
-    def __init__(self, in_channels, reduction=16):
-        super(CBAM, self).__init__()
-        self.channel_attention = SEBlock1D(in_channels, reduction)
-        self.spatial_attention = nn.Sequential(
-            nn.Conv1d(in_channels, in_channels // reduction, kernel_size=7, padding=3),
-            nn.ReLU(inplace=True),
-            nn.Conv1d(in_channels // reduction, 1, kernel_size=7, padding=3),
-            nn.Sigmoid()
-        )
-
-    def forward(self, x):
-        x_out = self.channel_attention(x)
-        y = self.spatial_attention(x_out)
-        return x_out * y.expand_as(x_out)
-
 
 def perturb(x, mul=0.1):
     return F.dropout(x, mul, training=True)

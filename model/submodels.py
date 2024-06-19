@@ -1,7 +1,7 @@
 import torch
 import torch.nn as nn
 from .attentions import TransformerEncoder, TransformerDecoder, TemporalConvNet, TCNAttention, MultiHeadAttention, \
-    mask_to_causal_attention_mask, TransposeLayerNorm, AttentionPooling
+    mask_to_causal_attention_mask, TransposeLayerNorm, AttentionPooling, APTxS1, APTx
 from torch.nn.utils.rnn import pack_padded_sequence, pad_packed_sequence
 import torch.nn.functional as F
 
@@ -565,7 +565,7 @@ class DynamicDurationPredictor(nn.Module):
         self.final_drop = nn.Dropout(0.1)
         self.linear_projection = nn.Linear(self.tcn_output_channels, 1)
         self.entry_dropout = nn.Dropout(0.1)
-        self.do_em_cond = False
+        self.do_em_cond = False # keep this off, turning it on leads to overfitting
         if self.do_em_cond:
             self.em_cond = nn.Sequential(nn.Linear(emotion_size, num_inputs),
                                          nn.Dropout(0.2),)
@@ -622,30 +622,32 @@ class EmotionEncoder(nn.Module):
         # Pre-FFN design here because our attention reduces the sequence length to 1.
         self.feedforward = nn.Sequential(
             nn.Conv1d(input_dim, hidden_dim, 3, padding="same"),
-            nn.ReLU(),
+            APTxS1(trainable=True),
             nn.Dropout(0.1),
             nn.Conv1d(hidden_dim, input_dim, 1, padding="same"),
         )
         self.attention_pooling = AttentionPooling(input_dim)
+        self.norm = nn.LayerNorm(input_dim)
 
-    def forward(self, final_hids, mask=None):
+    def forward(self, x, mask=None):
         """
-        Encode the final_hids into a conditioning vector.
+        Encode the final hidden states into a conditioning vector.
 
         Args:
-            final_hids (torch.Tensor): Tensor of shape (batch, seq_len, channels).
+            x (torch.Tensor): Tensor of shape (batch, seq_len, channels).
             mask (torch.Tensor, optional): Tensor of shape (batch, seq_len), where True indicates padding.
 
         Returns:
             torch.Tensor: Tensor of shape (batch, 1, channels).
         """
         # Apply feedforward network
-        projected_hids = self.feedforward(final_hids.transpose(1,2)).transpose(1,2)  # Shape: (batch, seq_len, channels)
+        x = self.feedforward(x.transpose(1,2)).transpose(1,2)  # Shape: (batch, seq_len, channels)
+        x = self.norm(x)
 
         # Apply attention pooling
-        conditioning_vector, attn_weights = self.attention_pooling(projected_hids, mask)  # Shape: (batch, channels)
+        x, attn_weights = self.attention_pooling(x, mask)  # Shape: (batch, channels)
 
         # Add the extra dimension to match (batch, 1, channels)
-        conditioning_vector = conditioning_vector.unsqueeze(1)  # Shape: (batch, 1, channels)
+        x = x.unsqueeze(1)  # Shape: (batch, 1, channels)
 
-        return conditioning_vector
+        return x

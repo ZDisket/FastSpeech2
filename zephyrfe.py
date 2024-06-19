@@ -12,7 +12,7 @@ class ZephyrFrontEnd:
 
         Args:
             model_path (str): Path to the model checkpoint.
-            processor (EmotionProcessor): An instance of EmotionProcessor for text processing.
+            processor (EmotionProcessorV2): An instance of EmotionProcessor for text processing.
             device (str, optional): The device to use ('cpu' or 'cuda'). Defaults to 'cpu'.
         """
         self.device = device
@@ -30,7 +30,7 @@ class ZephyrFrontEnd:
             torch.nn.Module: The loaded model.
         """
         model = Zephyr(len(self.processor.char_to_index) + 1,
-                       13, n_heads=4, num_conv_layers=4, dropout=0.1,
+                       10, n_heads=4, num_conv_layers=4, dropout=0.1,
                        hidden_dim=256, kernel_sizes=[3, 3, 4, 5])
         ckpt = torch.load(model_path, map_location=self.device)
         model.load_state_dict(ckpt)

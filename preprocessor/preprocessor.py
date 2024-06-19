@@ -10,7 +10,7 @@ from scipy.interpolate import interp1d
 from sklearn.preprocessing import StandardScaler
 from tqdm import tqdm
 from zephyrfe import ZephyrFrontEnd
-from preprocessor.emotion import EmotionProcessor
+from preprocessor.emotion import EmotionProcessorV2
 
 import audio as Audio
 
@@ -26,7 +26,7 @@ class Preprocessor:
         self.zephyr_model = None
 
         if len(config["preprocessing"]["zephyr_model"]):
-            proc_em = EmotionProcessor()
+            proc_em = EmotionProcessorV2()
             self.zephyr_model = ZephyrFrontEnd(model_path=config["preprocessing"]["zephyr_model"], processor=proc_em)
 
 

@@ -15,7 +15,7 @@ from model.loss import LSGANLoss
 from dataset import Dataset
 from torch.cuda.amp import GradScaler, autocast
 from zephyrfe import ZephyrFrontEnd
-from preprocessor.emotion import EmotionProcessor
+from preprocessor.emotion import EmotionProcessorV2
 
 from evaluate import evaluate
 
@@ -99,7 +99,7 @@ def main(args, configs):
     vocoder = get_vocoder(model_config, device)
 
     if len(preprocess_config["preprocessing"]["zephyr_model"]):
-        proc_em = EmotionProcessor()
+        proc_em = EmotionProcessorV2()
         zephyr_model = ZephyrFrontEnd(model_path=preprocess_config["preprocessing"]["zephyr_model"], processor=proc_em)
 
     # Init logger

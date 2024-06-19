@@ -81,6 +81,58 @@ class EmotionProcessor:
                 print(f"Error processing {row}")
                 continue
 
+        return processed_data
 
+class EmotionProcessorV2:
+    def __init__(self, filepath=""):
+        self.filepath = filepath
+        self._punctuation = "!'(),.:;?~!*&\" "
+        self._letters = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz"
+        self.reserved_vocab = ["|", "/"]
+        self.char_to_index = self.build_char_to_index()
+        self._whitespace_re = re.compile(r'\s+')
+
+    def build_char_to_index(self):
+        vocabulary = list(self._letters) + list(self._punctuation)
+        total_vocab = vocabulary + self.reserved_vocab
+        return {char: idx for idx, char in enumerate(total_vocab)}
+
+    def clean_text(self, text):
+        # Remove mentions and URLs
+        cleaned_text = re.sub(r'@\w+|http[s]?://\S+', '', text)
+        cleaned_text = cleaned_text.replace("&amp", "").replace("&quot", "\"")
+        cleaned_text = re.sub(self._whitespace_re, ' ', cleaned_text)
+        cleaned_text = cleaned_text.strip()  # Remove leading and trailing whitespace
+        return cleaned_text
+
+    def text_to_sequence(self, text):
+        text = self.clean_text(text)
+        indices = [self.char_to_index.get(char, self.char_to_index['/']) for char in text if char in self.char_to_index]
+        indices.append(self.char_to_index['|'])
+        return np.array(indices, dtype=np.int32)
+
+    def is_valid_entry(self, row):
+        try:
+            float_columns = row[1:].astype(float)
+            return isinstance(row[0], str) and len(row) == 11 and sum(float_columns) > 0 and len(row[0]) < 180
+        except ValueError:
+            return False
+
+    def process_file(self):
+        processed_data = []
+
+        # Read the file using pandas
+        df = pd.read_csv(self.filepath, delimiter='|', header=None)
+
+        # Iterate over each row in the dataframe
+        for _, row in df.iterrows():
+            if self.is_valid_entry(row):
+                text_sequence = self.text_to_sequence(row[0])
+                emotion_values = row[1:].astype(float).to_numpy(dtype=np.float32)
+                processed_data.append((text_sequence, emotion_values))
 
         return processed_data
+
+    def save_to_numpy(self, output_file):
+        processed_data = self.process_file()
+        np.save(output_file, processed_data)
