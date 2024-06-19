@@ -466,7 +466,7 @@ class SpectrogramDecoder(nn.Module):
 
         if self.do_em_cond:
             self.em_cond = nn.Sequential(nn.Linear(emotion_size, filter_channels),
-                                         nn.Dropout(0.1),)
+                                         nn.Dropout(0.5),)
 
     # x_mask : True=exclude mask size (batch, mel_lens)
     # x: (batch, mel_lens, channels)
@@ -565,15 +565,10 @@ class DynamicDurationPredictor(nn.Module):
         self.final_drop = nn.Dropout(0.1)
         self.linear_projection = nn.Linear(self.tcn_output_channels, 1)
         self.entry_dropout = nn.Dropout(0.1)
-        self.do_em_cond = emotion_size > 0
+        self.do_em_cond = False
         if self.do_em_cond:
             self.em_cond = nn.Sequential(nn.Linear(emotion_size, num_inputs),
                                          nn.Dropout(0.2),)
-
-
-
-
-
 
     def forward(self, x, x_lengths, in_em):
         """

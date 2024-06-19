@@ -10,8 +10,7 @@ from .modules import VarianceAdaptor,  AlignmentEncoder, sequence_mask, binarize
 from utils.tools import get_mask_from_lengths
 from .submodels import TextEncoder, SpectrogramDecoder, EmotionEncoder
 from text.symbols import symbols
-import submodels
-
+from .submodels import sequence_mask as seq_mask2
 
 
 
@@ -108,7 +107,7 @@ class FastSpeech2(nn.Module):
         output = self.text_encoder(texts, src_lens, em_blocks, em_lens)
         encoded_text = output.clone()
 
-        em_mask = submodels.sequence_mask(em_hidden.size(1), em_lens)
+        em_mask = seq_mask2(em_hidden.size(1), em_lens)
         encoded_emotion = self.emotion_encoder(em_hidden, em_mask)
 
         # src_masks -> [batch, mxlen] => [batch, 1, mxlen]
@@ -189,7 +188,7 @@ class FastSpeech2(nn.Module):
 
         output = self.text_encoder(texts, src_lens, em_blocks, em_lens)
 
-        em_mask = submodels.sequence_mask(em_hidden.size(1), em_lens)
+        em_mask = seq_mask2(em_hidden.size(1), em_lens)
         encoded_emotion = self.emotion_encoder(em_hidden, em_mask)
 
         attn_soft, attn_logprob, attn_hard, attn_hard_dur = torch.zeros(1), torch.zeros(1), torch.zeros(1), torch.zeros(1)
@@ -221,7 +220,6 @@ class FastSpeech2(nn.Module):
             e_control,
             d_control,
         )
-
 
         output, mel_masks = self.decoder(output, mel_masks, encoded_emotion)
 
