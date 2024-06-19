@@ -1,6 +1,7 @@
 import torch
 import torch.nn as nn
-from .attentions import TransformerEncoder, TransformerDecoder, TemporalConvNet, TCNAttention, MultiHeadAttention, mask_to_causal_attention_mask, TransposeLayerNorm
+from .attentions import TransformerEncoder, TransformerDecoder, TemporalConvNet, TCNAttention, MultiHeadAttention, \
+    mask_to_causal_attention_mask, TransposeLayerNorm, AttentionPooling
 from torch.nn.utils.rnn import pack_padded_sequence, pad_packed_sequence
 import torch.nn.functional as F
 
@@ -226,7 +227,7 @@ class VariantDurationPredictor(nn.Module):
 
     # x = Encoder hidden states size (batch, seq_len, text_channels)
     # x_lengths = Lengths of x size (batch_size,)
-    def forward(self, x, x_lengths):
+    def forward(self, x, x_lengths, in_em):
         x = x.transpose(1, 2)  # (batch, seq_len, text_channels) => (batch, text_channels, seq_len)
 
         x_mask = lens_to_sequence_mask(x_lengths, x.size(2))
@@ -441,7 +442,7 @@ class TemporalVariancePredictor(nn.Module):
 
 class SpectrogramDecoder(nn.Module):
     def __init__(self, input_size, filter_channels, mel_channels, depth, heads, kernel_sizes, dropout=0.1,
-                 alibi_alpha=1.0, forward_expansion=4):
+                 alibi_alpha=1.0, forward_expansion=4, emotion_size=256):
         super(SpectrogramDecoder, self).__init__()
 
         self.input_size = input_size
@@ -461,10 +462,15 @@ class SpectrogramDecoder(nn.Module):
           #                            mode="conv", kernel_size=kernel_sizes, start_i=4)
 
         self.mel_fc = nn.Linear(filter_channels, mel_channels)
+        self.do_em_cond = emotion_size > 0
+
+        if self.do_em_cond:
+            self.em_cond = nn.Sequential(nn.Linear(emotion_size, filter_channels),
+                                         nn.Dropout(0.1),)
 
     # x_mask : True=exclude mask size (batch, mel_lens)
     # x: (batch, mel_lens, channels)
-    def forward(self, x, x_mask):
+    def forward(self, x, x_mask, in_em):
         orig_mask = x_mask.clone()
 
         conv_mask = x_mask.bool()
@@ -478,6 +484,9 @@ class SpectrogramDecoder(nn.Module):
         # Decoder pass
         if self.input_size != self.filter_channels:
             x = self.pre_fc(x)
+
+        if self.do_em_cond:
+            x = x + self.em_cond(in_em)
 
         x_mask = x_mask.transpose(1, 2)
 
@@ -527,7 +536,7 @@ class DynamicDurationPredictor(nn.Module):
     """
     def __init__(self, num_inputs, num_channels, kernel_sizes=[2, 2, 3], dropout=0.2, att_dropout=0.3, alibi_alpha=1.5,
                  start_i=0, heads=2, bidirectional=False, backwards_channels=[256, 256], backwards_heads=[2,2],
-                 backwards_kernel_sizes=[2, 3]):
+                 backwards_kernel_sizes=[2, 3], emotion_size=256):
         super(DynamicDurationPredictor, self).__init__()
 
         self.tcn_output_channels = num_channels[-1]
@@ -556,8 +565,17 @@ class DynamicDurationPredictor(nn.Module):
         self.final_drop = nn.Dropout(0.1)
         self.linear_projection = nn.Linear(self.tcn_output_channels, 1)
         self.entry_dropout = nn.Dropout(0.1)
+        self.do_em_cond = emotion_size > 0
+        if self.do_em_cond:
+            self.em_cond = nn.Sequential(nn.Linear(emotion_size, num_inputs),
+                                         nn.Dropout(0.2),)
 
-    def forward(self, x, x_lengths):
+
+
+
+
+
+    def forward(self, x, x_lengths, in_em):
         """
         Forward pass through the DynamicDurationPredictor
 
@@ -568,6 +586,9 @@ class DynamicDurationPredictor(nn.Module):
         """
         # Generate the appropriate mask for attention
         mask = sequence_mask(x.size(1), x_lengths)
+
+        if self.do_em_cond:
+            x = x + self.em_cond(in_em)
 
         if self.bidirectional:
             x_orig = x.clone()
@@ -598,3 +619,38 @@ class DynamicDurationPredictor(nn.Module):
         durations = durations.masked_fill(mask, 0)
 
         return durations, mask, x
+
+
+class EmotionEncoder(nn.Module):
+    def __init__(self, input_dim, hidden_dim):
+        super(EmotionEncoder, self).__init__()
+        # Pre-FFN design here because our attention reduces the sequence length to 1.
+        self.feedforward = nn.Sequential(
+            nn.Conv1d(input_dim, hidden_dim, 3, padding="same"),
+            nn.ReLU(),
+            nn.Dropout(0.1),
+            nn.Conv1d(hidden_dim, input_dim, 1, padding="same"),
+        )
+        self.attention_pooling = AttentionPooling(input_dim)
+
+    def forward(self, final_hids, mask=None):
+        """
+        Encode the final_hids into a conditioning vector.
+
+        Args:
+            final_hids (torch.Tensor): Tensor of shape (batch, seq_len, channels).
+            mask (torch.Tensor, optional): Tensor of shape (batch, seq_len), where True indicates padding.
+
+        Returns:
+            torch.Tensor: Tensor of shape (batch, 1, channels).
+        """
+        # Apply feedforward network
+        projected_hids = self.feedforward(final_hids.transpose(1,2)).transpose(1,2)  # Shape: (batch, seq_len, channels)
+
+        # Apply attention pooling
+        conditioning_vector, attn_weights = self.attention_pooling(projected_hids, mask)  # Shape: (batch, channels)
+
+        # Add the extra dimension to match (batch, 1, channels)
+        conditioning_vector = conditioning_vector.unsqueeze(1)  # Shape: (batch, 1, channels)
+
+        return conditioning_vector

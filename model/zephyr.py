@@ -1,7 +1,7 @@
 import torch
 import torch.nn as nn
 import torch.optim as optim
-from .attentions import MultiHeadAttention, APTx, ResidualBlock1D, RMSNorm, SwiGLUConvFFN
+from .attentions import MultiHeadAttention, APTx, ResidualBlock1D, RMSNorm, SwiGLUConvFFN, AttentionPooling
 from .submodels import sequence_mask, mask_to_attention_mask
 import torch.nn.functional as F
 
@@ -37,20 +37,7 @@ class ReduceSequenceLength(nn.Module):
 
         return output_tensor
 
-class AttentionPooling(nn.Module):
-    def __init__(self, hidden_dim):
-        super(AttentionPooling, self).__init__()
-        self.attention_weights = nn.Parameter(torch.Tensor(hidden_dim, 1))
-        nn.init.xavier_uniform_(self.attention_weights)
 
-    def forward(self, x, mask):
-        # x: (batch, seq_len, hidden_dim)
-        # mask: (batch, seq_len)
-        attn_scores = torch.matmul(x, self.attention_weights).squeeze(-1)  # (batch, seq_len)
-        attn_scores = attn_scores.masked_fill(mask, float('-inf'))
-        attn_weights = torch.softmax(attn_scores, dim=-1).unsqueeze(-1)  # (batch, seq_len, 1)
-        context = torch.sum(attn_weights * x, dim=1)  # (batch, hidden_dim)
-        return context, attn_weights
 
 
 class Zephyr(nn.Module):

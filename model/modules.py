@@ -494,6 +494,7 @@ class VarianceAdaptor(nn.Module):
             x,
             src_mask,
             src_lens,
+            in_emotion=None,
             mel_mask=None,
             max_len=None,
             pitch_target=None,
@@ -503,7 +504,7 @@ class VarianceAdaptor(nn.Module):
             e_control=1.0,
             d_control=1.0,
     ):
-        log_duration_prediction, x_mask, dur_hidden = self.duration_predictor(x, src_lens)
+        log_duration_prediction, x_mask, dur_hidden = self.duration_predictor(x, src_lens, in_emotion)
 
 
         if self.pitch_feature_level == "phoneme_level":

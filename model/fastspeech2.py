@@ -8,9 +8,9 @@ import torch.nn.functional as F
 from transformer import Encoder, Decoder, PostNet
 from .modules import VarianceAdaptor,  AlignmentEncoder, sequence_mask, binarize_attention_parallel
 from utils.tools import get_mask_from_lengths
-from .submodels import TextEncoder, SpectrogramDecoder
+from .submodels import TextEncoder, SpectrogramDecoder, EmotionEncoder
 from text.symbols import symbols
-
+import submodels
 
 
 
@@ -43,6 +43,8 @@ class FastSpeech2(nn.Module):
                                           model_config["transformer"]["decoder_dropout"],
                                           alibi_alpha=1.25)
 
+        self.emotion_channels = 256 # must change
+        self.emotion_encoder = EmotionEncoder(self.emotion_channels, self.emotion_channels * 2)
         self.mel_linear = nn.Identity()
 
         self.postnet = PostNet(n_mel_channels=preprocess_config["preprocessing"]["mel"]["n_mel_channels"])
@@ -106,6 +108,9 @@ class FastSpeech2(nn.Module):
         output = self.text_encoder(texts, src_lens, em_blocks, em_lens)
         encoded_text = output.clone()
 
+        em_mask = submodels.sequence_mask(em_hidden.size(1), em_lens)
+        encoded_emotion = self.emotion_encoder(em_hidden, em_mask)
+
         # src_masks -> [batch, mxlen] => [batch, 1, mxlen]
         if mels is not None:
             attn_soft, attn_logprob, attn_hard, attn_hard_dur = self.run_aligner(output, src_lens, src_masks.unsqueeze(1), mels,
@@ -133,6 +138,7 @@ class FastSpeech2(nn.Module):
             output,
             src_masks,
             src_lens,
+            encoded_emotion,
             mel_masks,
             max_mel_len,
             p_targets,
@@ -143,8 +149,7 @@ class FastSpeech2(nn.Module):
             d_control,
         )
 
-        output, mel_masks = self.decoder(output, mel_masks)
-        output = self.mel_linear(output)
+        output, mel_masks = self.decoder(output, mel_masks, encoded_emotion)
 
         postnet_output = self.postnet(output) + output
 
@@ -184,6 +189,9 @@ class FastSpeech2(nn.Module):
 
         output = self.text_encoder(texts, src_lens, em_blocks, em_lens)
 
+        em_mask = submodels.sequence_mask(em_hidden.size(1), em_lens)
+        encoded_emotion = self.emotion_encoder(em_hidden, em_mask)
+
         attn_soft, attn_logprob, attn_hard, attn_hard_dur = torch.zeros(1), torch.zeros(1), torch.zeros(1), torch.zeros(1)
 
         if self.speaker_emb is not None:
@@ -203,6 +211,7 @@ class FastSpeech2(nn.Module):
             output,
             src_masks,
             src_lens,
+            encoded_emotion,
             mel_masks,
             None,
             None,
@@ -214,8 +223,7 @@ class FastSpeech2(nn.Module):
         )
 
 
-        output, mel_masks = self.decoder(output, mel_masks)
-        output = self.mel_linear(output)
+        output, mel_masks = self.decoder(output, mel_masks, encoded_emotion)
 
         postnet_output = self.postnet(output) + output
 
