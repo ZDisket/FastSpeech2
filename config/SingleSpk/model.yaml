@@ -51,6 +51,7 @@ variance_embedding:
 
 multi_speaker: False
 max_seq_len: 1000
+emotion_size: 256
 
 vocoder:
   model: "iSTFTNet" # support 'HiFi-GAN', 'MelGAN'

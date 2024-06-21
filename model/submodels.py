@@ -30,6 +30,7 @@ class StochasticDropout(nn.Module):
     """
     Also known as Monte Carlo dropout, StochasticDropout keeps a lower dropout rate to apply during inference, for stochasticity.
     If not specified, it will be dropout / 3, with the minimum being 0.1
+    Note: Currently unused
     """
 
     def __init__(self, p=0.5, p_inference=None, min_p_inference=0.1, stochastic=False):
@@ -56,48 +57,58 @@ class TextEncoder(nn.Module):
     def __init__(self, vocab_size, embed_size, num_heads, num_layers, forward_expansion, dropout, alibi_alpha=1.0,
                  start_i=0, emotion_channels=256):
         super(TextEncoder, self).__init__()
-        self.embed = nn.Embedding(vocab_size, embed_size)
-        self.emb_norm = nn.LayerNorm(embed_size)
+        self.embed = NormalizedEmbedding(vocab_size, embed_size)
         self.encoder = TransformerEncoder(embed_size, num_heads, num_layers, forward_expansion, dropout,
                                           alibi_alpha=alibi_alpha, start_i=start_i, kernel_size=[3, 1])
-        self.dropout = StochasticDropout(dropout)
+        self.dropout = nn.Dropout(dropout)
         self.layer_norm = nn.LayerNorm(embed_size)
-        self.cond_heads = 4
-        self.cond_head_size = embed_size // self.cond_heads
 
-        self.em_proj = nn.Sequential(
-            nn.Conv2d(emotion_channels, self.cond_head_size, 1, padding="same"),
-            nn.ReLU(),
-            nn.Dropout(0.1),
-        )
-        self.cond_att = MultiHeadAttention(embed_size, self.cond_heads, alibi_alpha=1.5, start_i_increment=4, num_persistent=16)
-        self.cond_drop = nn.Dropout(0.25)
+        self.emotion_channels = emotion_channels
+
+        if self.emotion_channels > 0:
+            self.cond_heads = 4
+            self.cond_head_size = embed_size // self.cond_heads
+            inter_size = emotion_channels // 2
+
+            self.em_proj = nn.Sequential(
+                nn.Conv2d(emotion_channels, inter_size, 1, padding="same"),
+                nn.ReLU(),
+                nn.Dropout(0.1),
+                nn.Conv2d(inter_size, self.cond_head_size, 1, padding="same"),
+                nn.ReLU(),
+                nn.Dropout(0.1),
+            )
+
+            self.cond_att = MultiHeadAttention(embed_size, self.cond_heads, alibi_alpha=1.5, start_i_increment=4,
+                                               num_persistent=16)
+            self.cond_drop = nn.Dropout(0.5)
+            self.em_norm = nn.LayerNorm([self.cond_heads, self.cond_head_size])
 
     def forward(self, token_ids, seq_lens, em_blocks, em_lens):
         # Embed token_ids
         x = self.embed(token_ids)  # Shape: (batch, max_seq_len, embed_size)
-        x = self.emb_norm(x)
-        x = self.dropout(x)
 
         # Create a mask based on sequence lengths
         max_len = token_ids.size(1)
         mask = torch.arange(max_len, device=seq_lens.device).expand(len(seq_lens), max_len) >= seq_lens.unsqueeze(1)
 
-        x_mask, y_mask = sequence_mask(max_len, seq_lens), sequence_mask(em_blocks.size(2), em_lens)
-
         #   ======================== ZEPHYR CONDITIONING ========================
         # em_blocks = [batch, n_blocks, seq_len, hidden]
 
-        em_blocks = em_blocks.transpose(1, 3) # ==> (batch, hidden, seq_len, n_blocks)
-        y = self.em_proj(em_blocks)
+        if self.emotion_channels > 0:
+            x_mask, y_mask = sequence_mask(max_len, seq_lens), sequence_mask(em_blocks.size(2), em_lens)
+            em_blocks = em_blocks.transpose(1, 3)  # ==> (batch, hidden, seq_len, n_blocks)
+            y = self.em_proj(em_blocks)
 
-        # Attention-on-Blocks
-        y = y.permute(0, 2, 3, 1) # ==> (batch, seq_len, n_blocks, hidden)
-        xy_att_mask = expand_masks(x_mask, y_mask)
+            # Attention-on-Blocks
+            y = y.permute(0, 2, 3, 1)  # ==> (batch, seq_len, n_blocks, hidden)
+            y = self.em_norm(y)
+            xy_att_mask = expand_masks(x_mask, y_mask)
 
-        xy_att = self.cond_att(y, y, x, mask=xy_att_mask)
-        xy_att = self.cond_drop(xy_att)
-        x = x + xy_att
+            xy_att = self.cond_att(y, y, x, mask=xy_att_mask)
+            xy_att = self.cond_drop(xy_att)
+            x = x + xy_att
+
 
         #   ======================== ZEPHYR CONDITIONING ========================
 
@@ -195,7 +206,7 @@ class VariantDurationPredictor(nn.Module):
 
         if conv_depth > 0:
             self.pre_convs = SConvNorm(filter_channels, num_layers=conv_depth, kernel_size=kernel_size)
-            self.post_conv_drop = StochasticDropout(p_dropout)
+            self.post_conv_drop = nn.Dropout(p_dropout)
         else:
             print("Not using pre convs")
             self.pre_convs = nn.Identity()
@@ -218,7 +229,7 @@ class VariantDurationPredictor(nn.Module):
 
         self.out_proj = nn.Conv1d(in_channels=lstm_channels, out_channels=1, kernel_size=1)
 
-        self.final_dropout = StochasticDropout(final_dropout)
+        self.final_dropout = nn.Dropout(final_dropout)
         self.use_pre_proj = False
 
         if text_channels != filter_channels:
@@ -324,7 +335,7 @@ class TemporalVariancePredictor(nn.Module):
         # Multiplicative dilation growth gives the best balance between coverage and accuracy.
         self.tcn = TemporalConvNet(input_channels, num_channels, kernel_size=kernel_size, dropout=dropout,
                                    dilation_growth="mul", use_se=True)
-        self.final_drop = StochasticDropout(dropout)
+        self.final_drop = nn.Dropout(dropout)
         self.cond_input_size = cond_input_size
         self.input_channels = input_channels
 
@@ -564,7 +575,6 @@ class DynamicDurationPredictor(nn.Module):
 
         self.final_drop = nn.Dropout(0.1)
         self.linear_projection = nn.Linear(self.tcn_output_channels, 1)
-        self.entry_dropout = nn.Dropout(0.1)
         self.do_em_cond = False # keep this off, turning it on leads to overfitting
         if self.do_em_cond:
             self.em_cond = nn.Sequential(nn.Linear(emotion_size, num_inputs),
@@ -588,7 +598,6 @@ class DynamicDurationPredictor(nn.Module):
         if self.bidirectional:
             x_orig = x.clone()
 
-        x = self.entry_dropout(x)
         # Pass input through the TCNAttention layer
         x = self.tcn_attention(x, mask)
 

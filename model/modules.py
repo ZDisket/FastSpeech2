@@ -450,16 +450,12 @@ class VarianceAdaptor(nn.Module):
             )
 
         # I'll make these into NormalizedEmbeddings later
-        self.pitch_embedding = nn.Embedding(
+        self.pitch_embedding = NormalizedEmbedding(
             n_bins, model_config["transformer"]["encoder_hidden"]
         )
-        self.pitch_norm = nn.LayerNorm(model_config["transformer"]["encoder_hidden"])
-        self.energy_embedding = nn.Embedding(
+        self.energy_embedding = NormalizedEmbedding(
             n_bins, model_config["transformer"]["encoder_hidden"]
         )
-        self.energy_norm = nn.LayerNorm(model_config["transformer"]["encoder_hidden"])
-
-        self.pitch_energy_drop = nn.Dropout(model_config["variance_predictor"]["dropout_on_emb"])
 
     def get_pitch_embedding(self, x, target, mask, control, y, y_mask):
         prediction = self.pitch_predictor(x, mask, y, y_mask)
@@ -471,8 +467,6 @@ class VarianceAdaptor(nn.Module):
                 torch.bucketize(prediction, self.pitch_bins)
             )
 
-        embedding = self.pitch_norm(embedding)
-        embedding = self.pitch_energy_drop(embedding)
         return prediction, embedding
 
     def get_energy_embedding(self, x, target, mask, control, y, y_mask):
@@ -485,8 +479,6 @@ class VarianceAdaptor(nn.Module):
                 torch.bucketize(prediction, self.energy_bins)
             )
 
-        embedding = self.energy_norm(embedding)
-        embedding = self.pitch_energy_drop(embedding)
         return prediction, embedding
 
     def forward(

@@ -150,7 +150,7 @@ class SwiGLUConvFFN(nn.Module):
         out_features = out_features or in_features
         hidden_features = hidden_features or in_features
 
-        valid_acts = ["swiglu", "relu2", "aptx", "relu", "dprelu"]
+        valid_acts = ["swiglu", "relu2", "aptx", "relu", "dprelu", "aptxs1"]
 
         if act not in valid_acts:
             raise ValueError(f"Unknown activation {act}. Valid activations are {valid_acts}")
@@ -163,22 +163,20 @@ class SwiGLUConvFFN(nn.Module):
         self.drop = nn.Dropout(drop)
         self.act = act
 
-        self.aptx = APTx(trainable=True) if act == "aptx" else nn.Identity()
-        self.dprelu = DPReLU() if act == "dprelu" else nn.Identity()
-
         # wall of if statements
         # I swear im not yanderedev
         if act == "swiglu":
             self.act_fn = self._swiglu
         elif act == "relu2":
             self.act_fn = self._relu2
-        elif act == "aptx":
+        elif act == "aptx" or act == "aptxs1":
+            self.aptx = APTx(trainable=True) if act == "aptx" else APTxS1(trainable=True)
             self.act_fn = self._aptx
         elif act == "relu":
             self.act_fn = self._relu
         elif act == "dprelu":
+            self.dprelu = DPReLU()
             self.act_fn = self._dprelu
-
 
         if causal:
             self.padding = self._causal_padding

@@ -6,12 +6,11 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from transformer import Encoder, Decoder, PostNet
-from .modules import VarianceAdaptor,  AlignmentEncoder, sequence_mask, binarize_attention_parallel
+from .modules import VarianceAdaptor, AlignmentEncoder, sequence_mask, binarize_attention_parallel
 from utils.tools import get_mask_from_lengths
 from .submodels import TextEncoder, SpectrogramDecoder, EmotionEncoder
 from text.symbols import symbols
 from .submodels import sequence_mask as seq_mask2
-
 
 
 class FastSpeech2(nn.Module):
@@ -20,6 +19,7 @@ class FastSpeech2(nn.Module):
     def __init__(self, preprocess_config, model_config):
         super(FastSpeech2, self).__init__()
         self.model_config = model_config
+        self.emotion_channels = model_config["emotion_size"]
 
         self.text_encoder = TextEncoder(
             len(symbols) + 1,
@@ -30,6 +30,7 @@ class FastSpeech2(nn.Module):
             model_config["transformer"]["encoder_dropout"],
             1.5,
             3,
+            emotion_channels=self.emotion_channels,
         )
         self.variance_adaptor = VarianceAdaptor(preprocess_config, model_config)
 
@@ -40,25 +41,27 @@ class FastSpeech2(nn.Module):
                                           model_config["transformer"]["decoder_head"],
                                           model_config["transformer"]["decoder_kernel_sizes"],
                                           model_config["transformer"]["decoder_dropout"],
-                                          alibi_alpha=1.25)
+                                          alibi_alpha=1.25,
+                                          emotion_size=self.emotion_channels)
 
-        self.emotion_channels = 256 # must change
-        self.emotion_encoder = EmotionEncoder(self.emotion_channels, self.emotion_channels * 2)
+        self.emotion_encoder = EmotionEncoder(self.emotion_channels,
+                                              self.emotion_channels * 2) if self.emotion_channels > 0 else None
         self.mel_linear = nn.Identity()
 
         self.postnet = PostNet(n_mel_channels=preprocess_config["preprocessing"]["mel"]["n_mel_channels"])
 
         self.aligner = AlignmentEncoder(n_mel_channels=preprocess_config["preprocessing"]["mel"]["n_mel_channels"],
                                         n_text_channels=model_config["transformer"]["encoder_hidden"],
-                                        n_att_channels=preprocess_config["preprocessing"]["mel"]["n_mel_channels"], temperature=0.0005)
+                                        n_att_channels=preprocess_config["preprocessing"]["mel"]["n_mel_channels"],
+                                        temperature=0.0005)
 
         self.speaker_emb = None
         if model_config["multi_speaker"]:
             with open(
-                os.path.join(
-                    preprocess_config["path"]["preprocessed_path"], "speakers.json"
-                ),
-                "r",
+                    os.path.join(
+                        preprocess_config["path"]["preprocessed_path"], "speakers.json"
+                    ),
+                    "r",
             ) as f:
                 n_speaker = len(json.load(f))
             self.speaker_emb = nn.Embedding(
@@ -68,34 +71,34 @@ class FastSpeech2(nn.Module):
 
     @torch.jit.unused
     def run_aligner(self, text_emb, text_len, text_mask, spect, spect_len, attn_prior):
-      text_emb = text_emb.permute(0, 2, 1)
-      text_mask = text_mask.permute(0, 2, 1) # [b, 1, mxlen] => [b, mxlen, 1]
-      spect = spect.permute(0,2,1)  #[b, mel_len, channels] => [b, channels, mel_len]
-      attn_soft, attn_logprob = self.aligner(
-                                # note: text_mask is MASK=TRUE, do NOT invert it!!!!
-          spect, text_emb, mask=text_mask, attn_prior=attn_prior,conditioning=None
-      )
-      attn_hard = binarize_attention_parallel(attn_soft, text_len, spect_len)
-      attn_hard_dur = attn_hard.sum(2)
-      return attn_soft, attn_logprob, attn_hard, attn_hard_dur
+        text_emb = text_emb.permute(0, 2, 1)
+        text_mask = text_mask.permute(0, 2, 1)  # [b, 1, mxlen] => [b, mxlen, 1]
+        spect = spect.permute(0, 2, 1)  # [b, mel_len, channels] => [b, channels, mel_len]
+        attn_soft, attn_logprob = self.aligner(
+            # note: text_mask is MASK=TRUE, do NOT invert it!!!!
+            spect, text_emb, mask=text_mask, attn_prior=attn_prior, conditioning=None
+        )
+        attn_hard = binarize_attention_parallel(attn_soft, text_len, spect_len)
+        attn_hard_dur = attn_hard.sum(2)
+        return attn_soft, attn_logprob, attn_hard, attn_hard_dur
 
     def forward(
-        self,
-        speakers,
-        texts,
-        src_lens,
-        max_src_len,
-        mels=None,
-        mel_lens=None,
-        max_mel_len=None,
-        p_targets=None,
-        e_targets=None,
-        em_blocks=None,
-        em_hidden=None,
-        em_lens=None,
-        p_control=1.0,
-        e_control=1.0,
-        d_control=1.0,
+            self,
+            speakers,
+            texts,
+            src_lens,
+            max_src_len,
+            mels=None,
+            mel_lens=None,
+            max_mel_len=None,
+            p_targets=None,
+            e_targets=None,
+            em_blocks=None,
+            em_hidden=None,
+            em_lens=None,
+            p_control=1.0,
+            e_control=1.0,
+            d_control=1.0,
     ):
         src_masks = get_mask_from_lengths(src_lens, max_src_len)
         mel_masks = (
@@ -108,17 +111,17 @@ class FastSpeech2(nn.Module):
         encoded_text = output.clone()
 
         em_mask = seq_mask2(em_hidden.size(1), em_lens)
-        encoded_emotion = self.emotion_encoder(em_hidden, em_mask)
+        encoded_emotion = self.emotion_encoder(em_hidden, em_mask) if self.emotion_channels > 0 else torch.zeros(1)
 
         # src_masks -> [batch, mxlen] => [batch, 1, mxlen]
         if mels is not None:
-            attn_soft, attn_logprob, attn_hard, attn_hard_dur = self.run_aligner(output, src_lens, src_masks.unsqueeze(1), mels,
-                                                                             mel_lens, None)
+            attn_soft, attn_logprob, attn_hard, attn_hard_dur = self.run_aligner(output, src_lens,
+                                                                                 src_masks.unsqueeze(1), mels,
+                                                                                 mel_lens, None)
             total_durs = attn_hard_dur.sum(1)
         else:
-            attn_soft, attn_logprob, attn_hard, attn_hard_dur, total_durs = torch.zeros(1), torch.zeros(1), torch.zeros(1), torch.zeros(1), None
-
-
+            attn_soft, attn_logprob, attn_hard, attn_hard_dur, total_durs = torch.zeros(1), torch.zeros(1), torch.zeros(
+                1), torch.zeros(1), None
 
         if self.speaker_emb is not None:
             output = output + self.speaker_emb(speakers).unsqueeze(1).expand(
@@ -171,17 +174,17 @@ class FastSpeech2(nn.Module):
         )
 
     def infer(
-        self,
-        speakers,
-        texts,
-        src_lens,
-        max_src_len,
-        em_blocks=None,
-        em_hidden=None,
-        em_lens=None,
-        p_control=1.0,
-        e_control=1.0,
-        d_control=1.0,
+            self,
+            speakers,
+            texts,
+            src_lens,
+            max_src_len,
+            em_blocks=None,
+            em_hidden=None,
+            em_lens=None,
+            p_control=1.0,
+            e_control=1.0,
+            d_control=1.0,
     ):
         src_masks = get_mask_from_lengths(src_lens, max_src_len)
         mel_masks = None
@@ -189,7 +192,7 @@ class FastSpeech2(nn.Module):
         output = self.text_encoder(texts, src_lens, em_blocks, em_lens)
 
         em_mask = seq_mask2(em_hidden.size(1), em_lens)
-        encoded_emotion = self.emotion_encoder(em_hidden, em_mask)
+        encoded_emotion = self.emotion_encoder(em_hidden, em_mask) if self.emotion_channels > 0 else torch.zeros(1)
 
         attn_soft, attn_logprob, attn_hard, attn_hard_dur = torch.zeros(1), torch.zeros(1), torch.zeros(1), torch.zeros(1)
 
