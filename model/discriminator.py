@@ -49,13 +49,14 @@ class AdvSeqDiscriminator(nn.Module):
     Use n_heads=0 for no attention
     """
 
-    def __init__(self, num_channels=1, num_conv_layers=3, conv_kernel_size=3, hidden_dim=128, dropout=0.3, n_heads=4, att_dropout=0.3):
+    def __init__(self, num_channels=1, num_conv_layers=3, conv_kernel_size=[3, 3, 3], hidden_dim=128, dropout=0.3, n_heads=4, att_dropout=0.3):
         super(AdvSeqDiscriminator, self).__init__()
 
         self.proj = nn.Linear(num_channels, hidden_dim)
         self.att_drop = nn.Dropout(att_dropout)
         self.drop1 = nn.Dropout(0.1)
         self.n_heads = n_heads
+
 
         if self.n_heads > 0:
             self.attention = MultiHeadAttention(hidden_dim, self.n_heads, alibi_alpha=1.5, start_i_increment=4, num_persistent=16)
@@ -65,19 +66,20 @@ class AdvSeqDiscriminator(nn.Module):
 
         self.blocks = nn.ModuleList(
             [
-                ResidualBlock1D(in_channels, in_channels, kernel_size=conv_kernel_size, dropout=dropout) for _ in range(num_conv_layers)
+                ResidualBlock1D(in_channels, in_channels, kernel_size=conv_kernel_size[i], dropout=dropout) for i in range(num_conv_layers)
             ])
 
         self.fc = nn.Sequential(
             nn.Linear(hidden_dim, 1),
         )
 
-    def forward(self, x, seq_lens, hidden_in=None):
+    def forward(self, x, seq_lens, hidden_in=None, emotion_in=None):
         """
         Forward pass through the sequence-level discriminator with masked global average pooling.
         :param x: Durations (real or fake), size (batch, seq_len)
         :param seq_lens: Int tensor of length for each batch, size (batch,)
         :param hidden_in: Text hidden states, (batch, seq_len, channels)
+        :param emotion_in: Emotion hidden states, (batch, 1, channels)
         :return: Probability that each sequence is real, size (batch, 1).
         """
         x_mask = sequence_mask(x.size(1), seq_lens)
@@ -88,6 +90,9 @@ class AdvSeqDiscriminator(nn.Module):
 
         if hidden_in is not None:
             x = x + hidden_in[:, :x.size(1), :]
+
+        if emotion_in is not None:
+            x = x + emotion_in
 
         if self.n_heads > 0:
             x_att = self.attention(x, x, x, mask=att_mask)
@@ -134,18 +139,22 @@ class AdvSeqDiscriminator(nn.Module):
 
 
 class DualDiscriminator(nn.Module):
-    def __init__(self, text_hidden=256, num_channels=1, num_blocks=3, hidden_dim=128, n_heads=4, dropout=0.3):
+    def __init__(self, text_hidden=256, num_channels=1, num_blocks=3, hidden_dim=128, n_heads=4, dropout=0.3, kernel_size=[3, 3, 3], emotion_hidden=256):
         super(DualDiscriminator, self).__init__()
 
         if text_hidden > 0:
             self.text_compress = nn.Conv1d(text_hidden, hidden_dim, 3, padding="same") if text_hidden != hidden_dim else nn.Identity()
 
-        self.sequence_discriminator = AdvSeqDiscriminator(num_channels, num_conv_layers=num_blocks,
-                                                          hidden_dim=hidden_dim, n_heads=n_heads, dropout=dropout)
-        self.difference_discriminator = AdvSeqDiscriminator(num_channels, num_conv_layers=num_blocks,
-                                                            hidden_dim=hidden_dim, n_heads=n_heads, dropout=dropout)
+        self.em_proj = nn.Sequential(nn.Linear(emotion_hidden, hidden_dim),
+                                     nn.ReLU(inplace=True),
+                                     nn.Dropout(0.5),)
 
-    def forward(self, x, seq_lens, text_hidden=None):
+        self.sequence_discriminator = AdvSeqDiscriminator(num_channels, num_conv_layers=num_blocks,
+                                                          hidden_dim=hidden_dim, n_heads=n_heads, dropout=dropout, conv_kernel_size=kernel_size)
+        self.difference_discriminator = AdvSeqDiscriminator(num_channels, num_conv_layers=num_blocks,
+                                                            hidden_dim=hidden_dim, n_heads=n_heads, dropout=dropout,  conv_kernel_size=kernel_size)
+
+    def forward(self, x, seq_lens, text_hidden=None, em_hidden=None):
         """
         Forward pass
         :param x:
@@ -158,15 +167,18 @@ class DualDiscriminator(nn.Module):
                 text_hidden.transpose(1, 2)
             ).transpose(1, 2)
 
+        if em_hidden is not None:
+            em_hidden = self.em_proj(em_hidden)
+
         # Forward pass through sequence discriminator
-        sequence_score = self.sequence_discriminator(x, seq_lens, text_hidden)
+        sequence_score = self.sequence_discriminator(x, seq_lens, text_hidden, em_hidden)
 
         # Compute consecutive differences for the difference discriminator
         diff_x = x[:, :1] - x[:, :-1]
         diff_seq_lens = seq_lens - 1  # Adjust sequence lengths for differences
 
         # Forward pass through difference discriminator
-        difference_score = self.difference_discriminator(diff_x, diff_seq_lens, text_hidden)
+        difference_score = self.difference_discriminator(diff_x, diff_seq_lens, text_hidden, em_hidden)
 
         # Concatenate both scores
         combined_score = torch.cat((sequence_score, difference_score), dim=1)

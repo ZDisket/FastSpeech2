@@ -1,8 +1,8 @@
 """ from https://github.com/keithito/tacotron """
 import re
 from text import cleaners
-from text.symbols import symbols
-
+from text.symbols import symbols, _pad
+import string
 
 # Mappings from symbol to numeric ID and vice versa:
 _symbol_to_id = {s: i for i, s in enumerate(symbols)}
@@ -10,7 +10,18 @@ _id_to_symbol = {i: s for i, s in enumerate(symbols)}
 
 # Regular expression matching text enclosed in curly braces:
 _curly_re = re.compile(r"(.*?)\{(.+?)\}(.*)")
+_ponct = ",.:;?!"
 
+_translation_table = translation_table = str.maketrans(
+        {punct: f"{_pad}{punct}{_pad}" for punct in _ponct}
+    )
+
+def remove_trailing_punctuation(s):
+    # Check if the string ends with any punctuation mark
+    if s and s[-1] in _ponct:
+        # Remove the punctuation mark
+        return s[:-1]
+    return s
 
 def text_to_sequence(text, cleaner_names):
     """Converts a string of text to a sequence of IDs corresponding to the symbols in the text.
@@ -57,6 +68,8 @@ def cleaned_text_to_sequence(text, cleaner_names):
     """
 
     sequence = []
+    #text = remove_trailing_punctuation(text)
+   # text = text.translate(_translation_table)
 
     # Check for curly braces and treat their contents as ARPAbet:
     while len(text):
@@ -71,7 +84,6 @@ def cleaned_text_to_sequence(text, cleaner_names):
 
     sequence.extend(_arpabet_to_sequence("end"))
     return sequence
-
 
 def sequence_to_text(sequence):
     """Converts a sequence of IDs back to a string"""
@@ -104,4 +116,4 @@ def _arpabet_to_sequence(text):
 
 
 def _should_keep_symbol(s):
-    return s in _symbol_to_id and s != "_" and s != "~"
+    return s in _symbol_to_id and s != "~"

@@ -15,6 +15,36 @@ matplotlib.use("Agg")
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 from text import text_to_sequence, sequence_to_text, cleaned_text_to_sequence
 
+# GPT-4 wrote this hyper-optimized voodoo function. It's 10x faster than a naive loop-based impl
+# (0.5s vs 0.05s). Back in the days before that I would've had to write a numba guvectorize function.
+def compute_phoneme_level_features_optimized(duration, mel_pitch):
+    """
+    Convert mel-level features (mostly pitch/energy) into phoneme-level using durations to average.
+    Note that masking is not taken into account, apply it in your loss function
+
+    :param duration: Predicted int/long durations tensor shape (batch, text_len)
+    :param mel_pitch: Predicted mel-level float features tensor shape (batch, mel_len)
+    :return: Phoneme-level features float tensor shape (batch, text_len)
+    """
+    batch_size, phoneme_len = duration.shape
+
+    # Compute the cumulative sum of durations to get the end indices of each phoneme
+    cumsum_durations = torch.cumsum(duration, dim=1)
+    start_indices = torch.cat(
+        [torch.zeros((batch_size, 1), device=duration.device, dtype=duration.dtype), cumsum_durations[:, :-1]], dim=1)
+
+    # Create a mask to select pitch values for each phoneme
+    mask = (torch.arange(mel_pitch.size(1), device=mel_pitch.device).view(1, 1, -1) < cumsum_durations.unsqueeze(2)) & (
+                torch.arange(mel_pitch.size(1), device=mel_pitch.device).view(1, 1, -1) >= start_indices.unsqueeze(2))
+
+    # Compute phoneme-level pitch
+    masked_pitch = mel_pitch.unsqueeze(1) * mask.float()
+    sum_pitch = masked_pitch.sum(dim=2)
+    count_pitch = mask.sum(dim=2).float()
+
+    phoneme_pitch = sum_pitch / (count_pitch + 1e-9)  # Add a small value to avoid division by zero
+
+    return phoneme_pitch
 
 def to_device(data, device):
     if len(data) == 11 + 3:
@@ -310,19 +340,17 @@ def plot_mel(data, stats, titles):
 
     return fig
 
-
-def pad_zephyr_outputs(hidden_blocks_list, final_hids_list):
+def pad_zephyr_outputs(hidden_blocks_list):
     """
     Zero-pads lists of numpy arrays along the sequence length dimension and returns their lengths.
 
     Args:
         hidden_blocks_list (list of np.ndarray): List of arrays with shape (1, 4, seq_len, hidden_dim).
-        final_hids_list (list of np.ndarray): List of arrays with shape (1, seq_len, hidden_dim).
 
     Returns:
-        tuple: Two numpy arrays, zero-padded along the sequence length dimension, and an array of lengths.
+        tuple: A numpy array, zero-padded along the sequence length dimension, and an array of lengths.
     """
-    # Determine the maximum sequence length in both lists
+    # Determine the maximum sequence length in the list
     max_seq_len = max(arr.shape[2] for arr in hidden_blocks_list)
 
     # Get lengths of each sequence
@@ -335,18 +363,10 @@ def pad_zephyr_outputs(hidden_blocks_list, final_hids_list):
         padded_arr = np.pad(arr, pad_width, mode='constant', constant_values=0)
         padded_hidden_blocks.append(padded_arr)
 
-    # Pad final_hids_list
-    padded_final_hids = []
-    for arr in final_hids_list:
-        pad_width = ((0, 0), (0, max_seq_len - arr.shape[1]), (0, 0))
-        padded_arr = np.pad(arr, pad_width, mode='constant', constant_values=0)
-        padded_final_hids.append(padded_arr)
-
-    # Convert lists to numpy arrays
+    # Convert list to numpy array
     padded_hidden_blocks = np.concatenate(padded_hidden_blocks, axis=0)
-    padded_final_hids = np.concatenate(padded_final_hids, axis=0)
 
-    return padded_hidden_blocks, padded_final_hids, lengths
+    return padded_hidden_blocks, lengths
 
 def pad_1D(inputs, PAD=0):
     def pad_data(x, length, PAD):
@@ -415,9 +435,10 @@ def fs2_infer(inmodel, text, in_blocks, in_hid):
     text = torch.IntTensor(text).to(device)
     em_len = torch.from_numpy(np.array([in_hid.shape[1]])).to(device)
     in_blocks = torch.from_numpy(in_blocks).to(device)
-    in_hid = torch.from_numpy(in_hid).to(device)
+    in_hid = torch.from_numpy(in_hid).to(device).unsqueeze(0)
+    speakers = torch.IntTensor([0])
 
-    predictions = inmodel.infer([0], text, src_len, src_len[0], in_blocks, in_hid, em_len)
+    predictions = inmodel.infer(speakers, text, src_len, src_len[0], in_blocks, in_hid, em_len)
     mel, mel_postnet = predictions[0], predictions[1]
 
     mel_torch = mel.transpose(1, 2).detach()

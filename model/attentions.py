@@ -1,9 +1,10 @@
 from math import sqrt
-from typing import Optional
+from typing import Optional, Tuple
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torch import Tensor
 from torch.nn.utils import weight_norm
 from rotary_embedding_torch import RotaryEmbedding
 
@@ -177,6 +178,9 @@ class SwiGLUConvFFN(nn.Module):
         elif act == "dprelu":
             self.dprelu = DPReLU()
             self.act_fn = self._dprelu
+        elif act == "relugt":
+            self.dprelu = ReLUGT()
+            self.act_fn = self._dprelu
 
         if causal:
             self.padding = self._causal_padding
@@ -187,7 +191,7 @@ class SwiGLUConvFFN(nn.Module):
 
         self.conv1 = nn.Conv1d(in_features, expand, kernel_size[0], bias=bias)
         self.conv2 = nn.Conv1d(hidden_features, out_features, kernel_size[1], bias=bias)
-        self.lwa = nn.Sequential(CBAM(expand), nn.Dropout(0.1)) if conv_att else nn.Identity()
+        self.lwa = MaskedCBAM1d(expand) if conv_att else None
 
     def _swiglu(self, x):
         x1, x2 = x.chunk(2, dim=1)
@@ -238,7 +242,7 @@ class SwiGLUConvFFN(nn.Module):
         pad_right = kernel_size // 2
         return F.pad(x, (pad_left, pad_right))
 
-    def apply_mask(self, x: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
+    def apply_mask(self, x: torch.Tensor, mask: torch.Tensor) -> tuple[Tensor, Tensor]:
         """
         Applies a mask to the input tensor.
 
@@ -248,18 +252,22 @@ class SwiGLUConvFFN(nn.Module):
 
         Returns:
             torch.Tensor: Masked input tensor of shape (batch_size, channels, seq_length).
+            torch.Tensor: Mask.
         """
         batch_size, channels, seq_length = x.shape
 
         if mask.shape == (batch_size, 1, seq_length):
             x = x.masked_fill(mask, 0)
-            return x
+            return x, mask
 
         if mask is not None:
             assert mask.shape == (batch_size, 1, 1, seq_length), f"Mask shape mismatch: {mask.shape}"
             mask = mask.squeeze(1)  # Reduce to (batch_size, 1, seq_length)
             x = x * mask
-        return x
+
+            mask = mask.bool()
+            mask = ~mask
+        return x, mask
 
     def forward(self, x: torch.Tensor, mask: torch.Tensor = None) -> torch.Tensor:
         """
@@ -268,6 +276,7 @@ class SwiGLUConvFFN(nn.Module):
         Parameters:
             x (torch.Tensor): Input tensor of shape (batch_size, seq_length, in_features).
             mask (torch.Tensor, optional): Mask tensor of shape (batch_size, 1, seq_length, seq_length), where True is include and False exclude.
+            OR  (batch_size, 1, seq_length) where True is exclude and False include
 
         Returns:
             torch.Tensor: Output tensor of shape (batch_size, seq_length, out_features).
@@ -276,17 +285,19 @@ class SwiGLUConvFFN(nn.Module):
         x = x.transpose(1, 2)
 
         # Apply mask before the first convolution
-        x = self.apply_mask(x, mask)
+        x, c_mask = self.apply_mask(x, mask)
 
         x12 = self.conv1(self.padding(x, self.kernel_size[0]))
-        x12 = self.lwa(x12)
+
+        if self.lwa is not None:
+            x12 = self.lwa(x12, c_mask)
 
         hidden = self.act_fn(x12)
 
         hidden = self.drop(hidden)
 
         # Apply mask before the second convolution
-        hidden = self.apply_mask(hidden, mask)
+        hidden, _ = self.apply_mask(hidden, mask)
 
         out = self.conv2(self.padding(hidden, self.kernel_size[1]))
         out = self.drop(out)
@@ -307,18 +318,23 @@ class MultiHeadAttention(nn.Module):
     use_talking_heads: "Talking-Heads Attention" (https://arxiv.org/abs/2003.02436)
     use_alibi: "Attention with Linear Biases" (https://ofir.io/train_short_test_long.pdf)
     rma_inp_dim: Recurrent Memory Attention (my invention). Per-head dim for projection, if necessary.
+    weighted_heads: Weighted Heads Attention. Keep trainable scalar weights for each head, which are used to multiply just
+    before the final projection, in order to allow the model to dynamically prioritize heads (Decreases performance, don't use)
+    dynamic_alibi: Dynamic ALiBi. Keep per-head trainable multipliers to dynamically adjust the slopes as it trains.
+
 
     If num_persistent > 0, we call this an AllAttention layer.
 
     """
 
     def __init__(self, embed_size, heads, alibi_alpha=1.0, start_i_increment=0, use_alibi=True, use_talking_heads=True,
-                 num_persistent=0, rma_inp_dim=None):
+                 num_persistent=0, rma_inp_dim=None, weighted_heads=False, dynamic_alibi=False):
         super(MultiHeadAttention, self).__init__()
         self.embed_size = embed_size
         self.heads = heads
         self.head_dim = embed_size // heads
         self.use_alibi = use_alibi
+        self.dynamic_alibi = dynamic_alibi
 
         assert (
                 self.head_dim * heads == embed_size
@@ -333,6 +349,7 @@ class MultiHeadAttention(nn.Module):
         self.use_talking_heads = use_talking_heads
         self.start_i_increment = start_i_increment
         self.num_persistent = num_persistent
+        self.weighted_heads = weighted_heads
 
         if self.use_alibi:
             # Precompute ALiBi slopes
@@ -340,9 +357,13 @@ class MultiHeadAttention(nn.Module):
                 [2 ** (-self.alibi_alpha * (i + self.start_i_increment)) for i in range(1, self.heads + 1)],
                 dtype=torch.float32).view(1, self.heads, 1, 1)
 
+            if self.dynamic_alibi:
+                self.alibi_betas = nn.Parameter(torch.ones(self.heads).view(1, self.heads, 1, 1))
+
         if self.use_talking_heads:  # Talking heads: x-transformers version (using Conv2d instead of Linear)
             self.pre_softmax_talking_heads = nn.Conv2d(heads, heads, 1, bias=False)
             self.post_softmax_talking_heads = nn.Conv2d(heads, heads, 1, bias=False)
+            self.talking_heads_drop = nn.Dropout(0.1)
 
         if self.num_persistent > 0:
             # persistent vectors:
@@ -358,8 +379,11 @@ class MultiHeadAttention(nn.Module):
                 self.rma_k_proj = GatedRetention(rma_inp_dim, self.head_dim)
                 self.rma_v_proj = GatedRetention(rma_inp_dim, self.head_dim)
 
+        if self.weighted_heads:
+            self.head_weights = nn.Parameter(torch.ones(self.heads))
 
-    def forward(self, values, keys, queries, mask=None, recurr_persistent=None):
+
+    def forward(self, values, keys, queries, mask=None, recurr_persistent=None, return_weights=False):
         """
         Do attention
         :param values: Values
@@ -411,10 +435,16 @@ class MultiHeadAttention(nn.Module):
 
         # Apply ALiBi positional encodings if enabled
         if self.use_alibi:
-            t_q = torch.arange(query_len, device=self.slopes.device)
-            t_k = torch.arange(key_len, device=self.slopes.device)
+            self.slopes = self.slopes.to(energy.device)
+
+            t_q = torch.arange(query_len, device=energy.device)
+            t_k = torch.arange(key_len, device=energy.device)
             alibi_bias = (t_q.view(1, 1, -1, 1) - t_k.view(1, 1, 1, -1)).abs()
-            alibi_bias = -alibi_bias * self.slopes
+
+            if self.dynamic_alibi:
+                alibi_bias = -alibi_bias * (self.slopes * self.alibi_betas)
+            else:
+                alibi_bias = -alibi_bias * self.slopes
 
             if current_persistent > 0:
                 # Extend ALiBi bias for persistent vectors with zero bias (so that it is allowed to attend to everything)
@@ -422,10 +452,10 @@ class MultiHeadAttention(nn.Module):
                 extended_alibi_bias = extended_alibi_bias.to(energy.device)
                 alibi_bias = extended_alibi_bias
 
-            energy += alibi_bias.to(energy.device)
+            energy += alibi_bias
 
         if self.use_talking_heads:
-            energy = self.pre_softmax_talking_heads(energy)
+            energy = self.talking_heads_drop(self.pre_softmax_talking_heads(energy))
 
         if mask is not None:
             if current_persistent > 0:
@@ -439,27 +469,60 @@ class MultiHeadAttention(nn.Module):
         attention = F.softmax(energy / (self.embed_size ** (1 / 2)), dim=3)
 
         if self.use_talking_heads:
-            attention = self.post_softmax_talking_heads(attention)
+            attention = self.talking_heads_drop(self.post_softmax_talking_heads(attention))
 
-        out = torch.einsum("nhql,nlhd->nqhd", [attention, values]).reshape(
-            N, query_len, self.heads * self.head_dim
-        )
+        out = torch.einsum("nhql,nlhd->nqhd", [attention, values])
+
+        if self.weighted_heads: # (batch, len, n_heads, head_dim)
+            out = out * self.head_weights.view(1, 1, -1, 1)
+
+        out = out.reshape(N,query_len, self.heads * self.head_dim)
 
         out = self.fc_out(out)
-        return out
+
+        if not return_weights:
+            return out
+        else:
+            return out, attention
 
 
-# pre-LN transformer Encoder with SwiGLUFFN
+def expand_masks(x_mask, y_mask):
+    """
+    Expand True=padded masks into an attention mask.
+    Inputs can be different or the same
+    :param x_mask: Mask of x size (batch, seq_len), where True is padded
+    :param y_mask: Mask of y size (batch, seq_2_len), where True is padded
+    :return: Attention mask for MultiHeadAttention
+    """
+    x_mask_expanded = x_mask.unsqueeze(1).unsqueeze(3)  # Shape: (batch_size, 1, mel_len, 1)
+    y_mask_expanded = y_mask.unsqueeze(1).unsqueeze(2)  # Shape: (batch_size, 1, 1, duration_len)
+    # Combine masks using broadcasting
+    attention_mask = x_mask_expanded & y_mask_expanded  # Shape: (batch_size, 1, mel_len, duration_len)
+    attention_mask = ~attention_mask  # True=padded => True=valid
+    return attention_mask
+
+
 class TransformerEncoderLayer(nn.Module):
     def __init__(self, embed_size, heads, forward_expansion, dropout, alibi_alpha=1.0, start_i_increment=0,
-                 kernel_size=3, act="swiglu", rma_mem_dim=0, conv_att=False):
+                 kernel_size=3, act="swiglu", rma_mem_dim=0, conv_att=False, talking_heads=True, coarse_fine=False, dynamic_alibi=False):
         super(TransformerEncoderLayer, self).__init__()
         self.norm1 = nn.LayerNorm(embed_size)
         self.norm2 = nn.LayerNorm(embed_size)
         self.use_rma = rma_mem_dim > 0
+        self.coarse_fine = coarse_fine
+
         self.attention = MultiHeadAttention(embed_size, heads, alibi_alpha=alibi_alpha,
                                             start_i_increment=start_i_increment, num_persistent=rma_mem_dim,
-                                            rma_inp_dim=embed_size // heads if self.use_rma else 0)
+                                            rma_inp_dim=embed_size // heads if self.use_rma else 0, use_talking_heads=talking_heads,
+                                            dynamic_alibi=dynamic_alibi)
+
+        if self.coarse_fine:
+            self.coarse_attention = MultiHeadAttention(embed_size, 1, alibi_alpha=alibi_alpha,
+                                                start_i_increment=start_i_increment, num_persistent=0,
+                                                rma_inp_dim=0,
+                                                use_talking_heads=False)
+            self.norm3 = nn.LayerNorm(embed_size)
+
         self.feed_forward = SwiGLUConvFFN(
             in_features=embed_size,
             hidden_features=forward_expansion * embed_size,
@@ -471,23 +534,28 @@ class TransformerEncoderLayer(nn.Module):
         )
         self.dropout = nn.Dropout(dropout)
 
-    def forward(self, value, key, query, mask, conv_mask=None, mem_kv=None):
-        # Normalize inputs
-        query_norm = self.norm1(query)
-        key_norm = self.norm1(key)
-        value_norm = self.norm1(value)
-
-        # Multi-head attention using normalized values
-        x = self.attention(value_norm, key_norm, query_norm, mask, mem_kv)
+    def forward(self, value, key, query, mask, conv_mask=None, mem_kv=None, coarse_features=None, coarse_mask=None):
+        # Multi-head attention
+        attn_output = self.attention(value, key, query, mask, mem_kv)
         # Apply dropout and add the residual (skip connection)
-        x = query + self.dropout(x)
+        x = query + self.dropout(attn_output)
+        # Normalize after the residual connection
+        x = self.norm1(x)
 
-        # Normalize before the feed-forward network
-        x = self.norm2(x)
+        if self.coarse_fine:
+            coarse_fine_attn_mask = expand_masks(conv_mask.squeeze(1), coarse_mask.squeeze(1))
+
+            # better perf if we use the query rather than x post attn+norm
+            coarse_attn_output = self.coarse_attention(coarse_features, coarse_features, query, coarse_fine_attn_mask)
+            x = x + self.dropout(coarse_attn_output)
+            x = self.norm3(x)
+
         # Feed-forward network
-        x = self.feed_forward(x, mask if conv_mask is None else conv_mask)
+        ff_output = self.feed_forward(x, mask if conv_mask is None else conv_mask)
         # Apply dropout and add the residual (skip connection)
-        x = query + self.dropout(x)
+        x = x + self.dropout(ff_output)
+        # Normalize after the residual connection
+        x = self.norm2(x)
 
         kv_ret = (self.attention.persistent_keys, self.attention.persistent_values) if self.use_rma else None
         return x, kv_ret
@@ -495,13 +563,22 @@ class TransformerEncoderLayer(nn.Module):
 
 class TransformerEncoder(nn.Module):
     def __init__(self, embed_size, heads, num_layers, forward_expansion, dropout, alibi_alpha=1.0, start_i=0,
-                 kernel_size=3, act="swiglu", rma_mem_dim=0, conv_att=False, multi_scale=False):
+                 kernel_size=3, act="swiglu", rma_mem_dim=0, conv_att=False, multi_scale=False, talking_heads=True, coarse_fine=False,
+                 dynamic_alibi=False):
         super(TransformerEncoder, self).__init__()
         self.use_conv_att = conv_att
-        self.encoder_layers = nn.ModuleList([  # Index-Ramped ALiBi
+        self.coarse_fine = coarse_fine
+
+        # Our design is coarse fine attention for all layers except the first.
+        coarse_fine_vec = [self.coarse_fine] * num_layers
+        # if coarse_fine=True, this will be all True except for the first layer (what we want)
+        coarse_fine_vec[0] = False
+
+        self.encoder_layers = nn.ModuleList([  # Layer-Scaled ALiBi
             TransformerEncoderLayer(embed_size, heads, forward_expansion, dropout, alibi_alpha=alibi_alpha,
                                     start_i_increment=start_i + (i * heads), kernel_size=[kernel_size[i], 1] if multi_scale else kernel_size, act=act,
-                                    rma_mem_dim=rma_mem_dim, conv_att=self.use_conv_att and i == num_layers - 1)
+                                    rma_mem_dim=rma_mem_dim, conv_att=self.use_conv_att and i == num_layers - 1, talking_heads=talking_heads, coarse_fine=coarse_fine_vec[i],
+                                    dynamic_alibi=dynamic_alibi)
             for i in range(num_layers)
         ])
         self.head_dim = embed_size // heads
@@ -512,7 +589,17 @@ class TransformerEncoder(nn.Module):
         if self.use_rma:
             self.kv_proj = nn.Sequential(
                 nn.ReLU(inplace=True),
-                nn.Dropout(0.1),
+                nn.Dropout(0.5),
+            )
+
+        if self.coarse_fine:
+            self.coarse_projs = nn.ModuleList(
+                [
+                    nn.Sequential(nn.Conv1d(embed_size, embed_size, 5, 2),
+                                  nn.ReLU(),
+                                  nn.Dropout(0.1))
+                    for _ in range(num_layers - 1)
+                ]
             )
 
     def forward(self, x, mask, conv_mask=None):
@@ -528,10 +615,26 @@ class TransformerEncoder(nn.Module):
 
         recurr_keys = None
         recurr_values = None
+        coarse_x, coarse_mask = x, conv_mask
 
-        for layer in self.encoder_layers:
+        for i, layer in enumerate(self.encoder_layers):
             x, current_kv = layer(x, x, x,
-                                  mask, conv_mask, (recurr_keys, recurr_values) if recurr_keys is not None else None)  # Here x serves as query, key, and value
+                                  mask, conv_mask, (recurr_keys, recurr_values) if recurr_keys is not None else None,
+                                  coarse_x, coarse_mask)  # Here x serves as query, key, and value
+
+            # Break at the last layer after processing;
+            # due to the design of coarse_fine, we have n_layers - 1 projections, which will trigger an IndexError
+            # when it tries to process coarse features after the last layer
+            if i == len(self.encoder_layers) - 1:
+                break
+
+            if self.coarse_fine:
+                # Neat 'lil trick: Max pooling with same args as the conv will compress the mask for us
+                coarse_mask = F.max_pool1d(conv_mask.float(), kernel_size=5, stride=2).bool()
+
+                coarse_x = self.coarse_projs[i](
+                    x.transpose(1,2)
+                ).masked_fill(coarse_mask, 0).transpose(1,2)
 
             if self.use_rma:
                 key_r, val_r = current_kv
@@ -551,209 +654,17 @@ class TransformerEncoder(nn.Module):
 
         return x
 
-
-class TransformerDecoderLayer(nn.Module):
-    def __init__(self, embed_size, heads, forward_expansion, dropout, alibi_alpha, start_i_index, mode="linear",
-                 kernel_size=3):
-        super(TransformerDecoderLayer, self).__init__()
-        self.norm1 = nn.LayerNorm(embed_size)
-        self.norm2 = nn.LayerNorm(embed_size)
-        self.norm3 = nn.LayerNorm(embed_size)
-
-        self.self_attention = MultiHeadAttention(embed_size, heads, alibi_alpha, start_i_index)
-        self.encoder_decoder_attention = MultiHeadAttention(embed_size, heads, alibi_alpha,
-                                                            start_i_index)  # Not used in isolation
-
-        if mode == "linear":
-            self.feed_forward = nn.Sequential(
-                SwiGLUFFN(embed_size, forward_expansion * embed_size, embed_size),
-                nn.Dropout(dropout)
-            )
-        elif mode == "conv":
-            self.feed_forward = SwiGLUConvFFN(
-                in_features=embed_size,
-                hidden_features=forward_expansion * embed_size,
-                out_features=embed_size,
-                kernel_size=kernel_size,
-                drop=0.1,
-                causal=True,
-                act="relu2"
-            )
+def make_conv(bayesian, in_channels, out_channels, kernel_size, stride=1, padding=0, dilation=1, WN=True):
+    if bayesian:
+        return BayesConv1d(0.0, 0.1, in_channels, out_channels, kernel_size,
+                           stride=stride, padding=padding, dilation=dilation)
+    else:
+        if WN:
+            return weight_norm(nn.Conv1d(in_channels, out_channels, kernel_size,
+                                stride=stride, padding=padding, dilation=dilation))
         else:
-            raise TypeError(f"Invalid FFN type for TransformerDecoderLayer: {mode}. Valid are linear and conv")
-
-        self.dropout = nn.Dropout(dropout)
-
-    def forward(self, x, value, key, src_mask, tgt_mask):
-        # Self-attention with look-ahead mask
-        x = self.self_attention(x, x, x, tgt_mask)
-        x = self.dropout(self.norm1(x))
-
-        # Encoder-decoder attention (if you have encoder context)
-        x = self.encoder_decoder_attention(x, key, value, src_mask)
-        x = self.dropout(self.norm2(x))
-
-        # Feed-forward network
-        x = self.feed_forward(x, src_mask)
-        x = self.dropout(self.norm3(x))
-
-        return x
-
-
-class TransformerDecoder(nn.Module):
-    def __init__(self, embed_size, heads, num_layers, forward_expansion, dropout, alibi_alpha, mode="linear",
-                 kernel_size=3, start_i=0):
-        super(TransformerDecoder, self).__init__()
-
-        self.layers = nn.ModuleList([
-            TransformerDecoderLayer(embed_size, heads, forward_expansion, dropout, alibi_alpha, start_i + (i * heads),
-                                    mode, kernel_size)
-            for i in range(num_layers)
-        ])
-
-    def forward(self, x, src_encodings, src_mask, tgt_mask):
-        for layer in self.layers:
-            x = layer(x, src_encodings, src_encodings, src_mask, tgt_mask)
-
-        return x
-
-
-def make_conv(bayesian, in_channels, out_channels, kernel_size, stride=1, padding=0, dilation=1):
-    return BayesConv1d(0.0, 0.1, in_channels, out_channels, kernel_size,
-                       stride=stride, padding=padding, dilation=dilation) \
-        if bayesian else weight_norm(nn.Conv1d(in_channels, out_channels, kernel_size,
-                                               stride=stride, padding=padding, dilation=dilation))
-
-def perturb(x, mul=0.1):
-    return F.dropout(x, mul, training=True)
-
-
-class SuperTemporalBlock(nn.Module):
-    def __init__(self, n_inputs, n_outputs, kernel_size, stride, dilation, padding, dropout=0.2, bayesian=False,
-                 use_aptx=False,
-                 reduction=16, heads=4, start_i_increment=0, cross_att_heads=0, alibi_alpha=1.2, rma_head_dim=0,
-                 att_dropout=0.1,
-                 context_size=0, noise_scale=0.3):
-        """
-        Initialize SuperTemporalBlock for TCN
-        :param n_inputs: Number of input channels
-        :param n_outputs: Output channels
-        :param kernel_size: Kernel size
-        :param stride: Stride of convs
-        :param dilation: Dilation
-        :param padding: Padding
-        :param dropout: Dropout
-        :param use_se: Use Squeeze-Excite attention
-        :param bayesian: Use Bayesian convs, for nondeterminism. Will use LayerNorm instead of weight normalization
-        :param use_aptx: Use APTx for the acts
-        :param noise_scale: Scale of noise to perturb inputs for increased variability. Set to 0 if not using Bayesian
-        (Not functional)
-        """
-        super(SuperTemporalBlock, self).__init__()
-
-        self.noise_scale = noise_scale
-
-        self.conv1 = make_conv(bayesian, n_inputs, n_outputs, kernel_size,
-                               stride=stride, padding=padding, dilation=dilation)
-        self.chomp1 = Chomp1d(padding)
-        self.ln1 = TransposeLayerNorm(n_outputs) if bayesian else nn.Identity()
-        self.relu1 = APTx() if use_aptx else nn.ReLU()
-        self.dropout1 = nn.Dropout(dropout)
-
-        n_final = n_outputs
-
-        self.conv2 = make_conv(bayesian, n_outputs, n_final, kernel_size,
-                               stride=stride, padding=padding, dilation=dilation)
-        self.chomp2 = Chomp1d(padding)
-        self.ln2 = TransposeLayerNorm(n_final) if bayesian else nn.Identity()
-        self.relu2 = APTx() if use_aptx else nn.ReLU()
-        self.dropout2 = nn.Dropout(dropout)
-
-        self.net_part_1 = nn.Sequential(self.conv1, self.chomp1, self.ln1, self.relu1, self.dropout1)
-        self.net_part_2 = nn.Sequential(self.conv2, self.chomp2, self.ln2, self.relu2, self.dropout2)
-
-        n_outputs = n_final
-
-        self.downsample = make_conv(False, n_inputs, n_outputs, 1) if n_inputs != n_outputs else nn.Identity()
-
-        self.cbam_block = CBAM(n_outputs, reduction)
-        self.res_cbam = CBAM(n_outputs, reduction)
-        self.drop = nn.Dropout(0.1)
-
-        self.relu = APTx(trainable=True) if use_aptx else nn.ReLU()
-
-        self.heads = heads
-        self.cross_att_heads = cross_att_heads
-
-        if self.heads > 0:
-            self.attention = MultiHeadAttention(n_outputs, heads, alibi_alpha=alibi_alpha,
-                                                start_i_increment=start_i_increment,
-                                                num_persistent=16, rma_inp_dim=rma_head_dim)
-            self.att_drop = nn.Dropout(att_dropout)  # Dropout for attention
-            self.att_norm = nn.LayerNorm(n_outputs)
-
-        if self.cross_att_heads > 0:
-            self.context_proj = nn.Linear(context_size, n_outputs) if context_size != n_outputs else nn.Identity()
-
-            self.cross_attention = MultiHeadAttention(n_outputs, cross_att_heads, alibi_alpha=alibi_alpha,
-                                                      start_i_increment=start_i_increment,
-                                                      num_persistent=16)
-
-
-    def forward(self, x, mask=None, att_mask=None, context=None, packed_kv=None):
-        """
-        Forward pass through the Temporal Block
-        :param x: Tensor size (batch, seq_len, in_channels)
-        :param mask: Bool mask size (batch, 1, seq_len), where True is padded and False is valid.
-                    If not passed, will assume all sequence is valid.
-        :param context: Context tensor same shape as x for cross attention
-        :packed_kv: (key, value) packed for RMA
-        :return: Processed tensor size (batch, seq_len, in_channels)
-        """
-
-        if mask is None:
-            mask = torch.zeros((x.size(0), 1, x.size(2))).bool().to(x.device)
-
-        self.chomp1.set_mask(mask)
-        self.chomp2.set_mask(mask)
-
-        x = x.transpose(1, 2)
-
-        # keep orig for residual block
-        x0 = x
-
-        x = self.net_part_1(x).masked_fill(mask, 0)
-
-        if self.heads > 0:
-            x = x.transpose(1, 2)
-            x_att = self.attention(x, x, x, att_mask, packed_kv)
-            x_att = self.att_drop(x_att)
-            x = x + x_att
-            x = self.att_norm(x)
-            x = x.transpose(1, 2)
-
-        x = x.masked_fill(mask, 0)
-        x = self.net_part_2(x)
-
-        res = self.downsample(x0).masked_fill(mask, 0)
-        x = x + self.res_cbam(res).masked_fill(mask, 0)
-        x = self.drop(x)
-
-        x = self.cbam_block(x).masked_fill(mask, 0)
-
-        x = self.drop(x)
-
-        if self.cross_att_heads > 0:
-            x = x.transpose(1, 2)
-            context = self.context_proj(context)
-            x_cross_att = self.cross_attention(context, context, x, att_mask)
-            x_cross_att = self.att_drop(x_cross_att)
-            x = x + x_cross_att
-            x = x.transpose(1, 2)
-
-        x = self.relu(x).masked_fill(mask, 0)
-        x = x.transpose(1, 2)
-        return x, (self.attention.persistent_keys, self.attention.persistent_values)
+            return nn.Conv1d(in_channels, out_channels, kernel_size,
+                      stride=stride, padding=padding, dilation=dilation)
 
 
 class TemporalBlock(nn.Module):
@@ -913,103 +824,7 @@ def mask_to_causal_attention_mask(mask):
     return attention_mask
 
 
-class TCNAttentionBlock(nn.Module):
-    """
-    Transformer-inspired TCNAttentionBlock:
 
-    x + Drop(AllAttention(x)) => LayerNorm => TemporalBlock => Gated Skip => Drop(LayerNorm)
-    Optionally, cross-attention between context and x
-    """
-
-    def __init__(self, in_channels, out_channels, kernel_size, heads, att_dropout, dropout, dilation, alibi_alpha,
-                 start_i_increment=0, bayesian=False, context_size=0, cross_att_heads=0, rma_head_dim=None):
-        """
-        Initialize the TCNAttentionBlock
-        :param in_channels: Input channels
-        :param out_channels: Output channels
-        :param kernel_size: Kernel size of convolution
-        :param heads: Attention heads. Set to 0 for no attention
-        :param att_dropout: Dropout for attention
-        :param dropout: General dropout
-        :param dilation: Dilation in the conv kernel
-        :param alibi_alpha: Alpha for ALiBi
-        :param start_i_increment: Starting increment of ALiBi
-        :param cross_att_heads: Heads for cross-attention between x and context. Set to 0 for no cross-att
-        :param context_size: Size, in channels, of context. Will use projection if different from in_channels
-        :param rma_head_dim: Head dim of last layer for Recurrent Memory Attention
-        """
-        super(TCNAttentionBlock, self).__init__()
-
-        self.heads = heads
-        self.cross_att_heads = cross_att_heads
-
-        if self.heads > 0:
-            self.attention = MultiHeadAttention(in_channels, heads, alibi_alpha=alibi_alpha,
-                                                start_i_increment=start_i_increment,
-                                                num_persistent=16, rma_inp_dim=rma_head_dim)
-            self.dropout1 = nn.Dropout(att_dropout)  # Dropout for attention
-
-        if self.cross_att_heads > 0:
-            self.context_proj = nn.Linear(context_size, in_channels) if context_size != in_channels else nn.Identity()
-
-            self.cross_attention = MultiHeadAttention(in_channels, cross_att_heads, alibi_alpha=alibi_alpha,
-                                                      start_i_increment=start_i_increment,
-                                                      num_persistent=16)
-        # A touch of insanity is all you need
-        self.rotary_emb = RotaryEmbedding(dim=in_channels // 2)
-
-        padding = (kernel_size - 1) * dilation  # Calculate padding based on dilation
-        self.temporal_block = TemporalBlock(in_channels, out_channels, kernel_size, stride=1, dilation=dilation,
-                                            padding=padding, dropout=dropout, use_se=True, bayesian=bayesian,
-                                            use_swiglu=False, use_aptx=True, use_cbam=True)
-
-        # Gated skip connection, increases naturalness a bit
-        self.gate = GatedRetention(in_channels, out_channels)
-        self.post_cross_att_norm = nn.LayerNorm(in_channels) if self.cross_att_heads > 0 else nn.Identity()
-        self.pre_norm = nn.LayerNorm(in_channels)
-        self.norm = nn.LayerNorm(out_channels)
-        self.dropout2 = nn.Dropout(dropout)
-
-    def forward(self, x, mask, att_mask, context, recurr_kv):
-        """
-        Args:
-            x: Input tensor of shape (batch_size, seq_length, channels).
-            mask: Mask tensor of shape (batch_size, 1, seq_length), where True is invalid (padding) and False is valid
-            att_mask: Attention mask of shape (batch_size, 1, seq_len, seq_len) where True is valid and False is invalid
-            (ideally, causal)
-            recurr_kv: Tuple of recurrent consistent tokens for the attention (key, values)
-            context: Context tensor for cross-attention, same shape and lengths as x
-        """
-        x_orig = x
-
-        if self.heads > 0:
-            x_att = self.attention(x, x, x, att_mask, recurr_kv)
-            x_att = self.dropout1(x_att)
-            x = x + x_att  # Residual connection
-
-        x = self.pre_norm(x)
-
-        if self.cross_att_heads > 0:
-            context = self.context_proj(context)
-            x_cross_att = self.cross_attention(context, context, x, att_mask)
-            x_cross_att = self.dropout1(x_cross_att)
-            x = x + x_cross_att
-            x = self.post_cross_att_norm(x)
-
-        x = x.transpose(1, 2)  # Switch dimensions for convolution
-        x = x.masked_fill(mask, 0)
-
-        # x = (batch, channels, seq_len)
-        x = self.temporal_block(x, mask)
-
-        x = x.masked_fill(mask, 0)
-        x = x.transpose(1, 2)  # (batch, channels, seq_len) => (batch, seq_len, channels)
-
-        x = x + self.gate(x_orig)
-        x = self.norm(x)
-        x = self.dropout2(x)
-
-        return x, (self.attention.persistent_keys, self.attention.persistent_values)
 
 
 class ResidualBlock1D(nn.Module):
@@ -1071,14 +886,60 @@ def reduce_sequence_length(input_tensor):
     return output_tensor
 
 
-class TCNAttention(nn.Module):
-    def __init__(self, num_inputs, num_channels, kernel_size=[2, 2, 2], dropout=0.2, att_dropout=0.3, heads=[2, 2, 2],
-                 alibi_alpha=1.25, start_i_increment=1, bayesian=False, integrated=False):
-        super(TCNAttention, self).__init__()
-        self.layers = nn.ModuleList()
+class CausalConv1d(nn.Module):
+    def __init__(self, in_channels, out_channels, kernel_size, dilation=1):
+        super(CausalConv1d, self).__init__()
+        self.padding = (kernel_size - 1) * dilation
+        self.conv = nn.Conv1d(in_channels, out_channels, kernel_size,
+                              padding=self.padding, dilation=dilation)
 
-        self.key_projs = nn.ModuleList()
-        self.val_projs = nn.ModuleList()
+    def forward(self, x):
+        return self.conv(x)[:, :, :-self.padding]
+
+
+class ConvReluNorm(nn.Module):
+    def __init__(self, in_channels, out_channels, kernel_size, dilation=1, normalization='layer', act="aptx", dropout=0.5):
+        super(ConvReluNorm, self).__init__()
+        self.causal_conv = CausalConv1d(in_channels, out_channels, kernel_size, dilation)
+
+        if act == "relu":
+            self.act = nn.ReLU()
+        elif act == "aptx":
+            self.act = APTx()
+        elif act == "taptx":
+            self.act = APTx(trainable=True)
+        elif act == "dprelu":
+            self.act = DPReLU()
+
+        self.drop = nn.Dropout(dropout)
+
+        if normalization == 'batch':
+            self.norm = nn.BatchNorm1d(out_channels)
+        elif normalization == 'layer':
+            self.norm = TransposeLayerNorm(out_channels)
+        elif normalization == "":
+            self.norm = nn.Identity()
+        else:
+            raise ValueError("Normalization type must be either 'batch', 'layer', or an empty string (none)")
+
+    def forward(self, x, x_mask):
+        x = self.causal_conv(x).masked_fill(x_mask, 0)
+        x = self.act(x).masked_fill(x_mask, 0)
+        x = self.norm(x).masked_fill(x_mask, 0)
+        x = self.drop(x)
+        return x
+
+
+class NeoTCNAttention(nn.Module):
+    def __init__(self, num_inputs, num_channels, kernel_size=[2, 2, 2], dropout=0.2, att_dropout=0.3, heads=[2, 2, 2],
+                 alibi_alpha=1.25, start_i_increment=1, dilation_growth="", act="aptx", bayesian=False, integrated=False, conv_att="se"):
+        super(NeoTCNAttention, self).__init__()
+
+        self.layers = nn.ModuleList()
+        self.att_layers = nn.ModuleList()
+        self.out_channels = num_channels[-1]
+        self.n_heads = heads
+        self.attn_dropout = nn.Dropout(att_dropout)
 
         if len(heads) != len(num_channels):
             raise ValueError("The length of heads must be equal to the length of num_channels")
@@ -1086,88 +947,68 @@ class TCNAttention(nn.Module):
             raise ValueError("The length of kernel_size must be equal to the length of num_channels")
 
         current_channels = num_inputs
-        # Keep a global head dim so that we don't have to deal with varying head dimensions when collecting the recurrent states
-        self.global_head_dim = 64
-
-        if integrated:
-            print("Using SuperTemporalBlocks")
 
         for level, (out_channels, num_heads, k_size) in enumerate(zip(num_channels, heads, kernel_size)):
-            dilation = 1  # we want max precision, dilation is detrimental.
             is_last = level == len(num_channels) - 1
             curr_i_increment = start_i_increment + (level * num_heads)
-            c_att_heads = 2 if is_last else 0
 
-            if not integrated:
-                self.layers.append(TCNAttentionBlock(current_channels, out_channels, k_size, num_heads,
-                                                     att_dropout, dropout, dilation, alibi_alpha=alibi_alpha,
-                                                     start_i_increment=curr_i_increment,
-                                                     bayesian=bayesian, cross_att_heads=2 if is_last else 0,
-                                                     context_size=num_inputs, rma_head_dim=self.global_head_dim
-                                                     )
-                                   )
+            if dilation_growth == "exp":
+                dilation_size = 2 ** level
+            elif dilation_growth == "mul":
+                dilation_size = max(1, 2 * level)
+            elif dilation_growth == "add":
+                dilation_size = level + 1
+            elif dilation_growth == "":
+                dilation_size = 1
             else:
-                self.layers.append(SuperTemporalBlock(current_channels, out_channels, k_size, 1, dilation,
-                                                      padding=(k_size - 1) * dilation,
-                                                      dropout=dropout, bayesian=bayesian, use_aptx=True, reduction=16,
-                                                      heads=num_heads,
-                                                      start_i_increment=curr_i_increment, cross_att_heads=c_att_heads,
-                                                      alibi_alpha=alibi_alpha,
-                                                      rma_head_dim=self.global_head_dim, att_dropout=att_dropout,
-                                                      context_size=num_inputs)
-                                   )
+                raise RuntimeError(f"Unknown dilation growth type {dilation_growth}")
+
+            # pre-attention arrangement
+            self.att_layers.append(
+                MultiHeadAttention(current_channels, num_heads, alibi_alpha=alibi_alpha,
+                                   start_i_increment=curr_i_increment,
+                                   num_persistent=16)
+                if num_heads > 0 else nn.Identity()  # append an identity so it still occupies an index i in the list
+
+            )
+            self.layers.append(ConvReluNorm(current_channels, out_channels, k_size, dilation_size, act=act, dropout=dropout))
 
             current_channels = out_channels  # The output of the current block is the input for the next
-            layer_head_dim = self.layers[-1].attention.head_dim
 
-            self.key_projs.append(
-                nn.Sequential(
-                    nn.Linear(layer_head_dim,
-                              self.global_head_dim) if layer_head_dim != self.global_head_dim else nn.Identity(),
-                    nn.ReLU(inplace=True),
-                    nn.Dropout(0.1),
-                ),
-            )
-            self.val_projs.append(
-                nn.Sequential(
-                    nn.Linear(layer_head_dim,
-                              self.global_head_dim) if layer_head_dim != self.global_head_dim else nn.Identity(),
-                    nn.ReLU(inplace=True),
-                    nn.Dropout(0.1),
-                ),
-            )
+        if conv_att == "se":
+            self.conv_att = MaskedSEBlock1D(out_channels)
+        elif conv_att == "cbam":
+            self.conv_att = MaskedCBAM1d(out_channels)
 
-    def forward(self, x, mask):
+    def forward(self, x, mask, inp_channel_last=True):
         """
         Args:
-            x: Input tensor of shape (batch_size, seq_length, channels).
+            x: Input tensor of shape (batch_size, seq_length, channels) if inp_channel_last=True, else (batch, channels, seq)
             mask: Mask tensor of shape (batch_size, seq_length), where True is invalid (padding) and False is valid
         """
 
         att_mask = mask_to_causal_attention_mask(mask)
         mask = mask.unsqueeze(1)
-        context = x.clone()
 
-        recurr_keys = None
-        recurr_values = None
+        if inp_channel_last:
+            x = x.transpose(1, 2)  # (batch, channels, seq)
 
         for i, layer in enumerate(self.layers):
-            x, current_kv = layer(x, mask, att_mask, context,
-                                  (recurr_keys, recurr_values) if recurr_keys is not None else None)
 
-            key_r, val_r = current_kv
+            if self.n_heads[i] > 0:
+                x = x.transpose(1, 2)  # (batch, seq, channels)
+                x_att = self.att_layers[i](x, x, x, att_mask)
+                x_att = self.attn_dropout(x_att)
+                x += x_att
+                x = x.transpose(1, 2)  # (batch, channels, seq)
 
-            # prevent backpropagation into the previous layers
-            # otherwise, it tries to optimize each attention layer for the next
-            # faster and better loss
-            key_r = self.key_projs[i](key_r.detach())
-            val_r = self.val_projs[i](val_r.detach())
+            x = layer(x, mask)
 
-            key_r = reduce_sequence_length(key_r)
-            val_r = reduce_sequence_length(val_r)
+        x = self.conv_att(x, mask)
 
-            # Collect recurrent key-values
-            recurr_keys = key_r if recurr_keys is None else torch.cat([recurr_keys, key_r], dim=0)
-            recurr_values = val_r if recurr_values is None else torch.cat([recurr_values, val_r], dim=0)
+        if inp_channel_last:
+            x = x.transpose(1, 2)  # (batch, seq, channels)
 
         return x
+
+

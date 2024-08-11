@@ -78,7 +78,6 @@ class Preprocessor:
             if os.path.isdir(dirf):
                 speakers_dirs.append(dirf)
 
-        print(os.listdir(self.in_dir))
         speakers_dirs = os.listdir(self.in_dir)
         for i, speaker in enumerate(tqdm(speakers_dirs)):
             speakers[speaker] = i

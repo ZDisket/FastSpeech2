@@ -9,9 +9,9 @@ import torch.nn as nn
 import numpy as np
 import torch.nn.functional as F
 
-from utils.tools import get_mask_from_lengths, pad
+from utils.tools import get_mask_from_lengths, pad, compute_phoneme_level_features_optimized
 from .attentions import PartialConv1d, CBAM, TransposeLayerNorm, TransposeRMSNorm
-from .submodels import VariantDurationPredictor, TemporalVariancePredictor, DynamicDurationPredictor, NormalizedEmbedding
+from .submodels import VariantDurationPredictor, TemporalVariancePredictor, DynamicDurationPredictor, NormalizedEmbedding, Prenet, sequence_mask
 
 from typing import Optional, Tuple
 from numba import jit, prange
@@ -20,11 +20,6 @@ from rotary_embedding_torch import RotaryEmbedding
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 
-def sequence_mask(length, max_length=None):
-    if max_length is None:
-        max_length = length.max()
-    x = torch.arange(max_length, dtype=length.dtype, device=length.device)
-    return x.unsqueeze(0) < length.unsqueeze(1)
 
 
 @jit(nopython=True)
@@ -176,6 +171,7 @@ class AlignmentEncoder(torch.nn.Module):
         self.temperature = temperature
         self.softmax = SafeSoftmax(dim=3)
         self.log_softmax = SafeLogSoftmax(dim=3)
+
         self.rotary_emb = RotaryEmbedding(n_att_channels // 2)
 
         self.key_proj = nn.Sequential(
@@ -185,7 +181,7 @@ class AlignmentEncoder(torch.nn.Module):
         )
 
         self.query_proj = nn.Sequential(
-            ConvNorm(n_mel_channels, n_mel_channels * 2, kernel_size=3, bias=True, w_init_gain='relu', use_cbam=True, drop=0.1),
+            ConvNorm(n_mel_channels, n_mel_channels * 2, kernel_size=3, bias=True, w_init_gain='relu', use_cbam=False, drop=0.1),
             torch.nn.ReLU(),
             ConvNorm(n_mel_channels * 2, n_mel_channels, kernel_size=1, bias=True, drop=0.1),
             torch.nn.ReLU(),
@@ -305,17 +301,6 @@ class AlignmentEncoder(torch.nn.Module):
         keys_enc = self.key_proj(keys)  # B x n_attn_dims x T2
         queries_enc = self.query_proj(queries)  # B x n_attn_dims x T1
 
-        # (batch, att_channels, seq_len) => (batch, seq_len, att_channels) =>> (batch, 1, seq_len, att_channels)
-
-        keys_enc = keys_enc.transpose(1,2).unsqueeze(1)
-        queries_enc = queries_enc.transpose(1,2).unsqueeze(1)
-
-        keys_enc = self.rotary_emb.rotate_queries_or_keys(keys_enc)
-        queries_enc = self.rotary_emb.rotate_queries_or_keys(queries_enc)
-
-        keys_enc = keys_enc.squeeze(1).transpose(1,2)
-        queries_enc = queries_enc.squeeze(1).transpose(1,2)
-
         # Simplistic Gaussian Isotopic Attention
         attn = (queries_enc[:, :, :, None] - keys_enc[:, :, None]) ** 2  # B x n_attn_dims x T1 x T2
         attn = -self.temperature * attn.sum(1, keepdim=True)
@@ -354,6 +339,8 @@ class VarianceAdaptor(nn.Module):
         super(VarianceAdaptor, self).__init__()
 
         dp_type = model_config["duration_predictor"]["type"]
+        self.spk_channels = model_config["speaker_channels"]
+        self.aligner_type = model_config["aligner"]
 
         if dp_type == "tcn":
             self.duration_predictor = DynamicDurationPredictor(
@@ -368,6 +355,7 @@ class VarianceAdaptor(nn.Module):
                 backwards_channels=model_config["duration_predictor"]["backwards_tcn_channels"],
                 backwards_heads=model_config["duration_predictor"]["backwards_heads"],
                 backwards_kernel_sizes=model_config["duration_predictor"]["backwards_kernel_sizes"],
+                speaker_channels=self.spk_channels,
             )
             dp_output_channels = model_config["duration_predictor"]["tcn_channels"][-1]
         elif dp_type == "lstm":
@@ -387,20 +375,24 @@ class VarianceAdaptor(nn.Module):
         else:
             raise RuntimeError(f"Invalid duration predictor type: {dp_type}. Valid are tcn and lstm")
 
+        if self.spk_channels > 0:
+            self.pe_spk_cond = nn.Sequential(nn.Linear(self.spk_channels, model_config["transformer"]["encoder_hidden"]),
+                                             nn.Dropout(0.1),)
+
         self.length_regulator = LengthRegulator()
         self.pitch_predictor = TemporalVariancePredictor(
             input_channels=model_config["transformer"]["encoder_hidden"],
             num_channels=model_config["variance_predictor"]["filter_size"],
             kernel_size=model_config["variance_predictor"]["kernel_size"],
             dropout=model_config["variance_predictor"]["dropout"],
-            cond_input_size=dp_output_channels,
+            cond_input_size=None,
         )
         self.energy_predictor = TemporalVariancePredictor(
             input_channels=model_config["transformer"]["encoder_hidden"],
             num_channels=model_config["variance_predictor"]["filter_size"],
             kernel_size=model_config["variance_predictor"]["kernel_size"],
             dropout=model_config["variance_predictor"]["dropout"],
-            cond_input_size=dp_output_channels,
+            cond_input_size=None,
         )
 
         self.pitch_feature_level = preprocess_config["preprocessing"]["pitch"][
@@ -449,13 +441,16 @@ class VarianceAdaptor(nn.Module):
                 requires_grad=False,
             )
 
-        # I'll make these into NormalizedEmbeddings later
         self.pitch_embedding = NormalizedEmbedding(
-            n_bins, model_config["transformer"]["encoder_hidden"]
+            n_bins, model_config["transformer"]["encoder_hidden"], model_config["variance_predictor"]["dropout_on_emb"], False
         )
         self.energy_embedding = NormalizedEmbedding(
-            n_bins, model_config["transformer"]["encoder_hidden"]
+            n_bins, model_config["transformer"]["encoder_hidden"], model_config["variance_predictor"]["dropout_on_emb"], False
         )
+
+        self.hid_proj = nn.Sequential(nn.Linear(dp_output_channels, model_config["transformer"]["encoder_hidden"]),
+                                     nn.ReLU(inplace=True),
+                                     nn.Dropout(0.5),)
 
     def get_pitch_embedding(self, x, target, mask, control, y, y_mask):
         prediction = self.pitch_predictor(x, mask, y, y_mask)
@@ -486,7 +481,9 @@ class VarianceAdaptor(nn.Module):
             x,
             src_mask,
             src_lens,
+            mel_lens,
             in_emotion=None,
+            in_spk=None,
             mel_mask=None,
             max_len=None,
             pitch_target=None,
@@ -496,19 +493,33 @@ class VarianceAdaptor(nn.Module):
             e_control=1.0,
             d_control=1.0,
     ):
-        log_duration_prediction, x_mask, dur_hidden = self.duration_predictor(x, src_lens, in_emotion)
+        log_duration_prediction, x_mask, dur_hidden = self.duration_predictor(x, src_lens, in_emotion, in_spk)
 
+        dur_hidden = self.hid_proj(dur_hidden).masked_fill(x_mask.unsqueeze(-1), 0)
 
         if self.pitch_feature_level == "phoneme_level":
+            x = x + dur_hidden
+
+        if self.spk_channels > 0:
+            x = x + self.pe_spk_cond(in_spk)
+
+        if self.pitch_feature_level == "phoneme_level":
+            if duration_target is not None:
+                pitch_target = compute_phoneme_level_features_optimized(duration_target, pitch_target)
+
             pitch_prediction, pitch_embedding = self.get_pitch_embedding(
                 x, pitch_target, src_mask, p_control, dur_hidden, x_mask
             )
             x = x + pitch_embedding
         if self.energy_feature_level == "phoneme_level":
+            if duration_target is not None:
+                energy_target = compute_phoneme_level_features_optimized(duration_target, energy_target)
+
             energy_prediction, energy_embedding = self.get_energy_embedding(
                 x, energy_target, src_mask, p_control, dur_hidden, x_mask
             )
             x = x + energy_embedding
+
 
         if duration_target is not None:
             x, mel_len = self.length_regulator(x, duration_target, max_len)
@@ -518,19 +529,24 @@ class VarianceAdaptor(nn.Module):
                 (torch.round(torch.exp(log_duration_prediction) - 1) * d_control),
                 min=0,
             )
-            x, mel_len = self.length_regulator(x, duration_rounded, max_len)
+            x, mel_len = self.length_regulator(x, duration_rounded, max_len, mel_lens)
             mel_mask = get_mask_from_lengths(mel_len)
+
+        x1_mask = sequence_mask(x.size(1), mel_len).unsqueeze(1)  # (batch, 1, max_mel_len)
 
         if self.pitch_feature_level == "frame_level":
             pitch_prediction, pitch_embedding = self.get_pitch_embedding(
                 x, pitch_target, mel_mask, p_control, dur_hidden, x_mask
             )
             x = x + pitch_embedding
+          #  x = self.post_pitch(x, x1_mask)
+
         if self.energy_feature_level == "frame_level":
             energy_prediction, energy_embedding = self.get_energy_embedding(
                 x, energy_target, mel_mask, p_control, dur_hidden, x_mask
             )
             x = x + energy_embedding
+           # x = self.post_energy(x, x1_mask)
 
         return (
             x,
@@ -549,7 +565,7 @@ class LengthRegulator(nn.Module):
     def __init__(self):
         super(LengthRegulator, self).__init__()
 
-    def LR(self, x, duration, max_len):
+    def LR(self, x, duration, max_len, mel_lens=None):
         output = list()
         mel_len = list()
         for batch, expand_target in zip(x, duration):
@@ -562,7 +578,13 @@ class LengthRegulator(nn.Module):
         else:
             output = pad(output)
 
-        return output, torch.LongTensor(mel_len).to(device)
+        # Override lengths if mel_lens is provided
+        if mel_lens is not None:
+            mel_len = mel_lens
+        else:
+            mel_len = torch.LongTensor(mel_len).to(device)
+
+        return output, mel_len
 
     def expand(self, batch, predicted):
         out = list()
@@ -574,8 +596,8 @@ class LengthRegulator(nn.Module):
 
         return out
 
-    def forward(self, x, duration, max_len):
-        output, mel_len = self.LR(x, duration, max_len)
+    def forward(self, x, duration, max_len, mel_lens=None):
+        output, mel_len = self.LR(x, duration, max_len, mel_lens)
         return output, mel_len
 
 

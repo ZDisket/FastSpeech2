@@ -22,7 +22,7 @@ duration_predictor:
   bidirectional: true # both: bidirectional
   att_dropout: 0.15 # only applies to TCN duration pred, dropout applied to attention
   tcn_channels: [384, 384] # only applies to TCN duration pred
-  tcn_heads: [2, 2] #tcn: attention heads for each layer. you can use 0 to disable multi-head and use squeeze-excite
+  tcn_heads: [4, 4] #tcn: attention heads for each layer. you can use 0 to disable multi-head and use squeeze-excite
   tcn_kernel_sizes: [2, 3] #tcn: kernel sizes for each layer
   backwards_tcn_channels: [128, 128]
   backwards_heads: [2, 2]
@@ -49,12 +49,10 @@ variance_embedding:
 #   n_style_token: 10
 #   attn_head: 4
 
-multi_speaker: False
+multi_speaker: True
 max_seq_len: 1000
-emotion_size: 256
-speaker_channels: 0
-aligner: "rad" # support 'rad': RAD-TTS aligner from NVIDIA, 'mas': Glow-TTS&VITS aligner
-mas_channels: 512 # dim for the MAS projection (for text and mel). only applies if aligner = "mas"
+emotion_size: 0
+speaker_channels: 256
 
 vocoder:
   model: "iSTFTNet" # support 'HiFi-GAN', 'MelGAN'

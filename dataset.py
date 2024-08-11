@@ -118,7 +118,9 @@ class Dataset(Dataset):
         mels = pad_2D(mels)
         pitches = pad_1D(pitches)
         energies = pad_1D(energies)
-        emotion_blocks, emotion_hiddens, emotion_lens = pad_zephyr_outputs(emotion_blocks, emotion_hiddens)
+        emotion_hiddens = np.array(emotion_hiddens)
+
+        emotion_blocks, emotion_lens = pad_zephyr_outputs(emotion_blocks)
 
         return (
             ids,

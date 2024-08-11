@@ -15,6 +15,7 @@ def prepare_align(config):
     max_wav_value = config["preprocessing"]["audio"]["max_wav_value"]
     cleaners = config["preprocessing"]["text"]["text_cleaners"]
     speaker = "LJSpeech"
+    printed_ms_notice = False
     with open(os.path.join(in_dir, "filelist.txt"), encoding="utf-8") as f:
         for line in tqdm(f):
             parts = line.strip().split("|")
@@ -25,6 +26,15 @@ def prepare_align(config):
 
             text = parts[1]
             text = _clean_text(text, cleaners)
+            if len(parts) == 3:
+                if not printed_ms_notice:
+                    print("Multispeaker filelist detected. Third part will be used as speaker name")
+
+                speaker = parts[2]
+
+                printed_ms_notice = True
+
+
 
             wav_path = os.path.join(in_dir, wav_name)
             if os.path.exists(wav_path):

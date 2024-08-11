@@ -9,6 +9,33 @@ from torch.nn.utils import weight_norm
 
 # subatts.py: normalization, activation functions
 
+def init_weights_he(m):
+    """
+    Applies He initialization to Conv1d, Conv2d, and Linear layers recursively.
+    """
+    if isinstance(m, (nn.Conv1d, nn.Conv2d, nn.Linear)):
+        nn.init.kaiming_normal_(m.weight, nonlinearity='relu')
+        if m.bias is not None:
+            nn.init.zeros_(m.bias)
+    elif isinstance(m, nn.Module):
+        for submodule in m.children():
+            init_weights_he(submodule)
+
+
+class ReLUGT(nn.Module):
+    """
+    ReLU GT: Leaky squared ReLU with trainable positive alpha, slope, and static negative alpha.
+    Early experiments show near parity with APTx S1 with faster initial fitting. Only squares positive part.
+    """
+    def __init__(self, initial_slope=0.05, initial_alpha_neg=2.5, initial_alpha_pos=1.0):
+        super(ReLUGT, self).__init__()
+        self.slope = nn.Parameter(torch.tensor(initial_slope))
+        self.alpha_neg = initial_alpha_neg
+        self.alpha_pos = nn.Parameter(torch.tensor(initial_alpha_pos))
+
+    def forward(self, x):
+        return torch.where(x < 0, self.alpha_neg * self.slope * x, self.alpha_pos * x ** 2)
+
 class APTxS1(nn.Module):
     """
     APTx Stage 1:

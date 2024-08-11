@@ -21,18 +21,27 @@ from evaluate import evaluate
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-
-def convert_to_magnitudes(durations):
-    total_duration = durations.sum(dim=1, keepdim=True)
-    magnitudes = durations / total_duration
-    return magnitudes
-
-
 def weights_init_he(m):
     if isinstance(m, nn.Conv1d) or isinstance(m, nn.Conv2d) or isinstance(m, nn.Linear):
         nn.init.kaiming_normal_(m.weight, nonlinearity='relu')
         if m.bias is not None:
             nn.init.constant_(m.bias, 0)
+
+from torch.optim.lr_scheduler import LRScheduler
+
+class WarmupExponentialLR(LRScheduler):
+    def __init__(self, optimizer, gamma, warmup_steps, last_epoch=-1):
+        self.gamma = gamma
+        self.warmup_steps = warmup_steps
+        super(WarmupExponentialLR, self).__init__(optimizer, last_epoch)
+
+    def get_lr(self):
+        if self.last_epoch < self.warmup_steps:
+            warmup_factor = (self.last_epoch + 1) / self.warmup_steps
+            return [base_lr * warmup_factor for base_lr in self.base_lrs]
+        else:
+            return [base_lr * (self.gamma ** (self.last_epoch - self.warmup_steps)) for base_lr in self.base_lrs]
+
 
 
 def main(args, configs):
@@ -66,13 +75,14 @@ def main(args, configs):
 
     # Prepare model
     model, optimizer = get_model(args, configs, device, train=True)
-    scheduler = torch.optim.lr_scheduler.ExponentialLR(optimizer, gamma=train_config["optimizer"]["gamma"],
-                                                       last_epoch=last_epoch)
+    scheduler = WarmupExponentialLR(optimizer, gamma=train_config["optimizer"]["gamma"],
+                                                       last_epoch=last_epoch,
+                                    warmup_steps=5 if not len(args.pretrained) else 1)
 
     if len(args.pretrained):
         load_pretrained_weights(model, args.pretrained)
 
-    discriminator = DualDiscriminator(n_heads=0, hidden_dim=256, num_blocks=3).to(device)
+    discriminator = DualDiscriminator(n_heads=0, hidden_dim=256, num_blocks=3, dropout=0.1).to(device)
     discriminator.apply(weights_init_he)
     discriminator.train()
     criterion_lsgan = LSGANLoss()
@@ -149,16 +159,17 @@ def main(args, configs):
                     durations_fake = output[4]
                     text_enc = output[14]  # no optimizing the text-encoder
                     seq_lens = batch[2 + 2]
+                    em_hids = batch[12]
 
                     # bring real durs to the log space
-                    durations_real = torch.log(attn_hard_dur.float() + 1)
+                    durations_real = torch.log(attn_hard_dur.float() + 1e-6)
 
                     if step > discriminator_train_start_steps:
                         # train on real
-                        outputs_real = discriminator(durations_real, seq_lens, text_enc.detach())
+                        outputs_real = discriminator(durations_real, seq_lens, text_enc.detach(), em_hids)
 
                         # train on fake
-                        outputs_fake = discriminator(durations_fake.detach(), seq_lens, text_enc.detach())
+                        outputs_fake = discriminator(durations_fake.detach(), seq_lens, text_enc.detach(), em_hids)
 
                         loss_d = criterion_lsgan.discriminator_loss(outputs_real, outputs_fake)
                         loss_d /= grad_acc_step
@@ -179,7 +190,7 @@ def main(args, configs):
                     losses = Loss(batch, output, epoch, model.module)
 
                     if step > discriminator_train_start_steps:
-                        outputs_fake = discriminator(durations_fake, seq_lens, text_enc)
+                        outputs_fake = discriminator(durations_fake, seq_lens, text_enc, em_hids)
                         gan_loss = criterion_lsgan.generator_loss(outputs_fake)
                     else:
                         gan_loss = torch.FloatTensor([0.0]).to(device)

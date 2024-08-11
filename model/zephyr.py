@@ -7,39 +7,6 @@ import torch.nn.functional as F
 
 
 
-class ReduceSequenceLength(nn.Module):
-    def __init__(self):
-        super(ReduceSequenceLength, self).__init__()
-
-    def forward(self, input_tensor):
-        """
-        Reduces the sequence length of a tensor by half using 1D max pooling.
-
-        Args:
-        input_tensor (torch.Tensor): Input tensor of shape (seq_len, N, dim).
-
-        Returns:
-        torch.Tensor: Output tensor with reduced sequence length, shape (seq_len//2, N, dim).
-        """
-        seq_len, N, dim = input_tensor.shape
-
-        # Ensure seq_len is even for the 1D max pooling to reduce by half
-        assert seq_len % 2 == 0, "Sequence length should be even for halving with max pooling"
-
-        # Permute the tensor to (N, dim, seq_len) for 1D max pooling
-        input_tensor_permuted = input_tensor.permute(1, 2, 0)  # (N, dim, seq_len)
-
-        # Apply 1D max pooling with kernel size 2 and stride 2
-        output_tensor_permuted = F.max_pool1d(input_tensor_permuted, kernel_size=2, stride=2)
-
-        # Permute back to original dimensions (seq_len//2, N, dim)
-        output_tensor = output_tensor_permuted.permute(2, 0, 1)  # (seq_len//2, N, dim)
-
-        return output_tensor
-
-
-
-
 class Zephyr(nn.Module):
     """
     Emotion classification model for assisting TTS.
@@ -125,12 +92,12 @@ class Zephyr(nn.Module):
             x_blocks[:, l_i, :, :] = x
 
         # Attention pooling
-        final_hid = x.transpose(1, 2)  # (batch, hidden_dim, seq_len) => (batch, seq_len, hidden_dim)
+        x = x.transpose(1, 2)  # (batch, hidden_dim, seq_len) => (batch, seq_len, hidden_dim)
 
-        x, attention_weights = self.att_pooling(final_hid, x_mask.squeeze(1))
+        final_hid, attention_weights = self.att_pooling(x, x_mask.squeeze(1))
 
         # Fully connected layer
-        x = self.fc(x)  # (batch_size, n_classes)
+        x = self.fc(final_hid)  # (batch_size, n_classes)
 
         # (batch, n_blocks, hidden_dim, seq_len) => (batch, n_blocks, seq_len, hidden_dim)
         x_blocks = x_blocks.transpose(2, 3)

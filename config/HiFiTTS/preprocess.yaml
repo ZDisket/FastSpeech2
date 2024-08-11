@@ -4,7 +4,7 @@ path:
   corpus_path: "../datasets"
   lexicon_path: "lexicon/librispeech-lexicon.txt"
   raw_path: "../predata"
-  preprocessed_path: "./preprocessed_data/LJSpeech"
+  preprocessed_path: "./preprocessed_data/HiFiTTS"
 
 preprocessing:
   val_size: 512 # ignored
@@ -24,8 +24,8 @@ preprocessing:
     mel_fmin: 00
     mel_fmax: 11025 # please set to 8000 for HiFi-GAN vocoder, set to null for MelGAN vocoder
   pitch:
-    feature: "phoneme_level" # support 'phoneme_level' or 'frame_level'
+    feature: "frame_level" # support 'phoneme_level' or 'frame_level'
     normalization: True
   energy:
-    feature: "phoneme_level" # support 'phoneme_level' or 'frame_level'
+    feature: "frame_level" # support 'phoneme_level' or 'frame_level'
     normalization: True
