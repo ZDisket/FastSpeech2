@@ -9,6 +9,8 @@ import pyworld as pw
 from scipy.interpolate import interp1d
 from sklearn.preprocessing import StandardScaler
 from tqdm import tqdm
+from zephyrfe import ZephyrFrontEnd
+from preprocessor.emotion import EmotionProcessorV2
 
 import audio as Audio
 
@@ -21,6 +23,12 @@ class Preprocessor:
         self.val_size = config["preprocessing"]["val_size"]
         self.sampling_rate = config["preprocessing"]["audio"]["sampling_rate"]
         self.hop_length = config["preprocessing"]["stft"]["hop_length"]
+        self.zephyr_model = None
+
+        if len(config["preprocessing"]["zephyr_model"]):
+            proc_em = EmotionProcessorV2()
+            self.zephyr_model = ZephyrFrontEnd(model_path=config["preprocessing"]["zephyr_model"], processor=proc_em)
+
 
         assert config["preprocessing"]["pitch"]["feature"] in [
             "phoneme_level",
@@ -55,6 +63,7 @@ class Preprocessor:
         os.makedirs((os.path.join(self.out_dir, "pitch")), exist_ok=True)
         os.makedirs((os.path.join(self.out_dir, "energy")), exist_ok=True)
         os.makedirs((os.path.join(self.out_dir, "duration")), exist_ok=True)
+        os.makedirs((os.path.join(self.out_dir, "emotion")), exist_ok=True)
 
         print("Processing Data ...")
         out = list()
@@ -69,7 +78,6 @@ class Preprocessor:
             if os.path.isdir(dirf):
                 speakers_dirs.append(dirf)
 
-        print(os.listdir(self.in_dir))
         speakers_dirs = os.listdir(self.in_dir)
         for i, speaker in enumerate(tqdm(speakers_dirs)):
             speakers[speaker] = i
@@ -199,6 +207,17 @@ class Preprocessor:
         # Compute mel-scale spectrogram and energy
         mel_spectrogram, energy = Audio.tools.get_mel_from_wav(wav, self.STFT)
 
+        if self.zephyr_model is not None:
+            _, (x_blocks, final_hid, _) = self.zephyr_model.predict_emotions(raw_text)
+
+            blocks_filename, hidden_filename = f"{speaker}-blocks-{basename}.npy", f"{speaker}-hid-{basename}.npy"
+
+            np.save(
+                os.path.join(self.out_dir, "emotion", blocks_filename), x_blocks.cpu().numpy()
+            )
+            np.save(
+                os.path.join(self.out_dir, "emotion", hidden_filename), final_hid.cpu().numpy()
+            )
 
         pitch_filename = "{}-pitch-{}.npy".format(speaker, basename)
         np.save(os.path.join(self.out_dir, "pitch", pitch_filename), pitch)

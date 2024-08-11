@@ -8,8 +8,8 @@ transformer:
   conv_filter_size: 1024
   conv_kernel_size: [9, 1]
   encoder_dropout: 0.1
-  decoder_dropout: 0.15
-
+  decoder_dropout: 0.2
+  decoder_kernel_sizes: [3, 3, 5, 5, 7, 7]
 
 variance_predictor:
   filter_size: [256, 384, 256]
@@ -20,11 +20,11 @@ variance_predictor:
 duration_predictor:
   type: "tcn" # support tcn (TCN-Attention) or lstm (Conv+Decoder+LSTM)
   bidirectional: true # both: bidirectional
-  att_dropout: 0.25 # only applies to TCN duration pred, dropout applied to attention
-  tcn_channels: [384, 512 , 256] # only applies to TCN duration pred
-  tcn_heads: [2, 4, 2] #tcn: attention heads for each layer. you can use 0 to disable multi-head and use squeeze-excite
-  tcn_kernel_sizes: [2, 3, 3] #tcn: kernel sizes for each layer
-  backwards_tcn_channels: [256, 256]
+  att_dropout: 0.15 # only applies to TCN duration pred, dropout applied to attention
+  tcn_channels: [384, 384] # only applies to TCN duration pred
+  tcn_heads: [2, 2] #tcn: attention heads for each layer. you can use 0 to disable multi-head and use squeeze-excite
+  tcn_kernel_sizes: [2, 3] #tcn: kernel sizes for each layer
+  backwards_tcn_channels: [128, 128]
   backwards_heads: [2, 2]
   backwards_kernel_sizes: [2, 3]
   decoder_depth: 2 # lstm: depth of auxiliary decoder
@@ -32,7 +32,7 @@ duration_predictor:
   kernel_size: 3 # lstm: conv kernel size
   heads: 2 # lstm: attention heads
   filter_size: 256 # lstm: hidden size
-  dropout: 0.15 # both: dropout
+  dropout: 0.175 # both: dropout
 
 
 
@@ -51,6 +51,10 @@ variance_embedding:
 
 multi_speaker: False
 max_seq_len: 1000
+emotion_size: 256
+speaker_channels: 0
+aligner: "rad" # support 'rad': RAD-TTS aligner from NVIDIA, 'mas': Glow-TTS&VITS aligner
+mas_channels: 512 # dim for the MAS projection (for text and mel). only applies if aligner = "mas"
 
 vocoder:
   model: "iSTFTNet" # support 'HiFi-GAN', 'MelGAN'

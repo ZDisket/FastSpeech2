@@ -1,3 +1,4 @@
+torchbnn/*
 ckpt/*
 ckpt2/*
 ckpt3/*
@@ -126,3 +127,4 @@ output/
 *.npy
 TextGrid/
 hifigan/*.pth.tar
+response.txt

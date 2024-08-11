@@ -9,20 +9,17 @@ import torch.nn as nn
 import numpy as np
 import torch.nn.functional as F
 
-from utils.tools import get_mask_from_lengths, pad
-from .submodels import VariantDurationPredictor, TemporalVariancePredictor, DynamicDurationPredictor, NormalizedEmbedding
+from utils.tools import get_mask_from_lengths, pad, compute_phoneme_level_features_optimized
+from .attentions import PartialConv1d, CBAM, TransposeLayerNorm, TransposeRMSNorm
+from .submodels import VariantDurationPredictor, TemporalVariancePredictor, DynamicDurationPredictor, NormalizedEmbedding, Prenet, sequence_mask
 
 from typing import Optional, Tuple
 from numba import jit, prange
+from rotary_embedding_torch import RotaryEmbedding
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 
-def sequence_mask(length, max_length=None):
-    if max_length is None:
-        max_length = length.max()
-    x = torch.arange(max_length, dtype=length.dtype, device=length.device)
-    return x.unsqueeze(0) < length.unsqueeze(1)
 
 
 @jit(nopython=True)
@@ -79,100 +76,6 @@ def binarize_attention_parallel(attn, in_lens, out_lens):
     return torch.from_numpy(attn_out).to(attn.device)
 
 
-class PartialConv1d(torch.nn.Conv1d):
-    """
-    Zero padding creates a unique identifier for where the edge of the data is, such that the model can almost always identify
-    exactly where it is relative to either edge given a sufficient receptive field. Partial padding goes to some lengths to remove
-    this affect.
-    """
-
-    def __init__(self, *args, **kwargs):
-        super(PartialConv1d, self).__init__(*args, **kwargs)
-        weight_maskUpdater = torch.ones(1, 1, self.kernel_size[0])
-        self.register_buffer("weight_maskUpdater", weight_maskUpdater, persistent=False)
-        slide_winsize = torch.tensor(self.weight_maskUpdater.shape[1] * self.weight_maskUpdater.shape[2])
-        self.register_buffer("slide_winsize", slide_winsize, persistent=False)
-
-        if self.bias is not None:
-            bias_view = self.bias.view(1, self.out_channels, 1)
-            self.register_buffer('bias_view', bias_view, persistent=False)
-        # caching part
-        self.last_size = (-1, -1, -1)
-
-        update_mask = torch.ones(1, 1, 1)
-        self.register_buffer('update_mask', update_mask, persistent=False)
-        mask_ratio = torch.ones(1, 1, 1)
-        self.register_buffer('mask_ratio', mask_ratio, persistent=False)
-        self.partial: bool = True
-
-    def calculate_mask(self, input: torch.Tensor, mask_in: Optional[torch.Tensor]):
-        with torch.no_grad():
-            if mask_in is None:
-                mask = torch.ones(1, 1, input.shape[2], dtype=input.dtype, device=input.device)
-            else:
-                mask = mask_in
-            update_mask = F.conv1d(
-                mask,
-                self.weight_maskUpdater,
-                bias=None,
-                stride=self.stride,
-                padding=self.padding,
-                dilation=self.dilation,
-                groups=1,
-            )
-            # for mixed precision training, change 1e-8 to 1e-6
-            mask_ratio = self.slide_winsize / (update_mask + 1e-6)
-            update_mask = torch.clamp(update_mask, 0, 1)
-            mask_ratio = torch.mul(mask_ratio.to(update_mask), update_mask)
-            return torch.mul(input, mask), mask_ratio, update_mask
-
-    def forward_aux(self, input: torch.Tensor, mask_ratio: torch.Tensor, update_mask: torch.Tensor) -> torch.Tensor:
-        assert len(input.shape) == 3
-
-        raw_out = self._conv_forward(input, self.weight, self.bias)
-
-        if self.bias is not None:
-            output = torch.mul(raw_out - self.bias_view, mask_ratio) + self.bias_view
-            output = torch.mul(output, update_mask)
-        else:
-            output = torch.mul(raw_out, mask_ratio)
-
-        return output
-
-    @torch.jit.ignore
-    def forward_with_cache(self, input: torch.Tensor, mask_in: Optional[torch.Tensor] = None) -> torch.Tensor:
-        use_cache = not (torch.jit.is_tracing() or torch.onnx.is_in_onnx_export())
-        cache_hit = use_cache and mask_in is None and self.last_size == input.shape
-        if cache_hit:
-            mask_ratio = self.mask_ratio
-            update_mask = self.update_mask
-        else:
-            input, mask_ratio, update_mask = self.calculate_mask(input, mask_in)
-            if use_cache:
-                # if a mask is input, or tensor shape changed, update mask ratio
-                self.last_size = tuple(input.shape)
-                self.update_mask = update_mask
-                self.mask_ratio = mask_ratio
-        return self.forward_aux(input, mask_ratio, update_mask)
-
-    def forward_no_cache(self, input: torch.Tensor, mask_in: Optional[torch.Tensor] = None) -> torch.Tensor:
-        if self.partial:
-            input, mask_ratio, update_mask = self.calculate_mask(input, mask_in)
-            return self.forward_aux(input, mask_ratio, update_mask)
-        else:
-            if mask_in is not None:
-                input = torch.mul(input, mask_in)
-            return self._conv_forward(input, self.weight, self.bias)
-
-    def forward(self, input: torch.Tensor, mask_in: Optional[torch.Tensor] = None) -> torch.Tensor:
-        if self.partial:
-            return self.forward_with_cache(input, mask_in)
-        else:
-            if mask_in is not None:
-                input = torch.mul(input, mask_in)
-            return self._conv_forward(input, self.weight, self.bias)
-
-
 class ConvNorm(torch.nn.Module):
     def __init__(
             self,
@@ -187,6 +90,8 @@ class ConvNorm(torch.nn.Module):
             use_partial_padding: bool = False,
             use_weight_norm: bool = False,
             norm_fn=None,
+            use_cbam=False,
+            drop=None,
     ):
         super(ConvNorm, self).__init__()
         if padding is None:
@@ -209,13 +114,16 @@ class ConvNorm(torch.nn.Module):
         if norm_fn is not None:
             self.norm = norm_fn(out_channels, affine=True)
         else:
-            self.norm = None
+            self.norm = nn.Identity()
         self.conv = conv
+        self.cbam = CBAM(out_channels) if use_cbam else nn.Identity()
+        self.drop = nn.Dropout(drop) if drop is not None else nn.Identity()
 
     def forward(self, input: torch.Tensor, mask_in: Optional[torch.Tensor] = None) -> torch.Tensor:
         ret = self.conv(input, mask_in)
-        if self.norm is not None:
-            ret = self.norm(ret)
+        ret = self.cbam(ret)
+        ret = self.norm(ret)
+        ret = self.drop(ret)
         return ret
 
 
@@ -264,16 +172,18 @@ class AlignmentEncoder(torch.nn.Module):
         self.softmax = SafeSoftmax(dim=3)
         self.log_softmax = SafeLogSoftmax(dim=3)
 
+        self.rotary_emb = RotaryEmbedding(n_att_channels // 2)
+
         self.key_proj = nn.Sequential(
-            ConvNorm(n_text_channels, n_text_channels * 2, kernel_size=3, bias=True, w_init_gain='relu'),
+            ConvNorm(n_text_channels, n_text_channels * 2, kernel_size=3, bias=True, w_init_gain='relu', use_cbam=False, drop=0.1),
             torch.nn.ReLU(),
             ConvNorm(n_text_channels * 2, n_att_channels, kernel_size=1, bias=True),
         )
 
         self.query_proj = nn.Sequential(
-            ConvNorm(n_mel_channels, n_mel_channels * 2, kernel_size=3, bias=True, w_init_gain='relu'),
+            ConvNorm(n_mel_channels, n_mel_channels * 2, kernel_size=3, bias=True, w_init_gain='relu', use_cbam=False, drop=0.1),
             torch.nn.ReLU(),
-            ConvNorm(n_mel_channels * 2, n_mel_channels, kernel_size=1, bias=True),
+            ConvNorm(n_mel_channels * 2, n_mel_channels, kernel_size=1, bias=True, drop=0.1),
             torch.nn.ReLU(),
             ConvNorm(n_mel_channels, n_att_channels, kernel_size=1, bias=True),
         )
@@ -429,6 +339,8 @@ class VarianceAdaptor(nn.Module):
         super(VarianceAdaptor, self).__init__()
 
         dp_type = model_config["duration_predictor"]["type"]
+        self.spk_channels = model_config["speaker_channels"]
+        self.aligner_type = model_config["aligner"]
 
         if dp_type == "tcn":
             self.duration_predictor = DynamicDurationPredictor(
@@ -436,13 +348,14 @@ class VarianceAdaptor(nn.Module):
                 num_channels=model_config["duration_predictor"]["tcn_channels"],
                 kernel_sizes=model_config["duration_predictor"]["tcn_kernel_sizes"],
                 dropout=model_config["duration_predictor"]["dropout"],
-                start_i=1,
+                start_i=4,
                 att_dropout=model_config["duration_predictor"]["att_dropout"],
                 heads=model_config["duration_predictor"]["tcn_heads"],
                 bidirectional=model_config["duration_predictor"]["bidirectional"],
                 backwards_channels=model_config["duration_predictor"]["backwards_tcn_channels"],
                 backwards_heads=model_config["duration_predictor"]["backwards_heads"],
                 backwards_kernel_sizes=model_config["duration_predictor"]["backwards_kernel_sizes"],
+                speaker_channels=self.spk_channels,
             )
             dp_output_channels = model_config["duration_predictor"]["tcn_channels"][-1]
         elif dp_type == "lstm":
@@ -462,20 +375,24 @@ class VarianceAdaptor(nn.Module):
         else:
             raise RuntimeError(f"Invalid duration predictor type: {dp_type}. Valid are tcn and lstm")
 
+        if self.spk_channels > 0:
+            self.pe_spk_cond = nn.Sequential(nn.Linear(self.spk_channels, model_config["transformer"]["encoder_hidden"]),
+                                             nn.Dropout(0.1),)
+
         self.length_regulator = LengthRegulator()
         self.pitch_predictor = TemporalVariancePredictor(
             input_channels=model_config["transformer"]["encoder_hidden"],
             num_channels=model_config["variance_predictor"]["filter_size"],
             kernel_size=model_config["variance_predictor"]["kernel_size"],
             dropout=model_config["variance_predictor"]["dropout"],
-            cond_input_size=dp_output_channels,
+            cond_input_size=None,
         )
         self.energy_predictor = TemporalVariancePredictor(
             input_channels=model_config["transformer"]["encoder_hidden"],
             num_channels=model_config["variance_predictor"]["filter_size"],
             kernel_size=model_config["variance_predictor"]["kernel_size"],
             dropout=model_config["variance_predictor"]["dropout"],
-            cond_input_size=dp_output_channels,
+            cond_input_size=None,
         )
 
         self.pitch_feature_level = preprocess_config["preprocessing"]["pitch"][
@@ -524,18 +441,16 @@ class VarianceAdaptor(nn.Module):
                 requires_grad=False,
             )
 
-        # I'll make these into NormalizedEmbeddings later
-        self.pitch_embedding = nn.Embedding(
-            n_bins, model_config["transformer"]["encoder_hidden"]
+        self.pitch_embedding = NormalizedEmbedding(
+            n_bins, model_config["transformer"]["encoder_hidden"], model_config["variance_predictor"]["dropout_on_emb"], False
         )
-        # BatchNorm is better than LayerNorm at regularization, our main objective here
-        self.pitch_norm = TransposeBatchNorm(model_config["transformer"]["encoder_hidden"])
-        self.energy_embedding = nn.Embedding(
-            n_bins, model_config["transformer"]["encoder_hidden"]
+        self.energy_embedding = NormalizedEmbedding(
+            n_bins, model_config["transformer"]["encoder_hidden"], model_config["variance_predictor"]["dropout_on_emb"], False
         )
-        self.energy_norm = TransposeBatchNorm(model_config["transformer"]["encoder_hidden"])
 
-        self.pitch_energy_drop = nn.Dropout(model_config["variance_predictor"]["dropout_on_emb"])
+        self.hid_proj = nn.Sequential(nn.Linear(dp_output_channels, model_config["transformer"]["encoder_hidden"]),
+                                     nn.ReLU(inplace=True),
+                                     nn.Dropout(0.5),)
 
     def get_pitch_embedding(self, x, target, mask, control, y, y_mask):
         prediction = self.pitch_predictor(x, mask, y, y_mask)
@@ -547,8 +462,6 @@ class VarianceAdaptor(nn.Module):
                 torch.bucketize(prediction, self.pitch_bins)
             )
 
-        embedding = self.pitch_norm(embedding)
-        embedding = self.pitch_energy_drop(embedding)
         return prediction, embedding
 
     def get_energy_embedding(self, x, target, mask, control, y, y_mask):
@@ -561,8 +474,6 @@ class VarianceAdaptor(nn.Module):
                 torch.bucketize(prediction, self.energy_bins)
             )
 
-        embedding = self.energy_norm(embedding)
-        embedding = self.pitch_energy_drop(embedding)
         return prediction, embedding
 
     def forward(
@@ -570,6 +481,9 @@ class VarianceAdaptor(nn.Module):
             x,
             src_mask,
             src_lens,
+            mel_lens,
+            in_emotion=None,
+            in_spk=None,
             mel_mask=None,
             max_len=None,
             pitch_target=None,
@@ -579,19 +493,33 @@ class VarianceAdaptor(nn.Module):
             e_control=1.0,
             d_control=1.0,
     ):
-        log_duration_prediction, x_mask, dur_hidden = self.duration_predictor(x, src_lens)
+        log_duration_prediction, x_mask, dur_hidden = self.duration_predictor(x, src_lens, in_emotion, in_spk)
 
+        dur_hidden = self.hid_proj(dur_hidden).masked_fill(x_mask.unsqueeze(-1), 0)
 
         if self.pitch_feature_level == "phoneme_level":
+            x = x + dur_hidden
+
+        if self.spk_channels > 0:
+            x = x + self.pe_spk_cond(in_spk)
+
+        if self.pitch_feature_level == "phoneme_level":
+            if duration_target is not None:
+                pitch_target = compute_phoneme_level_features_optimized(duration_target, pitch_target)
+
             pitch_prediction, pitch_embedding = self.get_pitch_embedding(
                 x, pitch_target, src_mask, p_control, dur_hidden, x_mask
             )
             x = x + pitch_embedding
         if self.energy_feature_level == "phoneme_level":
+            if duration_target is not None:
+                energy_target = compute_phoneme_level_features_optimized(duration_target, energy_target)
+
             energy_prediction, energy_embedding = self.get_energy_embedding(
                 x, energy_target, src_mask, p_control, dur_hidden, x_mask
             )
             x = x + energy_embedding
+
 
         if duration_target is not None:
             x, mel_len = self.length_regulator(x, duration_target, max_len)
@@ -601,19 +529,24 @@ class VarianceAdaptor(nn.Module):
                 (torch.round(torch.exp(log_duration_prediction) - 1) * d_control),
                 min=0,
             )
-            x, mel_len = self.length_regulator(x, duration_rounded, max_len)
+            x, mel_len = self.length_regulator(x, duration_rounded, max_len, mel_lens)
             mel_mask = get_mask_from_lengths(mel_len)
+
+        x1_mask = sequence_mask(x.size(1), mel_len).unsqueeze(1)  # (batch, 1, max_mel_len)
 
         if self.pitch_feature_level == "frame_level":
             pitch_prediction, pitch_embedding = self.get_pitch_embedding(
                 x, pitch_target, mel_mask, p_control, dur_hidden, x_mask
             )
             x = x + pitch_embedding
+          #  x = self.post_pitch(x, x1_mask)
+
         if self.energy_feature_level == "frame_level":
             energy_prediction, energy_embedding = self.get_energy_embedding(
                 x, energy_target, mel_mask, p_control, dur_hidden, x_mask
             )
             x = x + energy_embedding
+           # x = self.post_energy(x, x1_mask)
 
         return (
             x,
@@ -632,7 +565,7 @@ class LengthRegulator(nn.Module):
     def __init__(self):
         super(LengthRegulator, self).__init__()
 
-    def LR(self, x, duration, max_len):
+    def LR(self, x, duration, max_len, mel_lens=None):
         output = list()
         mel_len = list()
         for batch, expand_target in zip(x, duration):
@@ -645,7 +578,13 @@ class LengthRegulator(nn.Module):
         else:
             output = pad(output)
 
-        return output, torch.LongTensor(mel_len).to(device)
+        # Override lengths if mel_lens is provided
+        if mel_lens is not None:
+            mel_len = mel_lens
+        else:
+            mel_len = torch.LongTensor(mel_len).to(device)
+
+        return output, mel_len
 
     def expand(self, batch, predicted):
         out = list()
@@ -657,8 +596,8 @@ class LengthRegulator(nn.Module):
 
         return out
 
-    def forward(self, x, duration, max_len):
-        output, mel_len = self.LR(x, duration, max_len)
+    def forward(self, x, duration, max_len, mel_lens=None):
+        output, mel_len = self.LR(x, duration, max_len, mel_lens)
         return output, mel_len
 
 

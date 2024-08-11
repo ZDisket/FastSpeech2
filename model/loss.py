@@ -3,9 +3,30 @@ import torch.nn as nn
 from numba import jit
 import numpy as np
 from torch.nn import functional as F
+import torchbnn as bnn
+from .modules import SafeLogSoftmax
+from utils.tools import compute_phoneme_level_features_optimized
+
+
+class LSGANLoss(nn.Module):
+    def __init__(self, real_label=1.0, fake_label=0.0):
+        super(LSGANLoss, self).__init__()
+        self.real_label = real_label
+        self.fake_label = fake_label
+        self.criterion = nn.MSELoss()
+
+    def discriminator_loss(self, real_output, fake_output):
+        real_loss = self.criterion(real_output, torch.full_like(real_output, self.real_label))
+        fake_loss = self.criterion(fake_output, torch.full_like(fake_output, self.fake_label))
+        return 0.5 * (real_loss + fake_loss)
+
+    def generator_loss(self, fake_output):
+        return self.criterion(fake_output, torch.full_like(fake_output, self.real_label))
+
 
 class CharbonnierLoss(nn.Module):
     """Charbonnier Loss (L1) - generalized to handle tensors of arbitrary shapes."""
+
     def __init__(self, eps=1e-6):
         super(CharbonnierLoss, self).__init__()
         self.eps = eps
@@ -20,12 +41,13 @@ class CharbonnierLoss(nn.Module):
 
         # Calculate the Charbonnier loss
         diff = x - y
-        loss = torch.sqrt(diff.pow(2) + self.eps**2).mean()  # Mean across all dimensions except batch
+        loss = torch.sqrt(diff.pow(2) + self.eps ** 2).mean()  # Mean across all dimensions except batch
         return loss
 
 
 class Charbonnier1D(nn.Module):
     """Charbonnier Loss for 1D sequences (batch_size, seq_len)."""
+
     def __init__(self, eps=1e-6):
         super(Charbonnier1D, self).__init__()
         self.eps = eps
@@ -50,12 +72,13 @@ class Charbonnier1D(nn.Module):
         diff = diff[~mask]  # Include only valid elements using the inverted mask
 
         # Charbonnier loss calculation
-        loss = torch.sqrt(diff.pow(2) + self.eps**2).mean()  # Mean across valid dimensions
+        loss = torch.sqrt(diff.pow(2) + self.eps ** 2).mean()  # Mean across valid dimensions
         return loss
 
 
 class MSE1D(nn.Module):
     """Mean Squared Error Loss for 1D sequences with masking (batch_size, seq_len)."""
+
     def __init__(self):
         super(MSE1D, self).__init__()
 
@@ -72,7 +95,8 @@ class MSE1D(nn.Module):
         Returns:
             torch.Tensor: Computed MSE loss for valid elements.
         """
-        assert x.shape == y.shape, "Shape mismatch between predictions and ground truth"
+
+        assert x.shape == y.shape, f"Shape mismatch between predictions and ground truth, {x.size()}, vs {y.size()}"
         assert mask.shape == x.shape, "Shape mismatch between mask and predictions/ground_truth"
 
         # Apply the mask by selecting elements where mask is False
@@ -111,7 +135,7 @@ class TemporalConsistencyLoss(nn.Module):
         """
         # Ensure predictions and ground truth have the same shape
         assert predictions.shape == ground_truth.shape, "Shape mismatch between predictions and ground truth"
-        assert mask.shape == predictions.shape, "Shape mismatch between mask and predictions/ground_truth"
+        assert mask.shape == predictions.shape, f"Shape mismatch between mask and predictions/ground_truth, mask: {mask.size()}, preds = {predictions.size()}"
 
         # Compute consecutive differences for predictions and ground truth
         diff_pred = predictions[:, 1:] - predictions[:, :-1]
@@ -149,10 +173,9 @@ class BinLoss(torch.nn.modules.loss._Loss):
 class ForwardSumLoss(torch.nn.modules.loss._Loss):
     def __init__(self, blank_logprob=-1):
         super().__init__()
-        self.log_softmax = torch.nn.LogSoftmax(dim=3)
+        self.log_softmax = SafeLogSoftmax(dim=3)
         self.ctc_loss = torch.nn.CTCLoss(zero_infinity=True)
         self.blank_logprob = blank_logprob
-
 
     def forward(self, attn_logprob, in_lens, out_lens):
         key_lens = in_lens
@@ -168,104 +191,13 @@ class ForwardSumLoss(torch.nn.modules.loss._Loss):
             loss = self.ctc_loss(
                 curr_logprob,
                 target_seq,
-                input_lengths=query_lens[bid : bid + 1],
-                target_lengths=key_lens[bid : bid + 1],
+                input_lengths=query_lens[bid: bid + 1],
+                target_lengths=key_lens[bid: bid + 1],
             )
             total_loss += loss
 
         total_loss /= attn_logprob.shape[0]
         return total_loss
-
-
-class FastSpeech2Loss(nn.Module):
-    """ FastSpeech2 Loss """
-
-    def __init__(self, preprocess_config, model_config):
-        super(FastSpeech2Loss, self).__init__()
-        self.pitch_feature_level = preprocess_config["preprocessing"]["pitch"][
-            "feature"
-        ]
-        self.energy_feature_level = preprocess_config["preprocessing"]["energy"][
-            "feature"
-        ]
-        self.mse_loss = nn.MSELoss()
-        self.mae_loss = nn.L1Loss()
-
-    def forward(self, inputs, predictions):
-        (
-            mel_targets,
-            _,
-            _,
-            pitch_targets,
-            energy_targets,
-            duration_targets,
-        ) = inputs[6:]
-        (
-            mel_predictions,
-            postnet_mel_predictions,
-            pitch_predictions,
-            energy_predictions,
-            log_duration_predictions,
-            _,
-            src_masks,
-            mel_masks,
-            _,
-            _,
-        ) = predictions
-        src_masks = ~src_masks
-        mel_masks = ~mel_masks
-        log_duration_targets = torch.log(duration_targets.float() + 1)
-        mel_targets = mel_targets[:, : mel_masks.shape[1], :]
-        mel_masks = mel_masks[:, :mel_masks.shape[1]]
-
-        log_duration_targets.requires_grad = False
-        pitch_targets.requires_grad = False
-        energy_targets.requires_grad = False
-        mel_targets.requires_grad = False
-
-        if self.pitch_feature_level == "phoneme_level":
-            pitch_predictions = pitch_predictions.masked_select(src_masks)
-            pitch_targets = pitch_targets.masked_select(src_masks)
-        elif self.pitch_feature_level == "frame_level":
-            pitch_predictions = pitch_predictions.masked_select(mel_masks)
-            pitch_targets = pitch_targets.masked_select(mel_masks)
-
-        if self.energy_feature_level == "phoneme_level":
-            energy_predictions = energy_predictions.masked_select(src_masks)
-            energy_targets = energy_targets.masked_select(src_masks)
-        if self.energy_feature_level == "frame_level":
-            energy_predictions = energy_predictions.masked_select(mel_masks)
-            energy_targets = energy_targets.masked_select(mel_masks)
-
-        log_duration_predictions = log_duration_predictions.masked_select(src_masks)
-        log_duration_targets = log_duration_targets.masked_select(src_masks)
-
-        mel_predictions = mel_predictions.masked_select(mel_masks.unsqueeze(-1))
-        postnet_mel_predictions = postnet_mel_predictions.masked_select(
-            mel_masks.unsqueeze(-1)
-        )
-        mel_targets = mel_targets.masked_select(mel_masks.unsqueeze(-1))
-
-        mel_loss = self.mae_loss(mel_predictions, mel_targets)
-        postnet_mel_loss = self.mae_loss(postnet_mel_predictions, mel_targets)
-
-        pitch_loss = self.mse_loss(pitch_predictions, pitch_targets)
-        energy_loss = self.mse_loss(energy_predictions, energy_targets)
-        duration_loss = self.mse_loss(log_duration_predictions, log_duration_targets)
-
-        total_loss = (
-            mel_loss + postnet_mel_loss + duration_loss + pitch_loss + energy_loss
-        )
-
-        return (
-            total_loss,
-            mel_loss,
-            postnet_mel_loss,
-            pitch_loss,
-            energy_loss,
-            duration_loss,
-        )
-
 
 
 def pad_tensor_to_max_width(tensor, lens_w):
@@ -280,6 +212,47 @@ def pad_tensor_to_max_width(tensor, lens_w):
         tensor = F.pad(tensor, padding, "constant", 0)  # Adding zero padding
 
     return tensor
+
+
+class DurationMatchingLoss(nn.Module):
+    def __init__(self):
+        super(DurationMatchingLoss, self).__init__()
+        self.mse_loss = nn.MSELoss()
+
+    def forward(self, log_durations: torch.Tensor, mel_mask: torch.Tensor, duration_mask: torch.Tensor) -> torch.Tensor:
+        """
+        Compute the loss that encourages the sum of log durations to match the log lengths of mel-spectrograms,
+        taking into account masks for invalid durations and mel-spectrogram lengths.
+
+        Args:
+            log_durations (torch.Tensor): A tensor of shape (batch, max_duration_len) containing log durations.
+            mel_mask (torch.Tensor): A boolean tensor of shape (batch, max_mel_len) where True indicates a valid mel element.
+            duration_mask (torch.Tensor): A boolean tensor of shape (batch, max_duration_len) where True indicates a valid duration.
+
+        Returns:
+            torch.Tensor: The computed loss.
+        """
+        # Ensure the masks are boolean tensors
+        mel_mask = mel_mask.bool()
+        duration_mask = duration_mask.bool()
+
+        # Infer the mel lengths from the mel mask
+        mel_lengths = mel_mask.sum(dim=1).float()
+
+        # Apply the mask to the log durations, setting invalid positions to a very large negative number
+        log_durations_masked = log_durations.masked_fill(duration_mask == 0, -float('inf'))
+
+        # Sum the log durations for each sequence using logsumexp to maintain numerical stability
+        log_duration_sums = log_durations_masked.logsumexp(dim=1)
+
+        # Convert mel lengths to log space
+        log_mel_lengths = torch.log(mel_lengths + 1e-6)
+
+        # Compute the mean squared error loss between log duration sums and log mel lengths
+        loss = self.mse_loss(log_duration_sums, log_mel_lengths)
+
+        return loss
+
 
 class FastSpeech3Loss(nn.Module):
     """ FastSpeech2+1 Loss """
@@ -300,23 +273,31 @@ class FastSpeech3Loss(nn.Module):
         self.bin_loss = BinLoss()
         self.mse2_loss = MSE1D()
         self.charb_loss = Charbonnier1D()
-        self.temp_loss = TemporalConsistencyLoss(1.0, True) # I tested 0.35, 0.5, 0.75, but 1.0 is best
+        self.temp_loss = TemporalConsistencyLoss(1.0, True)  # I tested 0.35, 0.5, 0.75, but 1.0 is best
+        self.pe_temp_loss = TemporalConsistencyLoss(1.0, True)  # I tested 0.35, 0.5, 0.75, but 1.0 is best
+        self.kl_loss = bnn.BKLLoss(reduction='sum', last_layer_only=False)
+
+        self.duration_kl_loss_weight = 1.0
+        self.pitch_energy_kl_loss_weight = 1.0
 
         # With all our new losses (attention, masked duration, temporal), the mel loss (individual) goes from being 20% of the loss
         # to just 6% and audio quality suffers greatly. We re-weight, although too much is detrimental.
-        self.mel_loss_weight = 1.4
-        self.mel_postnet_loss_weight = 1.5
+        self.mel_loss_weight = 1.0
+        self.mel_postnet_loss_weight = 1.0
 
         self.bin_loss_start_epoch = train_config["optimizer"]["bin_loss_start_epoch"]
         self.bin_loss_warmup_epochs = train_config["optimizer"]["bin_loss_warmup_epochs"]
 
-    def forward(self, inputs, predictions, epoch):
+    def forward(self, inputs, predictions, epoch, model=None):
         (
             mel_targets,
             _,
             _,
             pitch_targets,
             energy_targets,
+            _,
+            _,
+            _,
         ) = inputs[6:]
         (
             mel_predictions,
@@ -333,6 +314,7 @@ class FastSpeech3Loss(nn.Module):
             attn_hard,
             attn_soft,
             attn_hard_dur,
+            _,
         ) = predictions
 
         src_masks = ~src_masks
@@ -346,6 +328,12 @@ class FastSpeech3Loss(nn.Module):
         pitch_targets.requires_grad = False
         energy_targets.requires_grad = False
         mel_targets.requires_grad = False
+
+        if self.pitch_feature_level == "phoneme_level":
+            pitch_targets = compute_phoneme_level_features_optimized(attn_hard_dur, pitch_targets)
+
+        if self.energy_feature_level == "phoneme_level":
+            energy_targets = compute_phoneme_level_features_optimized(attn_hard_dur, energy_targets)
 
         pitch_t, pitch_p = pitch_targets.clone(), pitch_predictions.clone()
         energy_t, energy_p = energy_targets.clone(), energy_predictions.clone()
@@ -364,8 +352,8 @@ class FastSpeech3Loss(nn.Module):
             energy_predictions = energy_predictions.masked_select(mel_masks)
             energy_targets = energy_targets.masked_select(mel_masks)
 
-       # log_duration_predictions = log_duration_predictions.masked_select(src_masks)
-        #log_duration_targets = log_duration_targets.masked_select(src_masks)
+        # log_duration_predictions = log_duration_predictions.masked_select(src_masks)
+        # log_duration_targets = log_duration_targets.masked_select(src_masks)
 
         mel_predictions = mel_predictions.masked_select(mel_masks.unsqueeze(-1))
         postnet_mel_predictions = postnet_mel_predictions.masked_select(
@@ -392,25 +380,21 @@ class FastSpeech3Loss(nn.Module):
                                            log_duration_targets,
                                            ~src_masks)
 
-        #pitch_p = pitch_p.masked_fill(~mel_masks, 0)
-       # pitch_t = pitch_t.masked_fill(~mel_masks, 0)
+        pitch_energy_mask = ~mel_masks if self.pitch_feature_level == "frame_level" else ~src_masks
 
-        pitch_temporal = self.temp_loss(pitch_p,
-                                        pitch_t,
-                                        ~mel_masks)
+        pitch_temporal = self.pe_temp_loss(pitch_p,
+                                           pitch_t,
+                                           pitch_energy_mask)
 
-        #energy_p = energy_p.masked_fill(~mel_masks, 0)
-        #energy_t = energy_t.masked_fill(~mel_masks, 0)
-
-        energy_temporal = self.temp_loss(energy_p,
-                                         energy_t,
-                                         ~mel_masks)
+        energy_temporal = self.pe_temp_loss(energy_p,
+                                            energy_t,
+                                            pitch_energy_mask)
 
         total_temporal = duration_temporal + pitch_temporal + energy_temporal
 
+
         # sometimes (almost always for some reason), output_lengths.max() == attn_logprob.size(2) + 1
         output_lengths = torch.clamp_max(output_lengths, attn_logprob.size(2))
-
         al_forward_sum = self.forward_sum(attn_logprob=attn_logprob, in_lens=input_lengths, out_lens=output_lengths)
 
         total_attn_loss = al_forward_sum
@@ -420,11 +404,20 @@ class FastSpeech3Loss(nn.Module):
             al_match_loss = self.bin_loss(hard_attention=attn_hard, soft_attention=attn_soft) * bin_loss_scale
             total_attn_loss += al_match_loss
 
+        kl_duration = self.kl_loss(model.variance_adaptor.duration_predictor) * self.duration_kl_loss_weight
+        kl_energy = self.kl_loss(model.variance_adaptor.energy_predictor) * self.pitch_energy_kl_loss_weight
+        kl_pitch = self.kl_loss(model.variance_adaptor.pitch_predictor) * self.pitch_energy_kl_loss_weight
+
+        kl_pitch_energy = kl_energy + kl_pitch
+
+        total_kl = kl_duration + kl_pitch_energy
+
         total_loss = (
-            mel_loss + postnet_mel_loss + duration_loss + pitch_loss + energy_loss + total_attn_loss + total_temporal
+                mel_loss + postnet_mel_loss + duration_loss + pitch_loss + energy_loss +
+                total_attn_loss + total_temporal + total_kl
         )
 
-        return (
+        ret = (
             total_loss,
             mel_loss,
             postnet_mel_loss,
@@ -434,4 +427,7 @@ class FastSpeech3Loss(nn.Module):
             total_attn_loss,
             duration_temporal,
             total_temporal,
+            kl_duration,
+            kl_pitch_energy,
         )
+        return list(ret)

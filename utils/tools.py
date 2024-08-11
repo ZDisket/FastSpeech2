@@ -15,9 +15,39 @@ matplotlib.use("Agg")
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 from text import text_to_sequence, sequence_to_text, cleaned_text_to_sequence
 
+# GPT-4 wrote this hyper-optimized voodoo function. It's 10x faster than a naive loop-based impl
+# (0.5s vs 0.05s). Back in the days before that I would've had to write a numba guvectorize function.
+def compute_phoneme_level_features_optimized(duration, mel_pitch):
+    """
+    Convert mel-level features (mostly pitch/energy) into phoneme-level using durations to average.
+    Note that masking is not taken into account, apply it in your loss function
+
+    :param duration: Predicted int/long durations tensor shape (batch, text_len)
+    :param mel_pitch: Predicted mel-level float features tensor shape (batch, mel_len)
+    :return: Phoneme-level features float tensor shape (batch, text_len)
+    """
+    batch_size, phoneme_len = duration.shape
+
+    # Compute the cumulative sum of durations to get the end indices of each phoneme
+    cumsum_durations = torch.cumsum(duration, dim=1)
+    start_indices = torch.cat(
+        [torch.zeros((batch_size, 1), device=duration.device, dtype=duration.dtype), cumsum_durations[:, :-1]], dim=1)
+
+    # Create a mask to select pitch values for each phoneme
+    mask = (torch.arange(mel_pitch.size(1), device=mel_pitch.device).view(1, 1, -1) < cumsum_durations.unsqueeze(2)) & (
+                torch.arange(mel_pitch.size(1), device=mel_pitch.device).view(1, 1, -1) >= start_indices.unsqueeze(2))
+
+    # Compute phoneme-level pitch
+    masked_pitch = mel_pitch.unsqueeze(1) * mask.float()
+    sum_pitch = masked_pitch.sum(dim=2)
+    count_pitch = mask.sum(dim=2).float()
+
+    phoneme_pitch = sum_pitch / (count_pitch + 1e-9)  # Add a small value to avoid division by zero
+
+    return phoneme_pitch
 
 def to_device(data, device):
-    if len(data) == 11:
+    if len(data) == 11 + 3:
         (
             ids,
             raw_texts,
@@ -30,6 +60,9 @@ def to_device(data, device):
             max_mel_len,
             pitches,
             energies,
+            emotion_blocks,
+            emotion_hiddens,
+            emotion_lens,
         ) = data
 
         speakers = torch.from_numpy(speakers).long().to(device)
@@ -39,6 +72,9 @@ def to_device(data, device):
         mel_lens = torch.from_numpy(mel_lens).to(device)
         pitches = torch.from_numpy(pitches).float().to(device)
         energies = torch.from_numpy(energies).to(device)
+        emotion_blocks = torch.from_numpy(emotion_blocks).to(device)
+        emotion_hiddens = torch.from_numpy(emotion_hiddens).to(device)
+        emotion_lens = torch.from_numpy(emotion_lens).to(device)
 
         return (
             ids,
@@ -52,6 +88,9 @@ def to_device(data, device):
             max_mel_len,
             pitches,
             energies,
+            emotion_blocks,
+            emotion_hiddens,
+            emotion_lens,
         )
 
     if len(data) == 6:
@@ -87,7 +126,7 @@ def log_attention_maps(logger, attention_tensor, widths, heights, step, tag_pref
         fig, ax = plt.subplots(figsize=(fig_width, fig_height))  # Create a matplotlib figure and axes.
         # Slice the attention tensor to the specified width and height
         attention_map = attention_tensor[i, :heights[i], :widths[i]].cpu().numpy()
-        im = ax.imshow(attention_map, cmap='hot', interpolation='nearest')
+        im = ax.imshow(attention_map, cmap='viridis', interpolation='nearest')
         # Adjust colorbar size by changing fraction and pad
         plt.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
         plt.title(f'Attention Map {i + 1}')
@@ -112,6 +151,11 @@ def log(
         logger.add_scalar("Loss/attention_loss", losses[6], step)
         logger.add_scalar("Loss/duration_temporal_loss", losses[7], step)
         logger.add_scalar("Loss/total_temporal_loss", losses[8], step)
+        logger.add_scalar("Loss/duration_kl_loss", losses[9], step)
+        logger.add_scalar("Loss/pitch_energy_kl_loss", losses[10], step)
+        if len(losses) > 11:
+            logger.add_scalar("Loss/dur_discriminator_loss", losses[11], step)
+            logger.add_scalar("Loss/dur_gan_loss", losses[12], step)
 
     if fig is not None:
         logger.add_figure(tag, fig)
@@ -296,6 +340,33 @@ def plot_mel(data, stats, titles):
 
     return fig
 
+def pad_zephyr_outputs(hidden_blocks_list):
+    """
+    Zero-pads lists of numpy arrays along the sequence length dimension and returns their lengths.
+
+    Args:
+        hidden_blocks_list (list of np.ndarray): List of arrays with shape (1, 4, seq_len, hidden_dim).
+
+    Returns:
+        tuple: A numpy array, zero-padded along the sequence length dimension, and an array of lengths.
+    """
+    # Determine the maximum sequence length in the list
+    max_seq_len = max(arr.shape[2] for arr in hidden_blocks_list)
+
+    # Get lengths of each sequence
+    lengths = np.array([arr.shape[2] for arr in hidden_blocks_list])
+
+    # Pad hidden_blocks_list
+    padded_hidden_blocks = []
+    for arr in hidden_blocks_list:
+        pad_width = ((0, 0), (0, 0), (0, max_seq_len - arr.shape[2]), (0, 0))
+        padded_arr = np.pad(arr, pad_width, mode='constant', constant_values=0)
+        padded_hidden_blocks.append(padded_arr)
+
+    # Convert list to numpy array
+    padded_hidden_blocks = np.concatenate(padded_hidden_blocks, axis=0)
+
+    return padded_hidden_blocks, lengths
 
 def pad_1D(inputs, PAD=0):
     def pad_data(x, length, PAD):
@@ -359,10 +430,15 @@ def preproc_text(in_txt, cleaners = ["english_cleaners2"]):
     return txt_arr
 
 
-def fs2_infer(inmodel, text):
+def fs2_infer(inmodel, text, in_blocks, in_hid):
     src_len = torch.from_numpy(np.array([text.shape[1]])).to(device)
     text = torch.IntTensor(text).to(device)
-    predictions = inmodel.infer([0], text, src_len, src_len[0])
+    em_len = torch.from_numpy(np.array([in_hid.shape[1]])).to(device)
+    in_blocks = torch.from_numpy(in_blocks).to(device)
+    in_hid = torch.from_numpy(in_hid).to(device).unsqueeze(0)
+    speakers = torch.IntTensor([0])
+
+    predictions = inmodel.infer(speakers, text, src_len, src_len[0], in_blocks, in_hid, em_len)
     mel, mel_postnet = predictions[0], predictions[1]
 
     mel_torch = mel.transpose(1, 2).detach()
@@ -373,14 +449,14 @@ def fs2_infer(inmodel, text):
     return mel, mel_postnet, mel_torch, mel_postnet_torch
 
 
-def test_one_fs2(inmodel, invocoder, in_txt):
+def test_one_fs2(inmodel, invocoder, in_txt, in_blocks, in_hid):
     with torch.no_grad():
         txt = preproc_text(in_txt)
         # [text_len] => [1, text_len]
 
         txt = np.expand_dims(txt, 0)
         try:
-            mel, mel_postnet, mel_torch, mel_postnet_torch = fs2_infer(inmodel, txt)
+            mel, mel_postnet, mel_torch, mel_postnet_torch = fs2_infer(inmodel, txt, in_blocks, in_hid)
         except RuntimeError:
             print(f"Error inferring {txt}")
             return None

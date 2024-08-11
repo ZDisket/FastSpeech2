@@ -1,9 +1,13 @@
 import torch
 import torch.nn as nn
-from .attentions import TransformerEncoder, TransformerDecoder, TemporalConvNet, TCNAttention, MultiHeadAttention
+from .attentions import TransformerEncoder, TemporalConvNet, MultiHeadAttention, \
+    mask_to_causal_attention_mask, TransposeLayerNorm, AttentionPooling, APTxS1, APTx, SwiGLUConvFFN, NeoTCNAttention, \
+    ConvReluNorm
 from torch.nn.utils.rnn import pack_padded_sequence, pad_packed_sequence
 import torch.nn.functional as F
-
+from .attblocks import CBAM2d, MaskedSEBlock1D
+from .subatts import init_weights_he
+import monotonic_align, math
 
 # Applying LayerNorm + Dropout on embeddings increases performance, probably due to the regularizing effect
 # Thanks dathudeptrai from TensorFlowTTS for discovering this.
@@ -12,10 +16,10 @@ class NormalizedEmbedding(nn.Module):
     Embedding + LayerNorm + Dropout
     """
 
-    def __init__(self, num_embeddings, embedding_dim, dropout=0.1):
+    def __init__(self, num_embeddings, embedding_dim, dropout=0.1, norm=True):
         super(NormalizedEmbedding, self).__init__()
         self.embedding = nn.Embedding(num_embeddings, embedding_dim)
-        self.layer_norm = nn.LayerNorm(embedding_dim)
+        self.layer_norm = nn.LayerNorm(embedding_dim) if norm else nn.Identity()
         self.dropout = nn.Dropout(dropout)
 
     def forward(self, x):
@@ -29,6 +33,7 @@ class StochasticDropout(nn.Module):
     """
     Also known as Monte Carlo dropout, StochasticDropout keeps a lower dropout rate to apply during inference, for stochasticity.
     If not specified, it will be dropout / 3, with the minimum being 0.1
+    Note: Currently unused
     """
 
     def __init__(self, p=0.5, p_inference=None, min_p_inference=0.1, stochastic=False):
@@ -51,33 +56,147 @@ class StochasticDropout(nn.Module):
                 return F.dropout(x, self.p, self.training)
 
 
-class TextEncoder(nn.Module):
-    def __init__(self, vocab_size, embed_size, num_heads, num_layers, forward_expansion, dropout, alibi_alpha=1.0,
-                 start_i=0):
-        super(TextEncoder, self).__init__()
-        self.embed = nn.Embedding(vocab_size, embed_size)
-        self.emb_norm = nn.LayerNorm(embed_size)
-        self.encoder = TransformerEncoder(embed_size, num_heads, num_layers, forward_expansion, dropout,
-                                          alibi_alpha=alibi_alpha, start_i=start_i)
-        self.dropout = StochasticDropout(dropout)
-        self.layer_norm = nn.LayerNorm(embed_size)
+class ResNetEmProj(nn.Module):
+    def __init__(self, emotion_channels, embed_size, cond_heads, kernel_size, drop=0.5):
+        super(ResNetEmProj, self).__init__()
+        self.emotion_channels = emotion_channels
+        self.cond_heads = cond_heads
+        self.cond_head_size = embed_size // self.cond_heads
+        inter_size = emotion_channels // 2
 
-    def forward(self, token_ids, seq_lens):
+        self.conv1 = nn.Conv2d(emotion_channels, inter_size, kernel_size, padding="same")
+        self.ln1 = nn.LayerNorm([self.cond_heads, inter_size])
+        self.relu = nn.ReLU()
+        self.dropout1 = nn.Dropout(drop)
+
+        self.conv2 = nn.Conv2d(inter_size, self.cond_head_size, kernel_size, padding="same")
+        self.ln2 = nn.LayerNorm([self.cond_heads, self.cond_head_size])
+        self.dropout2 = nn.Dropout(drop)
+
+        self.cbam = CBAM2d(self.cond_head_size)
+
+        # Use 1x1 convolution to match dimensions for the residual connection
+        self.residual_conv = nn.Conv2d(emotion_channels, self.cond_head_size,
+                                       1) if emotion_channels != self.cond_head_size else nn.Identity()
+        self.residual_ln = nn.LayerNorm(
+            [self.cond_heads, self.cond_head_size]) if emotion_channels != self.cond_head_size else nn.Identity()
+
+        self.final_act = nn.ReLU()
+
+    def forward(self, x, mask):
+        # Mask should be of shape (batch, max_len) and needs to be expanded
+        # to match the shape of x: (batch, n_blocks, seq_len, hidden)
+        mask = mask.unsqueeze(-1).unsqueeze(-1)  # (batch, max_len, 1, 1)
+        mask = mask.transpose(1, 2)  # (batch, 1, max_len, 1)
+
+        x = x.masked_fill(mask, 0)
+
+        # Permute to (batch, hidden, n_blocks, seq_len) for convolution
+        x = x.permute(0, 3, 1, 2)
+
+        residual = self.residual_conv(x)
+        # (batch, hidden, n_blocks, seq_len) => (batch, seq_len, n_blocks, hidden)
+        residual = residual.permute(0, 3, 2, 1)
+        residual = self.residual_ln(residual)
+        residual = residual.permute(0, 3, 2, 1)
+
+        # (batch, 1, max_len, 1) => (batch, 1, 1, max_len)
+        inter_mask = mask.transpose(2, 3)
+
+        out = self.conv1(x)
+        out = out.masked_fill(inter_mask, 0)
+        out = out.permute(0, 3, 2, 1)
+        out = self.ln1(out)
+        out = out.permute(0, 3, 2, 1)
+        out = self.relu(out)
+        out = self.dropout1(out)
+
+        out = self.conv2(out)
+        out = out.masked_fill(inter_mask, 0)
+        out = out.permute(0, 3, 2, 1)
+        out = self.ln2(out)
+        out = out.permute(0, 3, 2, 1)
+        out = self.relu(out)
+        out = self.dropout2(out)
+
+        out += residual
+
+        out = self.cbam(out)
+
+        out = self.relu(out)
+
+        # Permute back to original shape (batch, n_blocks, seq_len, hidden)
+        out = out.permute(0, 2, 3, 1)
+
+        return out
+
+
+
+
+class TextEncoder(nn.Module):
+    def __init__(self, vocab_size, embed_size, num_heads, num_layers, forward_expansion, dropout, kernel_sizes, alibi_alpha=1.0,
+                 start_i=0, emotion_channels=256, speaker_channels=0):
+        super(TextEncoder, self).__init__()
+        self.embed = NormalizedEmbedding(vocab_size, embed_size, norm=False)
+        self.encoder = TransformerEncoder(embed_size, num_heads, num_layers, forward_expansion, dropout,
+                                          alibi_alpha=alibi_alpha, start_i=start_i, multi_scale=True, kernel_size=kernel_sizes)
+        self.use_prenet = True
+        if self.use_prenet:
+            self.pre = Prenet(embed_size, 384, embed_size, 5, 3, 0.5, "aptx")
+
+        self.emotion_channels = emotion_channels
+        self.speaker_channels = speaker_channels
+
+        if self.speaker_channels > 0:
+            self.spk_cond = nn.Sequential(nn.Linear(speaker_channels, embed_size),
+                                          nn.Dropout(0.1), )
+
+        if self.emotion_channels > 0:
+            self.cond_heads = 4
+            self.cond_head_size = embed_size // self.cond_heads
+
+            self.em_proj = ResNetEmProj(self.emotion_channels, embed_size, self.cond_heads, 3)
+
+            self.cond_att = MultiHeadAttention(embed_size, self.cond_heads, alibi_alpha=1.5, start_i_increment=4,
+                                               num_persistent=16)
+            self.cond_drop = nn.Dropout(0.5)
+
+    def forward(self, token_ids, seq_lens, em_blocks, em_lens, spk_emb=None):
         # Embed token_ids
         x = self.embed(token_ids)  # Shape: (batch, max_seq_len, embed_size)
-        x = self.emb_norm(x)
-        x = self.dropout(x)
 
         # Create a mask based on sequence lengths
         max_len = token_ids.size(1)
         mask = torch.arange(max_len, device=seq_lens.device).expand(len(seq_lens), max_len) >= seq_lens.unsqueeze(1)
+        x_mask = sequence_mask(max_len, seq_lens)
+
+        #   ======================== ZEPHYR CONDITIONING ========================
+        # em_blocks = [batch, n_blocks, seq_len, hidden]
+
+        if self.emotion_channels > 0:
+            y_mask = sequence_mask(em_blocks.size(2), em_lens)
+            y = self.em_proj(em_blocks, y_mask).transpose(1, 3)  # ==> (batch, hidden, seq_len, n_blocks)
+
+            # Attention-on-Blocks
+            y = y.permute(0, 2, 3, 1)  # ==> (batch, seq_len, n_blocks, hidden)
+            xy_att_mask = expand_masks(x_mask, y_mask)
+
+            xy_att = self.cond_att(y, y, x, mask=xy_att_mask)
+            xy_att = self.cond_drop(xy_att)
+
+            # x, xy_att = (batch, seq_len, channels)
+            x = x + xy_att
+
+        #   ======================== ZEPHYR CONDITIONING ========================
+
+        if self.speaker_channels > 0:
+            x = x + self.spk_cond(spk_emb)
+
+        if self.use_prenet:
+            x = self.pre(x, x_mask.unsqueeze(1))
 
         # Pass through the transformer encoder
         x = self.encoder(x, mask.unsqueeze(1).unsqueeze(2))
-
-        # Apply dropout and LayerNorm after the encoder
-        x = self.dropout(x)
-        x = self.layer_norm(x)
 
         return x
 
@@ -166,7 +285,7 @@ class VariantDurationPredictor(nn.Module):
 
         if conv_depth > 0:
             self.pre_convs = SConvNorm(filter_channels, num_layers=conv_depth, kernel_size=kernel_size)
-            self.post_conv_drop = StochasticDropout(p_dropout)
+            self.post_conv_drop = nn.Dropout(p_dropout)
         else:
             print("Not using pre convs")
             self.pre_convs = nn.Identity()
@@ -189,7 +308,7 @@ class VariantDurationPredictor(nn.Module):
 
         self.out_proj = nn.Conv1d(in_channels=lstm_channels, out_channels=1, kernel_size=1)
 
-        self.final_dropout = StochasticDropout(final_dropout)
+        self.final_dropout = nn.Dropout(final_dropout)
         self.use_pre_proj = False
 
         if text_channels != filter_channels:
@@ -198,7 +317,7 @@ class VariantDurationPredictor(nn.Module):
 
     # x = Encoder hidden states size (batch, seq_len, text_channels)
     # x_lengths = Lengths of x size (batch_size,)
-    def forward(self, x, x_lengths):
+    def forward(self, x, x_lengths, in_em):
         x = x.transpose(1, 2)  # (batch, seq_len, text_channels) => (batch, text_channels, seq_len)
 
         x_mask = lens_to_sequence_mask(x_lengths, x.size(2))
@@ -271,16 +390,29 @@ class VariantDurationPredictor(nn.Module):
         return log_durations, x_mask, x
 
 
+def expand_masks(x_mask, y_mask):
+    """
+    Expand True=padded masks into an attention mask.
+    Inputs can be different or the same
+    :param x_mask: Mask of x size (batch, seq_len), where True is padded
+    :param y_mask: Mask of y size (batch, seq_2_len), where True is padded
+    :return: Attention mask for MultiHeadAttention
+    """
+    x_mask_expanded = x_mask.unsqueeze(1).unsqueeze(3)  # Shape: (batch_size, 1, mel_len, 1)
+    y_mask_expanded = y_mask.unsqueeze(1).unsqueeze(2)  # Shape: (batch_size, 1, 1, duration_len)
+    # Combine masks using broadcasting
+    attention_mask = x_mask_expanded & y_mask_expanded  # Shape: (batch_size, 1, mel_len, duration_len)
+    attention_mask = ~attention_mask  # True=padded => True=valid
+    return attention_mask
+
 # VariancePredictor but using TCNs for cheaper-than-RNN temporal dependencies.
 class TemporalVariancePredictor(nn.Module):
 
     def __init__(self, input_channels, num_channels, kernel_size=2, dropout=0.2, cond_input_size=None):
         super(TemporalVariancePredictor, self).__init__()
         # Temporal Convolutional Network
-        # Multiplicative dilation growth gives the best balance between coverage and accuracy.
-        self.tcn = TemporalConvNet(input_channels, num_channels, kernel_size=kernel_size, dropout=dropout,
-                                   dilation_growth="mul", use_se=True)
-        self.final_drop = StochasticDropout(dropout)
+        self.tcn = NeoTCNAttention(input_channels, num_channels, kernel_size, dropout, dropout, [0] * len(num_channels), dilation_growth="", act="relu")
+
         self.cond_input_size = cond_input_size
         self.input_channels = input_channels
 
@@ -296,8 +428,6 @@ class TemporalVariancePredictor(nn.Module):
             # For some reason, this case benefits from having 4 heads instead of 2
             self.cond_attention = MultiHeadAttention(self.input_channels, 4, alibi_alpha=1.5,
                                                      start_i_increment=4, num_persistent=16)
-
-            self.cond_norm = nn.LayerNorm(self.input_channels)
 
             self.cond_act = nn.ReLU()
             self.inter_cond_drop = nn.Dropout(0.25)
@@ -329,26 +459,18 @@ class TemporalVariancePredictor(nn.Module):
 
         :return: Conditioning vector, ready to add to hidden states
         """
-        x_mask_expanded = x_mask.unsqueeze(1).unsqueeze(3)  # Shape: (batch_size, 1, mel_len, 1)
-        y_mask_expanded = y_mask.unsqueeze(1).unsqueeze(2)  # Shape: (batch_size, 1, 1, duration_len)
-
-        # Combine masks using broadcasting
-        attention_mask = x_mask_expanded & y_mask_expanded  # Shape: (batch_size, 1, mel_len, duration_len)
-        attention_mask = ~attention_mask  # True=padded => True=valid
+        attention_mask = expand_masks(x_mask, y_mask)
 
         # (batch, seq_len, channels) <<=> (batch, channels, seq_len)
         y = self.cond_proj(
             y.transpose(1, 2)
-        ).transpose(1,2)
+        ).transpose(1,2).masked_fill(y_mask.unsqueeze(-1), 0)
 
         y = self.cond_act(y)
         y = self.inter_cond_drop(y)
 
         z = self.cond_attention(y, y, x, mask=attention_mask)
         z = self.inter_cond_drop(z)
-
-        z = self.cond_norm(z)
-        z = self.cond_act(z)
 
         return z
 
@@ -365,10 +487,6 @@ class TemporalVariancePredictor(nn.Module):
         """
 
         if self.cond_input_size is not None:
-            # Prevent backpropagation into the duration predictor
-            # If we don't do this, it tries to optimize the DP for pitch&energy and severely overfits
-            y = y.detach()
-
             cond = self.make_cond_vector(x, y, x_mask, y_mask)
             cond = self.cond_drop(cond)
             x = x + cond
@@ -377,15 +495,15 @@ class TemporalVariancePredictor(nn.Module):
         x = x.transpose(1, 2)  # (batch, seq_len, channels) => (batch, channels, seq_len)
         x_mask = x_mask.unsqueeze(1)  # (batch, seq_len) => (batch, 1, seq_len)
 
-        x = self.tcn(x)  # x = (batch, channels, seq_len)
+        x = x.masked_fill(x_mask, 0.0)
+
+        x = self.tcn(x, x_mask.squeeze(1), inp_channel_last=False)  # x = (batch, channels, seq_len)
 
         if x_mask is not None:
             x = x.masked_fill(x_mask, 0.0)
 
         # linear pass
         x = x.transpose(1, 2)  # x = (batch, seq_len, channels)
-
-        x = self.final_drop(x)
 
         # output
         x = self.output_layer(x)  # x = (batch, seq_len, 1)
@@ -401,54 +519,106 @@ class TemporalVariancePredictor(nn.Module):
 
 class SpectrogramDecoder(nn.Module):
     def __init__(self, input_size, filter_channels, mel_channels, depth, heads, kernel_sizes, dropout=0.1,
-                 alibi_alpha=1.0, forward_expansion=3):
+                 alibi_alpha=1.0, forward_expansion=4, emotion_size=256, speaker_channels=0, causal=True):
         super(SpectrogramDecoder, self).__init__()
 
         self.input_size = input_size
         self.filter_channels = filter_channels
+        self.speaker_channels = speaker_channels
 
         if input_size != filter_channels:
             self.pre_fc = nn.Linear(input_size, filter_channels)
 
-        self.dec = TransformerDecoder(filter_channels,
-                                      heads=heads, num_layers=depth,
-                                      forward_expansion=forward_expansion, dropout=dropout, alibi_alpha=alibi_alpha,
-                                      mode="conv", kernel_sizes=kernel_sizes)
+        self.dec = TransformerEncoder(filter_channels, heads=heads, num_layers=depth,
+                                      forward_expansion=forward_expansion, dropout=dropout,
+                                      alibi_alpha=alibi_alpha, start_i=4, kernel_size=kernel_sizes,
+                                      act="aptxs1", rma_mem_dim=0, conv_att=True, multi_scale=True, talking_heads=True,
+                                      dynamic_alibi=True, coarse_fine=True)
 
         self.mel_fc = nn.Linear(filter_channels, mel_channels)
+        self.do_em_cond = False
+
+        if self.do_em_cond:
+            self.em_cond = nn.Sequential(nn.Linear(emotion_size, filter_channels),
+                                         nn.ReLU(inplace=True),
+                                         nn.Dropout(0.5),)
+
+        if self.speaker_channels > 0:
+            self.spk_cond = nn.Sequential(nn.Linear(speaker_channels, filter_channels),
+                                          nn.Dropout(0.1),)
+
 
     # x_mask : True=exclude mask size (batch, mel_lens)
     # x: (batch, mel_lens, channels)
-    def forward(self, x, x_mask):
+    def forward(self, x, x_mask, in_em, in_spk=None):
+        """
+        Forward pass, decode hidden states into a mel spectrogram.
 
+        :param x: Hidden states size (batch, ,mel_len, channels)
+        :param x_mask: True=padded mask size (batch, mel_lens)
+        :param in_em:
+        :param in_spk:
+
+        :return: Mel spectrogram size (batch, mel_len, mel_channels)
+        """
         orig_mask = x_mask.clone()
 
-        # (batch, mel_lens) -> (batch, 1, mel_lens)
-        x_mask = x_mask.unsqueeze(1)
-        # True=exclude => True=Include
-        x_mask = ~x_mask
+        conv_mask = x_mask.bool()
+        attn_mask = mask_to_attention_mask(conv_mask)
 
-        src_mask, tgt_mask = generate_masks_from_float_mask(x_mask)
+        # (batch, mel_lens) -> (batch, 1, mel_lens)
+        # True=exclude => True=Include
+        x_mask = ~conv_mask
+        x_mask = x_mask.float().unsqueeze(1)
 
         # Decoder pass
-
         if self.input_size != self.filter_channels:
             x = self.pre_fc(x)
 
-        x = self.dec(x, x, src_mask,
-                     tgt_mask)
+        if self.speaker_channels > 0:
+            x = x + self.spk_cond(in_spk)
 
-        x = self.mel_fc(x)
+        if self.do_em_cond:
+            x = x + self.em_cond(in_em)
 
-        return x, orig_mask
+        x_mask = x_mask.transpose(1, 2)
+
+        x = x * x_mask
+
+        x = self.dec(x, attn_mask, conv_mask.unsqueeze(1))
+
+        x = x * x_mask
+
+        spec = self.mel_fc(x)
+
+        spec = spec * x_mask
+
+        return spec, x, orig_mask
 
 
 def mask_to_attention_mask(mask):
+    """
+    Turn a bool mask into an attention mask
+    :param mask: Bool sequence mask, True=padding size (batch, max_length)
+    :return: Attention mask size (batch, 1, seq_len, seq_len), True=valid
+    """
     attention_mask = mask.unsqueeze(1) & mask.unsqueeze(2)
     attention_mask = attention_mask.unsqueeze(1)
     # Flip the mask, our attention uses True=valid
     attention_mask = ~attention_mask
     return attention_mask
+
+
+def sequence_mask(max_length, x_lengths):
+    """
+    Make a bool sequence mask
+    :param max_length: Max length of sequences
+    :param x_lengths: Tensor (batch,) indicating sequence lengths
+    :return: Bool tensor size (batch, max_length) where True is padded and False is valid
+    """
+    mask = torch.arange(max_length).expand(len(x_lengths), max_length).to(x_lengths.device)
+    mask = mask >= x_lengths.unsqueeze(1)
+    return mask
 
 
 class DynamicDurationPredictor(nn.Module):
@@ -457,32 +627,58 @@ class DynamicDurationPredictor(nn.Module):
 
     (optionally bidirectional) TCN-Attention with increasing kernel sizes => Projection
     """
+
     def __init__(self, num_inputs, num_channels, kernel_sizes=[2, 2, 3], dropout=0.2, att_dropout=0.3, alibi_alpha=1.5,
-                 start_i=0, heads=2, bidirectional=False, backwards_channels=[256, 256], backwards_heads=[2,2],
-                 backwards_kernel_sizes=[2, 3]):
+                 start_i=0, heads=2, bidirectional=False, backwards_channels=[256, 256], backwards_heads=[2, 2],
+                 backwards_kernel_sizes=[2, 3], emotion_size=256, speaker_channels=0, bayesian=True):
         super(DynamicDurationPredictor, self).__init__()
 
         self.tcn_output_channels = num_channels[-1]
         self.bidirectional = bidirectional
+        self.speaker_channels = speaker_channels
+        self.emotion_size = 0
+        self.em_replace_channels = 16
+        self.bayesian = bayesian
 
-        # Initialize the TCNAttention module
-        self.tcn_attention = TCNAttention(num_inputs, num_channels, kernel_sizes, dropout, att_dropout, heads,
-                                          alibi_alpha=alibi_alpha, start_i_increment=start_i)
+        self.tcn_attention = NeoTCNAttention(num_inputs, num_channels, kernel_sizes, dropout, att_dropout, heads,
+                                             alibi_alpha=alibi_alpha, start_i_increment=start_i,
+                                             bayesian=self.bayesian, integrated=True, act="taptx", conv_att="cbam")
         if self.bidirectional:
-            self.backwards_tcn_attention = TCNAttention(num_inputs, backwards_channels, backwards_kernel_sizes, dropout, att_dropout,
-                                                        backwards_heads,
-                                                        alibi_alpha=alibi_alpha, start_i_increment=start_i)
+            # Widen the backwards attention bias in order to compensate for the lesser heads
+            backwards_start_i = start_i * ((sum(heads) - sum(backwards_heads)) // 2)
+
+            if backwards_start_i < 0:
+                raise ValueError(
+                    "DynamicDurationPredictor::Cannot have more backwards attention heads than forward heads.")
+
+            self.backwards_tcn_attention = NeoTCNAttention(num_inputs, backwards_channels, backwards_kernel_sizes,
+                                                           dropout, att_dropout,
+                                                           backwards_heads,
+                                                           alibi_alpha=alibi_alpha,
+                                                           start_i_increment=backwards_start_i, bayesian=self.bayesian,
+                                                           integrated=True, conv_att="cbam")
 
             self.bw_tcn_output_channels = backwards_channels[-1]
 
             # prevent model from overrelying on backwards features
-            self.backwards_drop = nn.Dropout(att_dropout)
-            self.fw_projection = nn.Linear(self.tcn_output_channels + self.bw_tcn_output_channels, self.tcn_output_channels)
+            self.backwards_drop = nn.Dropout(0.1)
+            self.fw_projection = nn.Linear(self.tcn_output_channels + self.bw_tcn_output_channels,
+                                           self.tcn_output_channels)
 
-        self.final_drop = nn.Dropout(0.1)
+    #    self.refiner = ConvReluNorm(self.tcn_output_channels + self.bw_tcn_output_channels, self.tcn_output_channels + self.bw_tcn_output_channels, 5, 1, "layer", dropout=0.5)
         self.linear_projection = nn.Linear(self.tcn_output_channels, 1)
 
-    def forward(self, x, x_lengths):
+
+        if self.speaker_channels > 0:
+            self.spk_cond = nn.Sequential(nn.Linear(self.speaker_channels, num_inputs),
+                                          nn.Dropout(0.1), )
+
+        if self.emotion_size > 0:
+            self.em_proj = nn.Sequential(nn.Linear(self.emotion_size, self.em_replace_channels),
+                                         nn.ReLU(inplace=True),
+                                         nn.Dropout(0.1), )
+
+    def forward(self, x, x_lengths, in_em, in_spk=None):
         """
         Forward pass through the DynamicDurationPredictor
 
@@ -492,26 +688,27 @@ class DynamicDurationPredictor(nn.Module):
         :return: Predicted durations size (batch, seq_len), True=padded mask of x size (batch, seq_len), duration hidden states
         """
         # Generate the appropriate mask for attention
-        max_length = x.size(1)
-        mask = torch.arange(max_length).expand(len(x_lengths), max_length).to(x_lengths.device)
-        mask = mask >= x_lengths.unsqueeze(1)
+        mask = sequence_mask(x.size(1), x_lengths)
 
-        # Create an attention mask (batch, 1, seq_len, seq_len)
-        attention_mask = mask_to_attention_mask(mask)
+        if self.speaker_channels > 0:
+            x = x + self.spk_cond(in_spk)
+
+        if self.emotion_size > 0:
+            x_e = self.em_proj(in_em)  # (b, 1, 16)
+            x[:, :, -self.em_replace_channels:] = x_e  # auto-broadcasting takes care of the seq dim
 
         if self.bidirectional:
             x_orig = x.clone()
 
         # Pass input through the TCNAttention layer
-        x = self.tcn_attention(x, attention_mask)
+        x = self.tcn_attention(x, mask)
 
         if self.bidirectional:
             # Reverse input and mask for backward processing
             x_reversed = x_orig.flip(dims=[1])
             mask_reversed = mask.flip(dims=[1])
-            reverse_attention_mask = mask_to_attention_mask(mask_reversed)
 
-            x_reversed = self.backwards_tcn_attention(x_reversed, reverse_attention_mask)
+            x_reversed = self.backwards_tcn_attention(x_reversed, mask_reversed)
             x_reversed = self.backwards_drop(x_reversed)
 
             # flip back to align with x
@@ -519,12 +716,268 @@ class DynamicDurationPredictor(nn.Module):
 
             # cat and project back to normal
             x = torch.cat((x, x_reversed), dim=-1)
-            x = self.fw_projection(x)
 
-        x = self.final_drop(x)
+     #       x = x + self.refiner(x.transpose(1,2), mask.unsqueeze(1)).transpose(1,2)
+            x = x.masked_fill(mask.unsqueeze(-1), 0)
+
+            x = self.fw_projection(x)
+            x = x.masked_fill(mask.unsqueeze(-1), 0)
 
         durations = self.linear_projection(x)
+
         durations = durations.squeeze(-1)
         durations = durations.masked_fill(mask, 0)
 
         return durations, mask, x
+
+
+class EmotionEncoder(nn.Module):
+    def __init__(self, input_dim, hidden_dim):
+        super(EmotionEncoder, self).__init__()
+
+        self.feedforward = nn.Sequential(
+            nn.Conv1d(input_dim, hidden_dim, 3, padding="same"),
+            APTxS1(trainable=True),
+            nn.Dropout(0.1),
+            nn.Conv1d(hidden_dim, input_dim, 1, padding="same"),
+        )
+        self.norm = nn.LayerNorm(input_dim)
+
+    def forward(self, x, mask=None):
+        """
+        Encode the final hidden states into a conditioning vector.
+
+        Args:
+            x (torch.Tensor): Tensor of shape (batch, seq_len, channels).
+            mask (torch.Tensor, optional): Tensor of shape (batch, seq_len), where True indicates padding.
+
+        Returns:
+            torch.Tensor: Tensor of shape (batch, 1, channels).
+        """
+        # Apply feedforward network
+        x = self.feedforward(x.transpose(1,2)).transpose(1,2)  # Shape: (batch, seq_len, channels)
+        x = self.norm(x)
+
+        return x
+
+
+def safe_log(tensor, epsilon=1e-6):
+    """
+    Computes the logarithm of the input tensor, adding epsilon for numerical stability
+    and replacing NaNs with a large negative value.
+
+    :param tensor: Input tensor for which the log is to be computed
+    :param epsilon: Small value to add to the tensor for numerical stability
+    :return: Tensor with the logarithm applied
+    """
+    tensor_with_epsilon = tensor + epsilon
+    log_tensor = torch.log(tensor_with_epsilon)
+    safe_log_tensor = torch.nan_to_num(log_tensor, nan=epsilon)  # Replace NaNs with -inf
+    return safe_log_tensor
+
+from rotary_embedding_torch import RotaryEmbedding
+
+class SimpleAttention(nn.Module):
+    def __init__(self, input_dim, attention_dim, use_positional_encoding=False):
+        super(SimpleAttention, self).__init__()
+        self.query_layer = nn.Linear(input_dim, attention_dim)
+        self.key_layer = nn.Linear(input_dim, attention_dim)
+        self.value_layer = nn.Linear(input_dim, attention_dim)
+        self.attention_dim = attention_dim
+        self.use_positional_encoding = use_positional_encoding
+        self.rotary_emb = RotaryEmbedding(dim=attention_dim // 2)
+            #self.positional_encoding = PositionalEncoding(attention_dim)
+    def forward(self, query, key, value, mask=None):
+        # Compute the query, key, and value
+        query = self.query_layer(query)
+        key = self.key_layer(key)
+        value = self.value_layer(value)
+
+        if self.use_positional_encoding:
+            query_seq_length = query.size(1)
+            key_seq_length = key.size(1)
+            query = self.rotary_emb.rotate_queries_or_keys(query.unsqueeze(1)).squeeze(1)
+            key = self.rotary_emb.rotate_queries_or_keys(key.unsqueeze(1)).squeeze(1)
+         #   query += self.positional_encoding(query_seq_length)
+          #  key += self.positional_encoding(key_seq_length)
+
+        # Compute attention scores
+        attention_scores = torch.matmul(query, key.transpose(-2, -1)) / (self.attention_dim ** 0.5)
+
+        if mask is not None:
+            attention_scores = attention_scores.masked_fill(mask == 0, float('-1e-9'))
+
+        # Compute attention weights
+        attention_weights = F.softmax(attention_scores, dim=-1)
+
+        # Compute the context vector as the weighted sum of values
+        context_vector = torch.matmul(attention_weights, value)
+
+        return context_vector, attention_weights
+
+
+class PositionalEncoding(nn.Module):
+    def __init__(self, attention_dim, max_len=5000):
+        super(PositionalEncoding, self).__init__()
+        self.attention_dim = attention_dim
+
+        # Create a matrix of [seq_length, attention_dim] representing the positional encodings
+        position = torch.arange(0, max_len, dtype=torch.float).unsqueeze(1)
+        div_term = torch.exp(torch.arange(0, attention_dim, 2).float() * (-math.log(10000.0) / attention_dim))
+
+        pe = torch.zeros(max_len, attention_dim)
+        pe[:, 0::2] = torch.sin(position * div_term)
+        pe[:, 1::2] = torch.cos(position * div_term)
+        pe = pe.unsqueeze(0).transpose(0, 1)
+
+        self.register_buffer('pe', pe)
+
+    def forward(self, length):
+        return self.pe[:length, :].transpose(0, 1)
+
+
+class Aligner(nn.Module):
+    def __init__(self, mel_channels, text_channels, mas_channels, heads, num_persistent=16):
+        super(Aligner, self).__init__()
+        self.proj_type = "conv"
+        self.attn_type = "simple" # mha is BROKEN (you could probably fix it with a LR warmup)
+        self.n_heads = heads
+
+        self.mel_proj = SwiGLUConvFFN(mel_channels, mas_channels * 2, mas_channels, 5, 0.1, act="aptxs1")
+        self.text_proj = SwiGLUConvFFN(text_channels, mas_channels * 2, mas_channels, 3, 0.1, act="aptxs1")
+
+        self.num_persistent = num_persistent
+
+        if self.attn_type == "simple":
+            self.attn = SimpleAttention(mas_channels, mas_channels)
+            self.n_heads = 1
+        elif self.attn_type == "mha":
+            self.attn = MultiHeadAttention(mas_channels, heads, 1.5, 4, num_persistent=num_persistent)
+
+        if self.proj_type == "conv" and self.n_heads > 1:
+            self.mha_proj = nn.Conv2d(heads, 1, 3, padding="same")
+
+    def forward(self, mel_hidden_states, text_hidden_states, x_lens, y_lens):
+
+        x_mask = sequence_mask(text_hidden_states.size(1), x_lens)
+        y_mask = sequence_mask(mel_hidden_states.size(1), y_lens)
+
+        # Project mel and text hidden states to mas_channels
+        text_proj = self.text_proj(text_hidden_states, x_mask.unsqueeze(1))
+        mel_proj = self.mel_proj(mel_hidden_states, y_mask.unsqueeze(1))
+
+        mha_mask = expand_masks(y_mask, x_mask)
+
+        # Run through MultiHeadAttention
+        if self.attn_type == "simple":
+            # query, key, value
+            _, attention_weights = self.attn(mel_proj, text_proj, text_proj, mask=mha_mask.squeeze(1))
+            attention_weights = attention_weights.unsqueeze(1)
+        else:
+            # values, keys, queries
+            _, attention_weights = self.attn(text_proj, text_proj, mel_proj, mha_mask, return_weights=True)
+            attention_weights = attention_weights[:, :, :, :-self.num_persistent]
+
+        # Average attention weights across heads
+        if self.n_heads > 1:
+            if self.proj_type == "conv":
+                average_attention_weights = self.mha_proj(attention_weights).masked_fill(mha_mask, float("-1e4"))
+                average_attention_weights = F.softmax(average_attention_weights, dim=3)
+            else:
+                average_attention_weights = torch.mean(attention_weights, 1, keepdim=True)
+        else:
+            average_attention_weights = attention_weights
+
+        # Compute log probabilities for MAS and CTC loss
+        attn_logprob = safe_log(average_attention_weights)
+
+        # prepare for MAS
+        x_mask = ~x_mask
+        y_mask = ~y_mask
+
+        x_mask = x_mask.float().unsqueeze(1)
+        y_mask = y_mask.float().unsqueeze(1)
+
+        attn_mask = torch.unsqueeze(x_mask, -1) * torch.unsqueeze(y_mask, 2)
+
+        # Apply monotonic alignment search (MAS)
+        # MAS works with (batch, text, mel) ; CTC loss works with (batch, mel, text)
+        with torch.no_grad():                       # Cython demands a contiguous tensor
+            attn_hard = monotonic_align.maximum_path(attn_logprob.squeeze(1).transpose(1,2).contiguous(), attn_mask.squeeze(1))
+
+        attn_hard_dur = attn_hard.sum(2)
+
+        return average_attention_weights, attn_logprob, attn_hard, attn_hard_dur
+
+# taken from glow-tts
+class Prenet(nn.Module):
+    def __init__(self, in_channels, hidden_channels, out_channels, kernel_size, n_layers, p_dropout, act="relu", conv_att=False):
+        super(Prenet, self).__init__()
+        self.in_channels = in_channels
+        self.hidden_channels = hidden_channels
+        self.out_channels = out_channels
+        self.kernel_size = kernel_size
+        self.n_layers = n_layers
+        self.p_dropout = p_dropout
+
+        self.conv_layers = nn.ModuleList()
+        self.norm_layers = nn.ModuleList()
+
+        self.conv_layers.append(nn.Conv1d(in_channels, hidden_channels, kernel_size, padding=kernel_size // 2))
+        self.norm_layers.append(nn.LayerNorm(hidden_channels))
+
+        self.mask_value = 0
+        act_fn = nn.Identity()
+        if act == "relu":
+            act_fn = nn.ReLU()
+        elif act == "aptx":
+            act_fn = APTx()
+            self.mask_value = -3
+        elif act == "aptxs1":
+            act_fn = APTxS1()
+            self.mask_value = -1
+        else:
+            raise RuntimeError(f"Unknown activation name {act}")
+
+        self.act_drop = nn.Sequential(act_fn, StochasticDropout(p_dropout, p_dropout, stochastic=False))
+
+        for _ in range(n_layers - 1):
+            self.conv_layers.append(nn.Conv1d(hidden_channels, hidden_channels, kernel_size, padding=kernel_size // 2))
+            self.norm_layers.append(nn.LayerNorm(hidden_channels))
+
+        self.conv_att = MaskedSEBlock1D(hidden_channels) if conv_att else None
+
+        self.proj = nn.Conv1d(hidden_channels, out_channels, 1) if hidden_channels != out_channels else nn.Identity()
+        if hidden_channels != out_channels:
+            self.proj.weight.data.zero_()
+            self.proj.bias.data.zero_()
+
+    def forward(self, x, x_mask):
+        """
+        Prenet pass
+        :param x: Hidden states (batch, seq, channels)
+        :param x_mask: Bool mask size (batch, 1, seq) where True is padded
+        :return: x + prenet
+        """
+        x = x.transpose(1, 2)  # Transpose to (batch_size, in_channels, seq_length)
+        x_org = x
+
+        for i in range(self.n_layers):
+            x = self.conv_layers[i](x)
+            x = x.masked_fill(x_mask, 0)
+            x = x.transpose(1, 2)  # Transpose to (batch_size, seq_length, hidden_channels)
+            x = self.norm_layers[i](x)
+            x = x.transpose(1, 2)  # Transpose back to (batch_size, hidden_channels, seq_length)
+            x = x.masked_fill(x_mask, self.mask_value)
+            x = self.act_drop(x)
+
+        if self.conv_att is not None:
+            x = self.conv_att(x, x_mask)
+
+        x = self.proj(x)
+        x = x_org + x
+
+        x = x.masked_fill(x_mask, 0)
+        x = x.transpose(1, 2)  # Transpose back to (batch_size, seq_length, out_channels)
+
+        return x

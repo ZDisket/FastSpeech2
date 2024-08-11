@@ -49,11 +49,11 @@ def get_model(args, configs, device, train=False):
         model.load_state_dict(ckpt["model"])
 
     if train:
-        scheduled_optim = torch.optim.AdamW(model.parameters(),
+        scheduled_optim = torch.optim.NAdam(model.parameters(),
                                             lr=train_config["optimizer"]["init_lr"],
                                             betas=train_config["optimizer"]["betas"],
                                             eps=train_config["optimizer"]["eps"],
-                                            weight_decay=0.001,
+                                            weight_decay=0.0,
                                             )
         if args.restore_step:
             scheduled_optim.load_state_dict(ckpt["optimizer"])

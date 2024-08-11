@@ -10,13 +10,38 @@ from tqdm import tqdm
 
 from utils.model import get_model, get_vocoder, get_param_num, load_pretrained_weights
 from utils.tools import to_device, log, synth_one_sample, test_one_fs2, log_attention_maps
-from model import FastSpeech3Loss
+from model import FastSpeech3Loss, DualDiscriminator, AdvSeqDiscriminator
+from model.loss import LSGANLoss
 from dataset import Dataset
 from torch.cuda.amp import GradScaler, autocast
+from zephyrfe import ZephyrFrontEnd
+from preprocessor.emotion import EmotionProcessorV2
 
 from evaluate import evaluate
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+def weights_init_he(m):
+    if isinstance(m, nn.Conv1d) or isinstance(m, nn.Conv2d) or isinstance(m, nn.Linear):
+        nn.init.kaiming_normal_(m.weight, nonlinearity='relu')
+        if m.bias is not None:
+            nn.init.constant_(m.bias, 0)
+
+from torch.optim.lr_scheduler import LRScheduler
+
+class WarmupExponentialLR(LRScheduler):
+    def __init__(self, optimizer, gamma, warmup_steps, last_epoch=-1):
+        self.gamma = gamma
+        self.warmup_steps = warmup_steps
+        super(WarmupExponentialLR, self).__init__(optimizer, last_epoch)
+
+    def get_lr(self):
+        if self.last_epoch < self.warmup_steps:
+            warmup_factor = (self.last_epoch + 1) / self.warmup_steps
+            return [base_lr * warmup_factor for base_lr in self.base_lrs]
+        else:
+            return [base_lr * (self.gamma ** (self.last_epoch - self.warmup_steps)) for base_lr in self.base_lrs]
+
 
 
 def main(args, configs):
@@ -50,20 +75,42 @@ def main(args, configs):
 
     # Prepare model
     model, optimizer = get_model(args, configs, device, train=True)
-    scheduler = torch.optim.lr_scheduler.ExponentialLR(optimizer, gamma=train_config["optimizer"]["gamma"],
-                                                       last_epoch=last_epoch)
+    scheduler = WarmupExponentialLR(optimizer, gamma=train_config["optimizer"]["gamma"],
+                                                       last_epoch=last_epoch,
+                                    warmup_steps=5 if not len(args.pretrained) else 1)
 
     if len(args.pretrained):
         load_pretrained_weights(model, args.pretrained)
 
+    discriminator = DualDiscriminator(n_heads=0, hidden_dim=256, num_blocks=3, dropout=0.1).to(device)
+    discriminator.apply(weights_init_he)
+    discriminator.train()
+    criterion_lsgan = LSGANLoss()
+    optimizer_d = torch.optim.Adam(discriminator.parameters(), lr=0.0001)
+    if args.restore_step:
+        ckpt_path = os.path.join(
+            train_config["path"]["ckpt_path"],
+            "D_{}.pth.tar".format(args.restore_step),
+        )
+        ckpt = torch.load(ckpt_path)
+        discriminator.load_state_dict(ckpt["model"])
+        optimizer_d.load_state_dict(ckpt["optimizer"])
+
+    scheduler_d = torch.optim.lr_scheduler.ExponentialLR(optimizer_d, gamma=train_config["optimizer"]["gamma"],
+                                                         last_epoch=last_epoch)
 
     model = nn.DataParallel(model)
+    discriminator = nn.DataParallel(discriminator)
     num_param = get_param_num(model)
     Loss = FastSpeech3Loss(preprocess_config, model_config, train_config).to(device)
     print("Number of FastSpeech2 Parameters:", num_param)
 
     # Load vocoder
     vocoder = get_vocoder(model_config, device)
+
+    if len(preprocess_config["preprocessing"]["zephyr_model"]):
+        proc_em = EmotionProcessorV2()
+        zephyr_model = ZephyrFrontEnd(model_path=preprocess_config["preprocessing"]["zephyr_model"], processor=proc_em)
 
     # Init logger
     for p in train_config["path"].values():
@@ -91,6 +138,10 @@ def main(args, configs):
     # torch.autograd.set_detect_anomaly(True, True)
 
     scaler = GradScaler()
+    scaler_d = GradScaler()
+    use_aligner_rope_steps = 5000 if not len(args.pretrained) else 250
+
+    discriminator_train_start_steps = 555555555555
 
     while True:
         inner_bar = tqdm(total=len(loader), desc=f"Epoch {epoch}", position=1)
@@ -99,9 +150,56 @@ def main(args, configs):
 
                 with autocast(enabled=True):
                     batch = to_device(batch, device)
+
                     # Forward pass and loss computation with autocast
                     output = model(*(batch[2:]))
-                    losses = Loss(batch, output, epoch)
+
+                    # =========================== DISCRIMINATOR ==================================
+
+                    attn_hard_dur = output[5].detach()  # we don't want to optimize the AlignmentEncoder
+                    durations_fake = output[4]
+                    text_enc = output[14]  # no optimizing the text-encoder
+                    seq_lens = batch[2 + 2]
+                    em_hids = batch[12]
+
+                    # bring real durs to the log space
+                    durations_real = torch.log(attn_hard_dur.float() + 1e-6)
+
+                    if step > discriminator_train_start_steps:
+                        # train on real
+                        outputs_real = discriminator(durations_real, seq_lens, text_enc.detach(), em_hids)
+
+                        # train on fake
+                        outputs_fake = discriminator(durations_fake.detach(), seq_lens, text_enc.detach(), em_hids)
+
+                        loss_d = criterion_lsgan.discriminator_loss(outputs_real, outputs_fake)
+                        loss_d /= grad_acc_step
+                        scaler_d.scale(loss_d).backward()
+
+                        if step % grad_acc_step == 0:
+                            scaler_d.unscale_(optimizer_d)
+                            nn.utils.clip_grad_norm_(discriminator.parameters(), grad_clip_thresh)
+
+                            scaler_d.step(optimizer_d)
+                            scaler_d.update()
+                            optimizer_d.zero_grad()
+                    else:
+                        loss_d = torch.FloatTensor([0.0]).to(device)
+
+                    # =========================== END DISCRIMINATOR ==================================
+
+                    losses = Loss(batch, output, epoch, model.module)
+
+                    if step > discriminator_train_start_steps:
+                        outputs_fake = discriminator(durations_fake, seq_lens, text_enc, em_hids)
+                        gan_loss = criterion_lsgan.generator_loss(outputs_fake)
+                    else:
+                        gan_loss = torch.FloatTensor([0.0]).to(device)
+
+                    losses.append(loss_d)
+                    losses.append(gan_loss)
+                    losses[0] += gan_loss
+
                     total_loss = losses[0] / grad_acc_step
 
                 # Backward pass with scaled loss
@@ -120,7 +218,12 @@ def main(args, configs):
                 if step % log_step == 0:
                     losses = [l.item() for l in losses]
                     message1 = "Step {}/{}, ".format(step, total_step)
-                    message2 = "Total Loss: {:.4f}, Mel Loss: {:.4f}, Mel PostNet Loss: {:.4f}, Pitch Loss: {:.4f}, Energy Loss: {:.4f}, Duration Loss: {:.4f}, Attention Loss: {:.4f}, Duration Temporal Loss: {:.4f}, Total Temporal Loss: {:.4f}".format(
+                    message2 = (
+                        "Total Loss: {:.4f}, Mel Loss: {:.4f}, Mel PostNet Loss: {:.4f}, Pitch Loss: {:.4f}, Energy Loss: {:.4f}, Duration Loss: {:.4f},"
+                        " Attention Loss: {:.4f}, Duration Temporal Loss: {:.4f}, Total Temporal Loss: {:.4f},"
+                        "Duration KL Divergence Loss: {:.4f}, Pitch-Energy KL Loss: {:.4f}, Dur Discriminator Loss: {:.4f}"
+                        ", Duration GAN Loss: {:.4f}"
+                        ).format(
                         *losses
                     )
 
@@ -159,15 +262,13 @@ def main(args, configs):
                         sampling_rate=sampling_rate,
                         tag="Training/step_{}_{}_synthesized".format(step, tag),
                     )
-                    # Assuming `attention_tensor` is your tensor of attention maps shaped (batch, w, h)
-                    # and `train_logger` is your initialized SummaryWriter
                     log_attention_maps(train_logger, attn_soft.transpose(1, 2).detach(),
                                        output[9].detach().cpu().numpy(), output[8].detach().cpu().numpy(),
                                        step, tag_prefix="Training")
 
                 if step % val_step == 0:
                     model.eval()
-                    message = evaluate(model, step, configs, val_logger, vocoder)
+                    message = evaluate(model, step, configs, val_logger, vocoder, epoch)
                     with open(os.path.join(val_log_path, "log.txt"), "a") as f:
                         f.write(message + "\n")
                     outer_bar.write(message)
@@ -180,7 +281,8 @@ def main(args, configs):
                         "Now I see. Black human beings dislike the sound of rubbing glass probably the sound wave of the whistle"]
 
                     for i, sent in enumerate(test_sentences):
-                        t_aud = test_one_fs2(model.module, vocoder, sent)
+                        _, (blocks, hid, _) = zephyr_model.predict_emotions(sent)
+                        t_aud = test_one_fs2(model.module, vocoder, sent, blocks.cpu().numpy(), hid.cpu().numpy())
                         if t_aud is None:
                             continue
                         log(
@@ -204,6 +306,19 @@ def main(args, configs):
                             "{}.pth.tar".format(step),
                         ),
                     )
+                    torch.save(
+                        {
+                            "model": discriminator.module.state_dict(),
+                            "optimizer": optimizer_d.state_dict(),
+                        },
+                        os.path.join(
+                            train_config["path"]["ckpt_path"],
+                            "D_{}.pth.tar".format(step),
+                        ),
+                    )
+
+                if step > use_aligner_rope_steps:
+                    model.module.aligner.attn.use_positional_encoding = True
 
                 if step == total_step:
                     quit()
@@ -212,6 +327,7 @@ def main(args, configs):
 
             inner_bar.update(1)
         scheduler.step()
+        scheduler_d.step()
         epoch += 1
 
 
