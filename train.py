@@ -139,6 +139,7 @@ def main(args, configs):
 
     scaler = GradScaler()
     scaler_d = GradScaler()
+    use_aligner_rope_steps = 5000 if not len(args.pretrained) else 250
 
     discriminator_train_start_steps = 555555555555
 
@@ -261,15 +262,13 @@ def main(args, configs):
                         sampling_rate=sampling_rate,
                         tag="Training/step_{}_{}_synthesized".format(step, tag),
                     )
-                    # Assuming `attention_tensor` is your tensor of attention maps shaped (batch, w, h)
-                    # and `train_logger` is your initialized SummaryWriter
                     log_attention_maps(train_logger, attn_soft.transpose(1, 2).detach(),
                                        output[9].detach().cpu().numpy(), output[8].detach().cpu().numpy(),
                                        step, tag_prefix="Training")
 
                 if step % val_step == 0:
                     model.eval()
-                    message = evaluate(model, step, configs, val_logger, vocoder)
+                    message = evaluate(model, step, configs, val_logger, vocoder, epoch)
                     with open(os.path.join(val_log_path, "log.txt"), "a") as f:
                         f.write(message + "\n")
                     outer_bar.write(message)
@@ -317,6 +316,9 @@ def main(args, configs):
                             "D_{}.pth.tar".format(step),
                         ),
                     )
+
+                if step > use_aligner_rope_steps:
+                    model.module.aligner.attn.use_positional_encoding = True
 
                 if step == total_step:
                     quit()

@@ -8,14 +8,14 @@ from torch.utils.data import DataLoader
 
 from utils.model import get_model, get_vocoder
 from utils.tools import to_device, log, synth_one_sample
-from model import FastSpeech2Loss, FastSpeech3Loss
+from model import FastSpeech3Loss
 from dataset import Dataset
 
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 
-def evaluate(model, step, configs, logger=None, vocoder=None):
+def evaluate(model, step, configs, logger=None, vocoder=None, epoch=0):
     preprocess_config, model_config, train_config = configs
 
     # Get dataset
@@ -43,7 +43,7 @@ def evaluate(model, step, configs, logger=None, vocoder=None):
                 output = model(*(batch[2:]))
 
                 # Cal Loss
-                losses = Loss(batch, output, 0, model.module)
+                losses = Loss(batch, output, epoch, model.module)
 
                 for i in range(len(losses)):
                     loss_sums[i] += losses[i].item() * len(batch[0])

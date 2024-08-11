@@ -7,6 +7,7 @@ from torch.nn.utils.rnn import pack_padded_sequence, pad_packed_sequence
 import torch.nn.functional as F
 from .attblocks import CBAM2d, MaskedSEBlock1D
 from .subatts import init_weights_he
+import monotonic_align, math
 
 # Applying LayerNorm + Dropout on embeddings increases performance, probably due to the regularizing effect
 # Thanks dathudeptrai from TensorFlowTTS for discovering this.
@@ -550,6 +551,16 @@ class SpectrogramDecoder(nn.Module):
     # x_mask : True=exclude mask size (batch, mel_lens)
     # x: (batch, mel_lens, channels)
     def forward(self, x, x_mask, in_em, in_spk=None):
+        """
+        Forward pass, decode hidden states into a mel spectrogram.
+
+        :param x: Hidden states size (batch, ,mel_len, channels)
+        :param x_mask: True=padded mask size (batch, mel_lens)
+        :param in_em:
+        :param in_spk:
+
+        :return: Mel spectrogram size (batch, mel_len, mel_channels)
+        """
         orig_mask = x_mask.clone()
 
         conv_mask = x_mask.bool()
@@ -748,40 +759,6 @@ class EmotionEncoder(nn.Module):
         x = self.norm(x)
 
         return x
-
-import monotonic_align, math
-
-
-def do_mas(mu_x, y, x_mask, y_mask, n_feats):
-    """
-    Calculate the alignment path, attention matrix, and attention durations.
-
-    Parameters:
-    mu_x (Tensor): Mean tensor from encoder.
-    y (Tensor): Mel-spectrogram tensor.
-    x_mask (Tensor): Mask tensor for the input sequence.
-    y_mask (Tensor): Mask tensor for the output sequence.
-    n_feats (int): Number of features in the mel-spectrogram.
-
-    Returns:
-    Tensor, Tensor: The attention matrix and attention durations.
-    """
-    attn_mask = x_mask.unsqueeze(-1) * y_mask.unsqueeze(2)
-
-    with torch.no_grad():
-        const = -0.5 * math.log(2 * math.pi) * n_feats
-        factor = -0.5 * torch.ones(mu_x.shape, dtype=mu_x.dtype, device=mu_x.device)
-        y_square = torch.matmul(factor.transpose(1, 2), y ** 2)
-        y_mu_double = torch.matmul(2.0 * (factor * mu_x).transpose(1, 2), y)
-        mu_square = torch.sum(factor * (mu_x ** 2), 1).unsqueeze(-1)
-        log_prior = y_square - y_mu_double + mu_square + const
-
-        attn = monotonic_align.maximum_path(log_prior, attn_mask.squeeze(1))
-        attn = attn.detach()
-
-    attn_durations = attn.sum(2)
-
-    return attn, attn_durations
 
 
 def safe_log(tensor, epsilon=1e-6):

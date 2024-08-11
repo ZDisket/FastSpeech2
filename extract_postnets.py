@@ -8,7 +8,7 @@ from torch.utils.data import DataLoader
 
 from utils.model import get_model, get_vocoder
 from utils.tools import to_device, log, synth_one_sample
-from model import FastSpeech2Loss, FastSpeech3Loss
+from model import FastSpeech3Loss
 from dataset import Dataset
 import numpy as np
 from model import FastSpeech2
