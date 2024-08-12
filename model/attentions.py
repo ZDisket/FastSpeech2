@@ -363,7 +363,6 @@ class MultiHeadAttention(nn.Module):
         if self.use_talking_heads:  # Talking heads: x-transformers version (using Conv2d instead of Linear)
             self.pre_softmax_talking_heads = nn.Conv2d(heads, heads, 1, bias=False)
             self.post_softmax_talking_heads = nn.Conv2d(heads, heads, 1, bias=False)
-            self.talking_heads_drop = nn.Dropout(0.1)
 
         if self.num_persistent > 0:
             # persistent vectors:
@@ -455,7 +454,7 @@ class MultiHeadAttention(nn.Module):
             energy += alibi_bias
 
         if self.use_talking_heads:
-            energy = self.talking_heads_drop(self.pre_softmax_talking_heads(energy))
+            energy = self.pre_softmax_talking_heads(energy)
 
         if mask is not None:
             if current_persistent > 0:
@@ -469,7 +468,7 @@ class MultiHeadAttention(nn.Module):
         attention = F.softmax(energy / (self.embed_size ** (1 / 2)), dim=3)
 
         if self.use_talking_heads:
-            attention = self.talking_heads_drop(self.post_softmax_talking_heads(attention))
+            attention = self.post_softmax_talking_heads(attention)
 
         out = torch.einsum("nhql,nlhd->nqhd", [attention, values])
 
