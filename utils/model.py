@@ -53,7 +53,7 @@ def get_model(args, configs, device, train=False):
                                             lr=train_config["optimizer"]["init_lr"],
                                             betas=train_config["optimizer"]["betas"],
                                             eps=train_config["optimizer"]["eps"],
-                                            weight_decay=0.0,
+                                            weight_decay=train_config["optimizer"]["weight_decay"],
                                             )
         if args.restore_step:
             scheduled_optim.load_state_dict(ckpt["optimizer"])
