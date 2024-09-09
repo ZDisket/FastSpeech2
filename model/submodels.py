@@ -131,6 +131,32 @@ class ResNetEmProj(nn.Module):
         return out
 
 
+class SimpleEmProj(nn.Module):
+    def __init__(self, in_channels, out_channels, kernel_size):
+        super(SimpleEmProj, self).__init__()
+        self.conv = nn.Conv2d(in_channels, out_channels, kernel_size, padding="same")
+        self.relu = nn.ReLU()
+
+    def forward(self, x, mask):
+        # Mask should be of shape (batch, max_len) and needs to be expanded
+        # to match the shape of x: (batch, n_blocks, seq_len, hidden)
+        mask = mask.unsqueeze(-1).unsqueeze(-1)  # (batch, max_len, 1, 1)
+        mask = mask.transpose(1, 2)  # (batch, 1, max_len, 1)
+
+        # Apply the mask to zero out positions
+        x = x.masked_fill(mask, 0)
+
+        # Permute to (batch, hidden, n_blocks, seq_len) for convolution
+        x = x.permute(0, 3, 1, 2)
+
+        x = self.conv(x)
+        x = self.relu(x)
+
+        # Permute back to original shape (batch, n_blocks, seq_len, hidden)
+        x = x.permute(0, 2, 3, 1)
+
+        return x
+
 
 
 class TextEncoder(nn.Module):
@@ -155,7 +181,8 @@ class TextEncoder(nn.Module):
             self.cond_heads = 4
             self.cond_head_size = embed_size // self.cond_heads
 
-            self.em_proj = ResNetEmProj(self.emotion_channels, embed_size, self.cond_heads, 3)
+            #self.em_proj = ResNetEmProj(self.emotion_channels, embed_size, self.cond_heads, 3)
+            self.em_proj = SimpleEmProj(self.emotion_channels, self.cond_head_size, 1)
 
             self.cond_att = MultiHeadAttention(embed_size, self.cond_heads, alibi_alpha=1.5, start_i_increment=4,
                                                num_persistent=16)
@@ -275,38 +302,33 @@ def generate_masks_from_float_mask(float_mask):
 
 
 class VariantDurationPredictor(nn.Module):
-    def __init__(self, text_channels, filter_channels=512, depth=4, heads=4, kernel_size=3, p_dropout=0.2,
+    def __init__(self, text_channels, filter_channels=256, depth=4, heads=4, kernel_size=3, p_dropout=0.2,
                  final_dropout=0.2, conv_depth=2, lstm_bidirectional=True, start_i=0):
         super(VariantDurationPredictor, self).__init__()
 
         print("Using Variant Duration Predictor")
         self.use_dual_proj = False
         self.lstm_bidirectional = lstm_bidirectional
+        self.conv_depth = conv_depth
 
-        if conv_depth > 0:
-            self.pre_convs = SConvNorm(filter_channels, num_layers=conv_depth, kernel_size=kernel_size)
-            self.post_conv_drop = nn.Dropout(p_dropout)
-        else:
-            print("Not using pre convs")
-            self.pre_convs = nn.Identity()
-            self.post_conv_drop = nn.Identity()
+        self.conv_layers = nn.ModuleList()
 
-        self.decoder = TransformerDecoder(embed_size=filter_channels, heads=heads, num_layers=depth,
-                                          forward_expansion=4, dropout=p_dropout, alibi_alpha=1.5, mode="conv",
-                                          kernel_size=3, start_i=start_i)
+        for _ in range(conv_depth):
+            self.conv_layers.append(
+                ConvReluNorm(filter_channels, filter_channels, kernel_size, 1, act="relu", causal=False,
+                             dropout=p_dropout))
 
-        lstm_channels = filter_channels // 2
 
-        self.lstm_channels = lstm_channels
+        self.lstm_channels = filter_channels
 
-        self.lstm = nn.LSTM(input_size=filter_channels, hidden_size=lstm_channels, batch_first=True,
+        self.lstm = nn.LSTM(input_size=filter_channels, hidden_size=self.lstm_channels, batch_first=True,
                             bidirectional=self.lstm_bidirectional)
         if self.lstm_bidirectional:
             print("BiLSTM")
             self.fc_merge = nn.Linear(2 * self.lstm_channels,
                                       self.lstm_channels)  # Merging down to the original filter_channels size
 
-        self.out_proj = nn.Conv1d(in_channels=lstm_channels, out_channels=1, kernel_size=1)
+        self.out_proj = nn.Conv1d(in_channels=self.lstm_channels, out_channels=1, kernel_size=1)
 
         self.final_dropout = nn.Dropout(final_dropout)
         self.use_pre_proj = False
@@ -321,31 +343,21 @@ class VariantDurationPredictor(nn.Module):
         x = x.transpose(1, 2)  # (batch, seq_len, text_channels) => (batch, text_channels, seq_len)
 
         x_mask = lens_to_sequence_mask(x_lengths, x.size(2))
+
+        conv_mask = sequence_mask(x.size(1), x_lengths).unsqueeze(1)
+
         if self.use_pre_proj:
             x = self.pre_proj(x)
 
-        x = self.pre_convs(x)  # x = (b, channels, seq_len)
-        x = self.post_conv_drop(x)
+        for i, layer in enumerate(self.conv_layers):
+            x = layer(x, conv_mask)
+
 
         # Apply mask after convolutions
-        x = x * x_mask
+        x = x.masked_fill(conv_mask, 0)
 
-        # Perform transformer stuff
-
-        # Transpose for decoder
+        # Transpose for LSTM
         x = x.transpose(1, 2)  # (b, text_channels, seq_len) -> (b, seq_len, channels)
-
-        src_mask, tgt_mask = generate_masks_from_float_mask(x_mask)
-
-        # Transformer pass
-
-        x_dec = self.decoder(x, x, src_mask,
-                             tgt_mask)  # x enc = (b, seq_len, channels)
-
-        # Residual connection.
-        x = x + x_dec
-        # Apply dropout even in inference
-        x = self.final_dropout(x)
 
         # LSTM Portion
         # input must be (batch, seq_len, channels)
@@ -366,7 +378,6 @@ class VariantDurationPredictor(nn.Module):
 
         # Unpack the sequence
         x, lens_unpacked = pad_packed_sequence(x, batch_first=True)  # x_lstm:  (batch, seq_len, lstm_channels)
-        x = self.final_dropout(x)
         # pad back to pre-LSTM seq_len
         x = pad_to_original_length(x, x_seq_len_orig, x.size(1))
 
@@ -375,19 +386,15 @@ class VariantDurationPredictor(nn.Module):
 
         # Transpose dimensions for the post-convolution
         x = x.transpose(1, 2)  # (b, seq_len, channels) -> (b, channels, seq_len)
-        x = self.final_dropout(x)
 
         # Project using 1D convolution
         log_durations = self.out_proj(x)
 
-        log_durations *= x_mask
+        log_durations = log_durations.masked_fill(conv_mask, 0)
 
         log_durations = log_durations.squeeze(1)  # (batch, 1, seq_len) => (batch, seq_len)
 
-        x_mask = x_mask.squeeze(1).bool()
-        x_mask = ~x_mask
-
-        return log_durations, x_mask, x
+        return log_durations, conv_mask.squeeze(1), x.transpose(1,2)
 
 
 def expand_masks(x_mask, y_mask):
@@ -639,6 +646,7 @@ class DynamicDurationPredictor(nn.Module):
         self.emotion_size = 0
         self.em_replace_channels = 16
         self.bayesian = bayesian
+        self.use_mul = False
 
         self.tcn_attention = NeoTCNAttention(num_inputs, num_channels, kernel_sizes, dropout, att_dropout, heads,
                                              alibi_alpha=alibi_alpha, start_i_increment=start_i,
@@ -667,6 +675,10 @@ class DynamicDurationPredictor(nn.Module):
 
     #    self.refiner = ConvReluNorm(self.tcn_output_channels + self.bw_tcn_output_channels, self.tcn_output_channels + self.bw_tcn_output_channels, 5, 1, "layer", dropout=0.5)
         self.linear_projection = nn.Linear(self.tcn_output_channels, 1)
+
+        if self.use_mul:
+            self.multiplier_proj = nn.Conv1d(self.tcn_output_channels, 1, 5, padding="same")
+
 
 
         if self.speaker_channels > 0:
@@ -725,7 +737,18 @@ class DynamicDurationPredictor(nn.Module):
 
         durations = self.linear_projection(x)
 
-        durations = durations.squeeze(-1)
+        if self.use_mul:
+            mul = self.multiplier_proj(
+                x.transpose(1, 2)
+            ).transpose(1, 2).masked_fill(mask.unsqueeze(-1), -10)
+
+            mul = torch.sigmoid(mul).masked_fill(mask.unsqueeze(-1), 0)
+            mul = mul.squeeze(-1)
+        else:
+            mul = 1.0
+
+
+        durations = durations.squeeze(-1) * mul
         durations = durations.masked_fill(mask, 0)
 
         return durations, mask, x

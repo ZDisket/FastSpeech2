@@ -12,11 +12,6 @@ from matplotlib import pyplot as plt
 matplotlib.use("Agg")
 
 
-device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-from text import text_to_sequence, sequence_to_text, cleaned_text_to_sequence
-
-# GPT-4 wrote this hyper-optimized voodoo function. It's 10x faster than a naive loop-based impl
-# (0.5s vs 0.05s). Back in the days before that I would've had to write a numba guvectorize function.
 def compute_phoneme_level_features_optimized(duration, mel_pitch):
     """
     Convert mel-level features (mostly pitch/energy) into phoneme-level using durations to average.
@@ -45,6 +40,11 @@ def compute_phoneme_level_features_optimized(duration, mel_pitch):
     phoneme_pitch = sum_pitch / (count_pitch + 1e-9)  # Add a small value to avoid division by zero
 
     return phoneme_pitch
+
+
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+from text import text_to_sequence, sequence_to_text, cleaned_text_to_sequence
+
 
 def to_device(data, device):
     if len(data) == 11 + 3:
@@ -340,6 +340,7 @@ def plot_mel(data, stats, titles):
 
     return fig
 
+
 def pad_zephyr_outputs(hidden_blocks_list):
     """
     Zero-pads lists of numpy arrays along the sequence length dimension and returns their lengths.
@@ -426,7 +427,7 @@ def pad(input_ele, mel_max_length=None):
 from text import _clean_text
 def preproc_text(in_txt, cleaners = ["english_cleaners2"]):
     txt_ipa = _clean_text(in_txt, cleaners)
-    txt_arr = cleaned_text_to_sequence(txt_ipa, cleaners)
+    txt_arr = np.array(cleaned_text_to_sequence(txt_ipa, cleaners))
     return txt_arr
 
 

@@ -897,9 +897,13 @@ class CausalConv1d(nn.Module):
 
 
 class ConvReluNorm(nn.Module):
-    def __init__(self, in_channels, out_channels, kernel_size, dilation=1, normalization='layer', act="aptx", dropout=0.5):
+    def __init__(self, in_channels, out_channels, kernel_size, dilation=1, normalization='layer', act="aptx", dropout=0.5, causal=True):
         super(ConvReluNorm, self).__init__()
-        self.causal_conv = CausalConv1d(in_channels, out_channels, kernel_size, dilation)
+
+        if self.causal:
+            self.causal_conv = CausalConv1d(in_channels, out_channels, kernel_size, dilation)
+        else:
+            self.causal_conv = nn.Conv1d(in_channels, out_channels, kernel_size, dilation, padding="same")
 
         if act == "relu":
             self.act = nn.ReLU()
@@ -978,6 +982,8 @@ class NeoTCNAttention(nn.Module):
             self.conv_att = MaskedSEBlock1D(out_channels)
         elif conv_att == "cbam":
             self.conv_att = MaskedCBAM1d(out_channels)
+        else:
+            self.conv_att = None
 
     def forward(self, x, mask, inp_channel_last=True):
         """
@@ -1002,8 +1008,9 @@ class NeoTCNAttention(nn.Module):
                 x = x.transpose(1, 2)  # (batch, channels, seq)
 
             x = layer(x, mask)
-
-        x = self.conv_att(x, mask)
+        
+        if self.conv_att is not None:
+            x = self.conv_att(x, mask)
 
         if inp_channel_last:
             x = x.transpose(1, 2)  # (batch, seq, channels)

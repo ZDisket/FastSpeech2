@@ -17,6 +17,7 @@ class Dataset(Dataset):
         self.preprocessed_path = preprocess_config["path"]["preprocessed_path"]
         self.cleaners = preprocess_config["preprocessing"]["text"]["text_cleaners"]
         self.batch_size = train_config["optimizer"]["batch_size"]
+        self.zero_intersperse = False
 
         self.basename, self.speaker, self.text, self.raw_text = self.process_meta(
             filename

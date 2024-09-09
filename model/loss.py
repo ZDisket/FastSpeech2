@@ -319,7 +319,7 @@ class FastSpeech3Loss(nn.Module):
 
         src_masks = ~src_masks
         mel_masks = ~mel_masks
-        log_duration_targets = torch.log(attn_hard_dur.float() + 1)
+        log_duration_targets = torch.log(attn_hard_dur.float() + 1e-6)
 
         mel_targets = mel_targets[:, : mel_masks.shape[1], :]
         mel_masks = mel_masks[:, :mel_masks.shape[1]]
