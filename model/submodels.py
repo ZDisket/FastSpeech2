@@ -315,7 +315,7 @@ class VariantDurationPredictor(nn.Module):
 
         for _ in range(conv_depth):
             self.conv_layers.append(
-                ConvReluNorm(filter_channels, filter_channels, kernel_size, 1, act="relu", causal=False,
+                ConvReluNorm(filter_channels, filter_channels, kernel_size, 1, act="aptx", causal=False,
                              dropout=p_dropout))
 
 
