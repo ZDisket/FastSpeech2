@@ -372,6 +372,10 @@ class VarianceAdaptor(nn.Module):
                 lstm_bidirectional=model_config["duration_predictor"]["bidirectional"],
             )
             dp_output_channels = model_config["duration_predictor"]["filter_size"]
+
+            if model_config["duration_predictor"]["bidirectional"]:
+                dp_output_channels *= 2
+
         else:
             raise RuntimeError(f"Invalid duration predictor type: {dp_type}. Valid are tcn and lstm")
 

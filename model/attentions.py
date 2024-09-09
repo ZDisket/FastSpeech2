@@ -899,6 +899,7 @@ class CausalConv1d(nn.Module):
 class ConvReluNorm(nn.Module):
     def __init__(self, in_channels, out_channels, kernel_size, dilation=1, normalization='layer', act="aptx", dropout=0.5, causal=True):
         super(ConvReluNorm, self).__init__()
+        self.causal = causal
 
         if self.causal:
             self.causal_conv = CausalConv1d(in_channels, out_channels, kernel_size, dilation)

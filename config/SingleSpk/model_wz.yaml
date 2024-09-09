@@ -19,7 +19,7 @@ variance_predictor:
   dropout_on_emb: 0.1 # dropout applied to pitch&energy embs before adding to decoder input, doesn't affect predictors directly
 
 duration_predictor:
-  type: "tcn" # support tcn (TCN-Attention) or lstm (Conv+Decoder+LSTM)
+  type: "lstm" # support tcn (TCN-Attention) or lstm (Conv+Decoder+LSTM)
   bidirectional: true # both: bidirectional
   att_dropout: 0.5 # only applies to TCN duration pred, dropout applied to attention
   tcn_channels: [256, 256] # only applies to TCN duration pred

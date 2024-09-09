@@ -5,7 +5,7 @@ from .attentions import TransformerEncoder, TemporalConvNet, MultiHeadAttention,
     ConvReluNorm
 from torch.nn.utils.rnn import pack_padded_sequence, pad_packed_sequence
 import torch.nn.functional as F
-from .attblocks import CBAM2d, MaskedSEBlock1D
+from .attblocks import CBAM2d, MaskedSEBlock1D, MaskedCBAM1d
 from .subatts import init_weights_he
 import monotonic_align, math
 
@@ -325,10 +325,9 @@ class VariantDurationPredictor(nn.Module):
                             bidirectional=self.lstm_bidirectional)
         if self.lstm_bidirectional:
             print("BiLSTM")
-            self.fc_merge = nn.Linear(2 * self.lstm_channels,
-                                      self.lstm_channels)  # Merging down to the original filter_channels size
 
-        self.out_proj = nn.Conv1d(in_channels=self.lstm_channels, out_channels=1, kernel_size=1)
+        self.out_proj = nn.Conv1d(in_channels=self.lstm_channels * 2 if self.lstm_bidirectional else self.lstm_channels,
+                                  out_channels=1, kernel_size=1)
 
         self.final_dropout = nn.Dropout(final_dropout)
         self.use_pre_proj = False
@@ -339,19 +338,16 @@ class VariantDurationPredictor(nn.Module):
 
     # x = Encoder hidden states size (batch, seq_len, text_channels)
     # x_lengths = Lengths of x size (batch_size,)
-    def forward(self, x, x_lengths, in_em):
+    def forward(self, x, x_lengths, in_em, in_spk):
         x = x.transpose(1, 2)  # (batch, seq_len, text_channels) => (batch, text_channels, seq_len)
 
-        x_mask = lens_to_sequence_mask(x_lengths, x.size(2))
-
-        conv_mask = sequence_mask(x.size(1), x_lengths).unsqueeze(1)
+        conv_mask = sequence_mask(x.size(2), x_lengths).unsqueeze(1)
 
         if self.use_pre_proj:
             x = self.pre_proj(x)
 
         for i, layer in enumerate(self.conv_layers):
             x = layer(x, conv_mask)
-
 
         # Apply mask after convolutions
         x = x.masked_fill(conv_mask, 0)
@@ -380,9 +376,6 @@ class VariantDurationPredictor(nn.Module):
         x, lens_unpacked = pad_packed_sequence(x, batch_first=True)  # x_lstm:  (batch, seq_len, lstm_channels)
         # pad back to pre-LSTM seq_len
         x = pad_to_original_length(x, x_seq_len_orig, x.size(1))
-
-        if self.lstm_bidirectional:
-            x = self.fc_merge(x)
 
         # Transpose dimensions for the post-convolution
         x = x.transpose(1, 2)  # (b, seq_len, channels) -> (b, channels, seq_len)
