@@ -10,7 +10,7 @@ from tqdm import tqdm
 
 from utils.model import get_model, get_vocoder, get_param_num, load_pretrained_weights
 from utils.tools import to_device, log, synth_one_sample, test_one_fs2, log_attention_maps
-from model import FastSpeech3Loss, DualDiscriminator, AdvSeqDiscriminator
+from model import FastSpeech3Loss, DualDiscriminator, AdvSeqDiscriminator, AdEMAMix
 from model.loss import LSGANLoss
 from dataset import Dataset
 from torch.cuda.amp import GradScaler, autocast
@@ -86,7 +86,7 @@ def main(args, configs):
     discriminator.apply(weights_init_he)
     discriminator.train()
     criterion_lsgan = LSGANLoss()
-    optimizer_d = torch.optim.Adam(discriminator.parameters(), lr=0.0001)
+    optimizer_d = AdEMAMix(discriminator.parameters(), lr=0.0001)
     if args.restore_step:
         ckpt_path = os.path.join(
             train_config["path"]["ckpt_path"],
