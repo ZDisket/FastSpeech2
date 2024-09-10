@@ -332,6 +332,7 @@ class VariantDurationPredictor(nn.Module):
         self.final_dropout = nn.Dropout(final_dropout)
         self.use_pre_proj = False
 
+
         if text_channels != filter_channels:
             self.pre_proj = nn.Conv1d(text_channels, filter_channels, 1)
             self.use_pre_proj = True

@@ -82,7 +82,7 @@ def main(args, configs):
     if len(args.pretrained):
         load_pretrained_weights(model, args.pretrained)
 
-    discriminator = DualDiscriminator(n_heads=0, hidden_dim=256, num_blocks=3, dropout=0.1).to(device)
+    discriminator = DualDiscriminator(n_heads=0, hidden_dim=768, num_blocks=3, dropout=0.1).to(device)
     discriminator.apply(weights_init_he)
     discriminator.train()
     criterion_lsgan = LSGANLoss()

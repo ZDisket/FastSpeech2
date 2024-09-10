@@ -5,9 +5,8 @@ import torch
 import numpy as np
 
 import hifigan
-from model import FastSpeech2, ScheduledOptim
+from model import FastSpeech2, ScheduledOptim, AdEMAMix
 from istftnetfe import ISTFTNetFE
-
 
 def load_pretrained_weights(model, pretrained_path):
     print(f"Loading pretrained weights from {pretrained_path}")
@@ -49,9 +48,8 @@ def get_model(args, configs, device, train=False):
         model.load_state_dict(ckpt["model"])
 
     if train:
-        scheduled_optim = torch.optim.NAdam(model.parameters(),
+        scheduled_optim = AdEMAMix(model.parameters(),
                                             lr=train_config["optimizer"]["init_lr"],
-                                            betas=train_config["optimizer"]["betas"],
                                             eps=train_config["optimizer"]["eps"],
                                             weight_decay=train_config["optimizer"]["weight_decay"],
                                             )
