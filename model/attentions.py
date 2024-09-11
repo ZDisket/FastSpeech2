@@ -181,13 +181,16 @@ class SwiGLUConvFFN(nn.Module):
         elif act == "relugt":
             self.dprelu = ReLUGT()
             self.act_fn = self._dprelu
+        elif act == "relugtz":
+            self.dprelu = ReLUGT()
+            self.act_fn = self._relugtz
 
         if causal:
             self.padding = self._causal_padding
         else:
             self.padding = self._same_padding
 
-        expand = 2 * hidden_features if act == "swiglu" else hidden_features
+        expand = 2 * hidden_features if act in ["swiglu", "relugtz"] else hidden_features
 
         self.conv1 = nn.Conv1d(in_features, expand, kernel_size[0], bias=bias)
         self.conv2 = nn.Conv1d(hidden_features, out_features, kernel_size[1], bias=bias)
@@ -196,6 +199,11 @@ class SwiGLUConvFFN(nn.Module):
     def _swiglu(self, x):
         x1, x2 = x.chunk(2, dim=1)
         x = F.silu(x1) * x2
+        return x
+
+    def _relugtz(self, x):
+        x1, x2 = x.chunk(2, dim=1)
+        x = self.dprelu(x1) * x2
         return x
 
     def _relu2(self, x):

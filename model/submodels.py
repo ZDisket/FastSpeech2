@@ -330,6 +330,7 @@ class VariantDurationPredictor(nn.Module):
                                   out_channels=1, kernel_size=1)
 
         self.final_dropout = nn.Dropout(final_dropout)
+        self.drop = nn.Dropout(0.3)
         self.use_pre_proj = False
 
 
@@ -380,6 +381,8 @@ class VariantDurationPredictor(nn.Module):
 
         # Transpose dimensions for the post-convolution
         x = x.transpose(1, 2)  # (b, seq_len, channels) -> (b, channels, seq_len)
+
+        x = self.drop(x)
 
         # Project using 1D convolution
         log_durations = self.out_proj(x)
