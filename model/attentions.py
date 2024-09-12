@@ -151,7 +151,7 @@ class SwiGLUConvFFN(nn.Module):
         out_features = out_features or in_features
         hidden_features = hidden_features or in_features
 
-        valid_acts = ["swiglu", "relu2", "aptx", "relu", "dprelu", "aptxs1", "relugtz"]
+        valid_acts = ["swiglu", "relu2", "aptx", "relu", "dprelu", "aptxs1", "relugtz", "relugt"]
 
         if act not in valid_acts:
             raise ValueError(f"Unknown activation {act}. Valid activations are {valid_acts}")
