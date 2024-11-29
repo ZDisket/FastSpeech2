@@ -321,10 +321,10 @@ class VariantDurationPredictor(nn.Module):
 
         self.lstm_channels = filter_channels
 
-        self.lstm = nn.LSTM(input_size=filter_channels, hidden_size=self.lstm_channels, batch_first=True,
+        self.lstm = nn.GRU(input_size=filter_channels, hidden_size=self.lstm_channels, batch_first=True,
                             bidirectional=self.lstm_bidirectional)
         if self.lstm_bidirectional:
-            print("BiLSTM")
+            print("BiGRU")
 
         self.out_proj = nn.Conv1d(in_channels=self.lstm_channels * 2 if self.lstm_bidirectional else self.lstm_channels,
                                   out_channels=1, kernel_size=1)

@@ -9,18 +9,71 @@ from utils.tools import compute_phoneme_level_features_optimized
 
 
 class LSGANLoss(nn.Module):
-    def __init__(self, real_label=1.0, fake_label=0.0):
+    def __init__(self, real_label=1.0, fake_label=0.0, decay=0.99, use_lecam=True):
         super(LSGANLoss, self).__init__()
         self.real_label = real_label
         self.fake_label = fake_label
+        self.decay = decay
+        self.use_lecam = use_lecam
         self.criterion = nn.MSELoss()
 
+        # Initialize EMA variables for discriminator predictions
+        self.register_buffer("ema_real", torch.tensor(0.0))
+        self.register_buffer("ema_fake", torch.tensor(0.0))
+        self.ema_initialized = False  # Flag to check initialization
+
+    def update_ema(self, current_real, current_fake):
+        """Update EMA values for real and fake scores."""
+        # Ensure EMA tensors are on the same device as the inputs
+        device = current_real.device
+        self.ema_real = self.ema_real.to(device)
+        self.ema_fake = self.ema_fake.to(device)
+
+        if not self.ema_initialized:
+            # Initialize EMA values with the mean of current inputs (detached from graph)
+            self.ema_real.copy_(current_real.mean().detach())
+            self.ema_fake.copy_(current_fake.mean().detach())
+            self.ema_initialized = True
+        else:
+            # Update EMA values using exponential moving average formula
+            self.ema_real.mul_(self.decay).add_(1 - self.decay, current_real.mean().detach())
+            self.ema_fake.mul_(self.decay).add_(1 - self.decay, current_fake.mean().detach())
+
+    def lecam_loss(self, real_output, fake_output):
+        """Compute the LeCam regularization loss."""
+        # Ensure EMA tensors are on the same device as the outputs
+        device = real_output.device
+        self.ema_real = self.ema_real.to(device)
+        self.ema_fake = self.ema_fake.to(device)
+
+        # Detach EMA values to ensure no gradients flow through them
+        ema_real = self.ema_real.detach()
+        ema_fake = self.ema_fake.detach()
+
+        # Relu to ensure non-negative loss components
+        lecam_real = torch.mean((real_output - ema_fake).clamp(min=0) ** 2)
+        lecam_fake = torch.mean((ema_real - fake_output).clamp(min=0) ** 2)
+        return lecam_real + lecam_fake
+
     def discriminator_loss(self, real_output, fake_output):
+        """Discriminator loss with optional LeCam regularization."""
+        # Standard LSGAN loss
         real_loss = self.criterion(real_output, torch.full_like(real_output, self.real_label))
         fake_loss = self.criterion(fake_output, torch.full_like(fake_output, self.fake_label))
-        return 0.5 * (real_loss + fake_loss)
+        lsgan_loss = 0.5 * (real_loss + fake_loss)
+
+        # Compute and optionally add LeCam regularization
+        if self.use_lecam:
+            # Update EMA values
+            self.update_ema(real_output, fake_output)
+            # Compute LeCam loss
+            lecam_reg = self.lecam_loss(real_output, fake_output)
+            return lsgan_loss + lecam_reg
+        else:
+            return lsgan_loss
 
     def generator_loss(self, fake_output):
+        """Generator loss remains the same."""
         return self.criterion(fake_output, torch.full_like(fake_output, self.real_label))
 
 

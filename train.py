@@ -85,7 +85,7 @@ def main(args, configs):
     discriminator = DualDiscriminator(n_heads=0, hidden_dim=768, num_blocks=3, dropout=0.5).to(device)
     discriminator.apply(weights_init_he)
     discriminator.train()
-    criterion_lsgan = LSGANLoss()
+    criterion_lsgan = LSGANLoss(use_lecam=True)
     optimizer_d = AdEMAMix(discriminator.parameters(), lr=0.0001)
     if args.restore_step:
         ckpt_path = os.path.join(
