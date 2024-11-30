@@ -8,6 +8,7 @@ import torch.nn.functional as F
 from .attblocks import CBAM2d, MaskedSEBlock1D, MaskedCBAM1d
 from .subatts import init_weights_he
 import monotonic_align, math
+from torchbnn import BayesLinear
 
 # Applying LayerNorm + Dropout on embeddings increases performance, probably due to the regularizing effect
 # Thanks dathudeptrai from TensorFlowTTS for discovering this.
@@ -303,7 +304,7 @@ def generate_masks_from_float_mask(float_mask):
 
 class VariantDurationPredictor(nn.Module):
     def __init__(self, text_channels, filter_channels=256, depth=4, heads=4, kernel_size=3, p_dropout=0.2,
-                 final_dropout=0.2, conv_depth=2, lstm_bidirectional=True, start_i=0):
+                 final_dropout=0.2, conv_depth=2, lstm_bidirectional=True, start_i=0, bayesian=True):
         super(VariantDurationPredictor, self).__init__()
 
         print("Using Variant Duration Predictor")
@@ -326,11 +327,17 @@ class VariantDurationPredictor(nn.Module):
         if self.lstm_bidirectional:
             print("BiGRU")
 
-        self.out_proj = nn.Conv1d(in_channels=self.lstm_channels * 2 if self.lstm_bidirectional else self.lstm_channels,
-                                  out_channels=1, kernel_size=1)
+        if not bayesian:
+            self.out_proj = nn.Linear(self.lstm_channels * 2 if self.lstm_bidirectional else self.lstm_channels, 1)
+        else:
+            self.out_proj = BayesLinear(prior_mu=0.0, prior_sigma=0.01, # very low prior sigma because we operate in the log domain
+                                        in_features=self.lstm_channels * 2 if self.lstm_bidirectional else self.lstm_channels,
+                                        out_features=1)
+
+
 
         self.final_dropout = nn.Dropout(final_dropout)
-        self.drop = nn.Dropout(0.3)
+        self.drop = nn.Dropout(0.1)
         self.use_pre_proj = False
 
 
@@ -385,7 +392,7 @@ class VariantDurationPredictor(nn.Module):
         x = self.drop(x)
 
         # Project using 1D convolution
-        log_durations = self.out_proj(x)
+        log_durations = self.out_proj(x.transpose(1,2)).transpose(1,2)
 
         log_durations = log_durations.masked_fill(conv_mask, 0)
 

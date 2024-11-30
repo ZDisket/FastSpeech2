@@ -457,13 +457,13 @@ class FastSpeech3Loss(nn.Module):
             al_match_loss = self.bin_loss(hard_attention=attn_hard, soft_attention=attn_soft) * bin_loss_scale
             total_attn_loss += al_match_loss
 
-        kl_duration = self.kl_loss(model.variance_adaptor.duration_predictor) * self.duration_kl_loss_weight
-        kl_energy = self.kl_loss(model.variance_adaptor.energy_predictor) * self.pitch_energy_kl_loss_weight
-        kl_pitch = self.kl_loss(model.variance_adaptor.pitch_predictor) * self.pitch_energy_kl_loss_weight
+        kl_duration = self.kl_loss(model.variance_adaptor.duration_predictor)
+        kl_energy = self.kl_loss(model.variance_adaptor.energy_predictor)
+        kl_pitch = self.kl_loss(model.variance_adaptor.pitch_predictor)
 
         kl_pitch_energy = kl_energy + kl_pitch
 
-        total_kl = kl_duration + kl_pitch_energy
+        total_kl = kl_duration * self.duration_kl_loss_weight + kl_pitch_energy * self.pitch_energy_kl_loss_weight
 
         total_loss = (
                 mel_loss + postnet_mel_loss + duration_loss + pitch_loss + energy_loss +
