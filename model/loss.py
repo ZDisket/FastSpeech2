@@ -328,7 +328,7 @@ class FastSpeech3Loss(nn.Module):
         self.charb_loss = Charbonnier1D()
         self.temp_loss = TemporalConsistencyLoss(1.0, True)  # I tested 0.35, 0.5, 0.75, but 1.0 is best
         self.pe_temp_loss = TemporalConsistencyLoss(1.0, True)  # I tested 0.35, 0.5, 0.75, but 1.0 is best
-        self.kl_loss = bnn.BKLLoss(reduction='sum', last_layer_only=False)
+        self.kl_loss = bnn.BKLLoss(reduction='mean', last_layer_only=False)
 
         self.duration_kl_loss_weight = 1.0
         self.pitch_energy_kl_loss_weight = 1.0

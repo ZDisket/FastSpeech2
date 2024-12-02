@@ -367,24 +367,7 @@ class VariantDurationPredictor(nn.Module):
         # LSTM Portion
         # input must be (batch, seq_len, channels)
 
-        # Pack padded sequence
-
-        # max(x_lengths) is less than the seq_len dimension in x, often by 5 or 10
-        # and the LSTM outputs a tensor of max(x_lengths) in its seq_len dimension
-        # therefore, we save the original seq_len dimension for padding back later
-        x_seq_len_orig = x.size(1)
-
-        x = pack_padded_sequence(x, x_lengths.detach().cpu(),
-                                 # pack_padded_sequence demands that the lengths tensor be on the CPU
-                                 batch_first=True, enforce_sorted=False)
-
-        # LSTM pass
-        x, (hn, cn) = self.lstm(x)
-
-        # Unpack the sequence
-        x, lens_unpacked = pad_packed_sequence(x, batch_first=True)  # x_lstm:  (batch, seq_len, lstm_channels)
-        # pad back to pre-LSTM seq_len
-        x = pad_to_original_length(x, x_seq_len_orig, x.size(1))
+        x = self.run_rnn(x, x_lengths)
 
         # Transpose dimensions for the post-convolution
         x = x.transpose(1, 2)  # (b, seq_len, channels) -> (b, channels, seq_len)
@@ -399,6 +382,23 @@ class VariantDurationPredictor(nn.Module):
         log_durations = log_durations.squeeze(1)  # (batch, 1, seq_len) => (batch, seq_len)
 
         return log_durations, conv_mask.squeeze(1), x.transpose(1,2)
+
+    def run_rnn(self, x, x_lengths):
+        # Pack padded sequence
+        # max(x_lengths) is less than the seq_len dimension in x, often by 5 or 10
+        # and the LSTM outputs a tensor of max(x_lengths) in its seq_len dimension
+        # therefore, we save the original seq_len dimension for padding back later
+        x_seq_len_orig = x.size(1)
+        x = pack_padded_sequence(x, x_lengths.detach().cpu(),
+                                 # pack_padded_sequence demands that the lengths tensor be on the CPU
+                                 batch_first=True, enforce_sorted=False)
+        # LSTM pass
+        x, (hn, cn) = self.lstm(x)
+        # Unpack the sequence
+        x, lens_unpacked = pad_packed_sequence(x, batch_first=True)  # x_lstm:  (batch, seq_len, lstm_channels)
+        # pad back to pre-LSTM seq_len
+        x = pad_to_original_length(x, x_seq_len_orig, x.size(1))
+        return x
 
 
 def expand_masks(x_mask, y_mask):

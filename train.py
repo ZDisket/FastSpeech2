@@ -10,7 +10,7 @@ from tqdm import tqdm
 
 from utils.model import get_model, get_vocoder, get_param_num, load_pretrained_weights
 from utils.tools import to_device, log, synth_one_sample, test_one_fs2, log_attention_maps
-from model import FastSpeech3Loss, DualDiscriminator, AdvSeqDiscriminator, AdEMAMix
+from model import FastSpeech3Loss, DualDiscriminator, AdvSeqDiscriminator, AdEMAMix, MultiLengthDiscriminator
 from model.loss import LSGANLoss
 from dataset import Dataset
 from torch.cuda.amp import GradScaler, autocast
@@ -82,7 +82,8 @@ def main(args, configs):
     if len(args.pretrained):
         load_pretrained_weights(model, args.pretrained)
 
-    discriminator = DualDiscriminator(n_heads=0, hidden_dim=768, num_blocks=3, dropout=0.5).to(device)
+    discriminator = MultiLengthDiscriminator(n_heads=0, hidden_dim=768, dropout=0.5,
+                                                kernel_size=[[3, 3], [7, 9]], emotion_hidden=0).to(device)
     discriminator.apply(weights_init_he)
     discriminator.train()
     criterion_lsgan = LSGANLoss(use_lecam=True)
@@ -327,7 +328,10 @@ def main(args, configs):
 
             inner_bar.update(1)
         scheduler.step()
-        scheduler_d.step()
+
+        if step > discriminator_train_start_steps:
+            scheduler_d.step()
+
         epoch += 1
 
 

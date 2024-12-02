@@ -4,10 +4,12 @@ import torch.optim as optim
 from .attentions import SEBlock1D, TransposeRMSNorm, MultiHeadAttention, APTx, ResidualBlock1D
 from .submodels import sequence_mask, mask_to_attention_mask
 
+
 class SequenceNormalization(nn.Module):
     """
     Masked sequence normalization with learned alpha and beta values
     """
+
     def __init__(self, num_features):
         super(SequenceNormalization, self).__init__()
         self.alpha = nn.Parameter(torch.ones(1, num_features, 1))
@@ -20,7 +22,7 @@ class SequenceNormalization(nn.Module):
         :param seq_lens: Int sequence lengths tensor size (batch,)
         :return: Normalized x, same shape
         """
-        x = x.transpose(1,2) # (batch, seq_len, 1) => (batch, 1, seq_len)
+        x = x.transpose(1, 2)  # (batch, seq_len, 1) => (batch, 1, seq_len)
 
         # Create mask based on sequence lengths
         batch_size, max_len = x.size(0), x.size(2)
@@ -37,8 +39,9 @@ class SequenceNormalization(nn.Module):
 
         # Apply learnable scaling and shifting
         scaled_x = normalized_x * self.alpha + self.beta
-        scaled_x = scaled_x.transpose(1, 2) # (batch, 1, seq_len) => (batch, seq_len, 1)
+        scaled_x = scaled_x.transpose(1, 2)  # (batch, 1, seq_len) => (batch, seq_len, 1)
         return scaled_x
+
 
 class AdvSeqDiscriminator(nn.Module):
     """
@@ -49,24 +52,27 @@ class AdvSeqDiscriminator(nn.Module):
     Use n_heads=0 for no attention
     """
 
-    def __init__(self, num_channels=1, num_conv_layers=3, conv_kernel_size=[3, 3, 3], hidden_dim=128, dropout=0.3, n_heads=4, att_dropout=0.3):
+    def __init__(self, num_channels=1, num_conv_layers=3, conv_kernel_size=[3, 3, 3], hidden_dim=128, dropout=0.3,
+                 n_heads=4, att_dropout=0.3, gru_channels=0):
         super(AdvSeqDiscriminator, self).__init__()
 
         self.proj = nn.Linear(num_channels, hidden_dim)
         self.att_drop = nn.Dropout(att_dropout)
         self.drop1 = nn.Dropout(0.1)
         self.n_heads = n_heads
-
+        self.gru_channels = gru_channels
 
         if self.n_heads > 0:
-            self.attention = MultiHeadAttention(hidden_dim, self.n_heads, alibi_alpha=1.5, start_i_increment=4, num_persistent=16)
+            self.attention = MultiHeadAttention(hidden_dim, self.n_heads, alibi_alpha=1.5, start_i_increment=4,
+                                                num_persistent=16)
             self.norm = nn.LayerNorm(hidden_dim)
 
         in_channels = hidden_dim
 
         self.blocks = nn.ModuleList(
             [
-                ResidualBlock1D(in_channels, in_channels, kernel_size=conv_kernel_size[i], dropout=dropout) for i in range(num_conv_layers)
+                ResidualBlock1D(in_channels, in_channels, kernel_size=conv_kernel_size[i], dropout=dropout) for i in
+                range(num_conv_layers)
             ])
 
         self.fc = nn.Sequential(
@@ -86,7 +92,7 @@ class AdvSeqDiscriminator(nn.Module):
         att_mask = mask_to_attention_mask(x_mask)
         x = x.unsqueeze(-1)  # (batch, seq_len) => (batch, seq_len, 1)
 
-        x = self.proj(x) # (batch, seq_len, 1) => (batch, seq_len, hidden_dim)
+        x = self.proj(x)  # (batch, seq_len, 1) => (batch, seq_len, hidden_dim)
 
         if hidden_in is not None:
             x = x + hidden_in[:, :x.size(1), :]
@@ -101,8 +107,8 @@ class AdvSeqDiscriminator(nn.Module):
             x = self.drop1(x)
 
         # Prepare for convs
-        x = x.transpose(1,2) # (batch, seq_len, hidden_dim) => (batch, hidden_dim, seq_len)
-        x_mask = x_mask.unsqueeze(1) # (batch, seq_len) => (batch, 1, seq_len)
+        x = x.transpose(1, 2)  # (batch, seq_len, hidden_dim) => (batch, hidden_dim, seq_len)
+        x_mask = x_mask.unsqueeze(1)  # (batch, seq_len) => (batch, 1, seq_len)
 
         for layer in self.blocks:
             x.masked_fill(x_mask, 0)
@@ -138,21 +144,90 @@ class AdvSeqDiscriminator(nn.Module):
         return x
 
 
+class MultiLengthDiscriminator(nn.Module):
+    """
+    Borrowing from HiFi-GAN, Multi-Length Discriminator employs multiple discriminator at lengths and kernel sizes.
+    """
+    def __init__(self, text_hidden=256, num_channels=1, hidden_dim=768,
+                 n_heads=0, dropout=0.5, kernel_size=[[3, 3], [7, 9]], emotion_hidden=256):
+        super(MultiLengthDiscriminator, self).__init__()
+
+        self.emotion_hidden = emotion_hidden
+
+        if text_hidden > 0:
+            self.text_compress = (
+                nn.Conv1d(text_hidden, hidden_dim, 3, padding="same")
+                if text_hidden != hidden_dim else nn.Identity()
+            )
+
+        if self.emotion_hidden > 0:
+            self.em_proj = nn.Sequential(
+                nn.Linear(emotion_hidden, hidden_dim),
+                nn.ReLU(inplace=True),
+                nn.Dropout(0.5),
+            )
+
+        # Create a list of discriminators for each set of kernel sizes
+        self.discriminators = nn.ModuleList()
+        for ks in kernel_size:
+            discriminator = AdvSeqDiscriminator(
+                num_channels=num_channels,
+                num_conv_layers=len(ks),
+                hidden_dim=hidden_dim,
+                n_heads=n_heads,
+                dropout=dropout,
+                conv_kernel_size=ks
+            )
+            self.discriminators.append(discriminator)
+
+    def forward(self, x, seq_lens, text_hidden=None, em_hidden=None):
+        """
+        Forward pass
+        :param x: Input tensor of shape (batch_size, seq_len, num_channels)
+        :param seq_lens: Sequence lengths tensor of shape (batch_size,)
+        :param text_hidden: Optional text features of shape (batch_size, seq_len, text_hidden)
+        :param em_hidden: Optional emotion features of shape (batch_size, emotion_hidden)
+        :return: Combined discriminator scores
+        """
+        if text_hidden is not None:
+            text_hidden = self.text_compress(text_hidden.transpose(1, 2)).transpose(1, 2)
+
+        if em_hidden is not None and self.emotion_hidden > 0:
+            em_hidden = self.em_proj(em_hidden)
+        else:
+            em_hidden = None
+
+        # Collect scores from all discriminators
+        scores = []
+        for discriminator in self.discriminators:
+            score = discriminator(x, seq_lens, text_hidden, em_hidden)
+            scores.append(score)
+
+        # Concatenate all scores along the channel dimension
+        combined_score = torch.cat(scores, dim=1)
+
+        return combined_score
+
+
 class DualDiscriminator(nn.Module):
-    def __init__(self, text_hidden=256, num_channels=1, num_blocks=3, hidden_dim=128, n_heads=4, dropout=0.3, kernel_size=[3, 3, 3], emotion_hidden=256):
+    def __init__(self, text_hidden=256, num_channels=1, num_blocks=3, hidden_dim=128, n_heads=4, dropout=0.3,
+                 kernel_size=[3, 3, 3], emotion_hidden=256):
         super(DualDiscriminator, self).__init__()
 
         if text_hidden > 0:
-            self.text_compress = nn.Conv1d(text_hidden, hidden_dim, 3, padding="same") if text_hidden != hidden_dim else nn.Identity()
+            self.text_compress = nn.Conv1d(text_hidden, hidden_dim, 3,
+                                           padding="same") if text_hidden != hidden_dim else nn.Identity()
 
         self.em_proj = nn.Sequential(nn.Linear(emotion_hidden, hidden_dim),
                                      nn.ReLU(inplace=True),
-                                     nn.Dropout(0.5),)
+                                     nn.Dropout(0.5), )
 
         self.sequence_discriminator = AdvSeqDiscriminator(num_channels, num_conv_layers=num_blocks,
-                                                          hidden_dim=hidden_dim, n_heads=n_heads, dropout=dropout, conv_kernel_size=kernel_size)
+                                                          hidden_dim=hidden_dim, n_heads=n_heads, dropout=dropout,
+                                                          conv_kernel_size=kernel_size)
         self.difference_discriminator = AdvSeqDiscriminator(num_channels, num_conv_layers=num_blocks,
-                                                            hidden_dim=hidden_dim, n_heads=n_heads, dropout=dropout,  conv_kernel_size=kernel_size)
+                                                            hidden_dim=hidden_dim, n_heads=n_heads, dropout=dropout,
+                                                            conv_kernel_size=kernel_size)
 
     def forward(self, x, seq_lens, text_hidden=None, em_hidden=None):
         """
@@ -184,6 +259,7 @@ class DualDiscriminator(nn.Module):
         combined_score = torch.cat((sequence_score, difference_score), dim=1)
 
         return combined_score
+
 
 class SeqDiscriminator(nn.Module):
     """
@@ -260,7 +336,9 @@ class PatchDiscriminator(nn.Module):
     Conv1Ds => Compress => Out
     Very slow.
     """
-    def __init__(self, num_channels=1, num_conv_layers=3, conv_kernel_size=3, hidden_dim=128, chunk_size=3, dropout=0.3):
+
+    def __init__(self, num_channels=1, num_conv_layers=3, conv_kernel_size=3, hidden_dim=128, chunk_size=3,
+                 dropout=0.3):
         super(PatchDiscriminator, self).__init__()
         self.chunk_size = chunk_size
 
@@ -304,7 +382,8 @@ class PatchDiscriminator(nn.Module):
         batch_size = x.size(0)
         for b in range(batch_size):
             max_len = seq_lens[b]
-            chunks = [x[b:b + 1, i:i + self.chunk_size, :] for i in range(0, max_len - self.chunk_size + 1, self.chunk_size)]
+            chunks = [x[b:b + 1, i:i + self.chunk_size, :] for i in
+                      range(0, max_len - self.chunk_size + 1, self.chunk_size)]
             all_chunks.extend(chunks)
 
         if all_chunks:
