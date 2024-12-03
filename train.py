@@ -83,11 +83,11 @@ def main(args, configs):
         load_pretrained_weights(model, args.pretrained)
 
     discriminator = MultiLengthDiscriminator(n_heads=0, hidden_dim=768, dropout=0.5,
-                                                kernel_size=[[3, 3], [7, 9]], emotion_hidden=0).to(device)
+                                                kernel_size=[[3, 3, 3], [5, 7, 9]], emotion_hidden=0, gru_size=[256, 0]).to(device)
     discriminator.apply(weights_init_he)
     discriminator.train()
     criterion_lsgan = LSGANLoss(use_lecam=True)
-    optimizer_d = AdEMAMix(discriminator.parameters(), lr=0.0001)
+    optimizer_d = AdEMAMix(discriminator.parameters(), lr=0.00001)
     if args.restore_step:
         ckpt_path = os.path.join(
             train_config["path"]["ckpt_path"],

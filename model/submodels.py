@@ -393,7 +393,7 @@ class VariantDurationPredictor(nn.Module):
                                  # pack_padded_sequence demands that the lengths tensor be on the CPU
                                  batch_first=True, enforce_sorted=False)
         # LSTM pass
-        x, (hn, cn) = self.lstm(x)
+        x, _ = self.lstm(x)
         # Unpack the sequence
         x, lens_unpacked = pad_packed_sequence(x, batch_first=True)  # x_lstm:  (batch, seq_len, lstm_channels)
         # pad back to pre-LSTM seq_len
