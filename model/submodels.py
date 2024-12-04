@@ -395,9 +395,8 @@ class VariantDurationPredictor(nn.Module):
         # LSTM pass
         x, _ = self.lstm(x)
         # Unpack the sequence
-        x, lens_unpacked = pad_packed_sequence(x, batch_first=True)  # x_lstm:  (batch, seq_len, lstm_channels)
-        # pad back to pre-LSTM seq_len
-        x = pad_to_original_length(x, x_seq_len_orig, x.size(1))
+        x, lens_unpacked = pad_packed_sequence(x, batch_first=True, total_length=x_seq_len_orig)  # x_lstm:  (batch, seq_len, lstm_channels)
+
         return x
 
 
