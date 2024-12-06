@@ -1,7 +1,7 @@
 import torch
 import torch.nn as nn
 import torch.optim as optim
-from .attentions import SEBlock1D, TransposeRMSNorm, TransposeLayerNorm, MultiHeadAttention, APTx, ResidualBlock1D
+from .attentions import SEBlock1D, TransposeRMSNorm, TransposeLayerNorm, MultiHeadAttention, APTx, ResidualBlock1D, MaskedCBAM1d
 from .submodels import sequence_mask, mask_to_attention_mask
 from torch.nn.utils.rnn import pack_padded_sequence, pad_packed_sequence
 
@@ -73,7 +73,7 @@ class AdvSeqDiscriminator(nn.Module):
     """
 
     def __init__(self, num_channels=1, num_conv_layers=3, conv_kernel_size=[3, 3, 3], hidden_dim=128, dropout=0.3,
-                 n_heads=4, att_dropout=0.3, gru_channels=0):
+                 n_heads=4, att_dropout=0.3, gru_channels=0, use_cbam=True):
         super(AdvSeqDiscriminator, self).__init__()
 
         self.proj = nn.Linear(num_channels, hidden_dim)
@@ -81,6 +81,7 @@ class AdvSeqDiscriminator(nn.Module):
         self.drop1 = nn.Dropout(0.1)
         self.n_heads = n_heads
         self.gru_channels = gru_channels  # Store gru_channels for conditional GRU usage
+        self.use_cbam = use_cbam
 
         # Attention mechanism (if enabled)
         if self.n_heads > 0:
@@ -96,6 +97,9 @@ class AdvSeqDiscriminator(nn.Module):
                 ConvBlock1D(in_channels, in_channels, kernel_size=conv_kernel_size[i], dropout=dropout) for i in
                 range(num_conv_layers)
             ])
+
+        if self.use_cbam:
+            self.cbam = MaskedCBAM1d(hidden_dim)
 
         # GRU layer (optional)
         if self.gru_channels > 0:
@@ -160,6 +164,9 @@ class AdvSeqDiscriminator(nn.Module):
         for layer in self.blocks:
             x = x.masked_fill(x_mask_conv, 0)
             x = layer(x, x_mask_conv)
+
+        if self.use_cbam:
+            x = self.cbam(x, x_mask_conv)
 
         # If GRU is used
         if self.gru_channels > 0:
