@@ -105,16 +105,13 @@ class AdvSeqDiscriminator(nn.Module):
         if self.gru_channels > 0:
             self.gru = nn.GRU(input_size=hidden_dim, hidden_size=self.gru_channels, batch_first=True,
                               bidirectional=True)
+            self.gru_proj = nn.Sequential(
+              nn.Linear(gru_channels * 2, hidden_dim),
+              nn.Dropout(0.35))
 
-            # Adjust the fully connected layer for GRU output
-            self.fc = nn.Sequential(
-                nn.Linear(self.gru_channels * 2, 1),
-            )
-        else:
-            # If no GRU, the fully connected layer uses hidden_dim
-            self.fc = nn.Sequential(
-                nn.Linear(hidden_dim, 1),
-            )
+        self.fc = nn.Sequential(
+            nn.Linear(hidden_dim, 1),
+        )
 
     def run_rnn(self, x, seq_lens):
         # Run the GRU with packed sequences to handle variable-length inputs
@@ -174,7 +171,7 @@ class AdvSeqDiscriminator(nn.Module):
             x = x.transpose(1, 2)  # (batch, hidden_dim, seq_len) => (batch, seq_len, hidden_dim)
 
             # Run GRU
-            x = self.run_rnn(x, seq_lens)  # (batch, seq_len, gru_channels)
+            x = x + self.gru_proj(self.run_rnn(x, seq_lens))  # (batch, seq_len, gru_channels)
 
             # Transpose back for pooling
             x = x.transpose(1, 2)  # (batch, seq_len, gru_channels) => (batch, gru_channels, seq_len)

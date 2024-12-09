@@ -82,8 +82,8 @@ def main(args, configs):
     if len(args.pretrained):
         load_pretrained_weights(model, args.pretrained)
 
-    discriminator = MultiLengthDiscriminator(n_heads=0, hidden_dim=768, dropout=0.5,
-                                                kernel_size=[[3, 3, 3], [5, 7, 9]], emotion_hidden=0, gru_size=[256, 0]).to(device)
+    discriminator = MultiLengthDiscriminator(n_heads=0, hidden_dim=1024, dropout=0.5,
+                                                kernel_size=[[3, 3, 3, 3], [5, 7, 9, 11]], emotion_hidden=0, gru_size=[0, 0]).to(device)
     discriminator.apply(weights_init_he)
     discriminator.train()
     criterion_lsgan = LSGANLoss(use_lecam=True)
