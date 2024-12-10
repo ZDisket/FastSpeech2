@@ -1,14 +1,18 @@
+from IPython.utils import text
 import torch
 import torch.nn as nn
 import torch.optim as optim
-from .attentions import SEBlock1D, TransposeRMSNorm, AttentionPooling, TransposeLayerNorm, MultiHeadAttention, APTx, ResidualBlock1D, MaskedCBAM1d
+from .attentions import SEBlock1D, TransposeRMSNorm, AttentionPooling, TransposeLayerNorm, MultiHeadAttention, APTx, \
+    ResidualBlock1D, MaskedCBAM1d
 from .submodels import sequence_mask, mask_to_attention_mask
 from torch.nn.utils.rnn import pack_padded_sequence, pad_packed_sequence
+
 
 class ConvBlock1D(nn.Module):
     """
     Simple Conv1D+ReLU+TransposeRMSNorm block for sequence modeling.
     """
+
     def __init__(self, in_channels, out_channels, kernel_size=3, dilation=1, dropout=0.3, act="relu"):
         super(ConvBlock1D, self).__init__()
         self.conv1 = nn.Conv1d(in_channels, out_channels, kernel_size, dilation=dilation, padding="same")
@@ -22,7 +26,6 @@ class ConvBlock1D(nn.Module):
         out = self.relu(out).masked_fill(x_mask, 0)
         out = self.dropout(out)
         return out
-
 
 
 class SequenceNormalization(nn.Module):
@@ -63,191 +66,171 @@ class SequenceNormalization(nn.Module):
         return scaled_x
 
 
+########################################
+# Updated AdvSeqDiscriminator
+########################################
+
 class AdvSeqDiscriminator(nn.Module):
     """
-    Sequence-level discriminator with masked global average pooling.
-    Proj+MultiHeadAttn => ResidualBlocks => (Optional GRU) => Masked Global Pooling => Fully Connected => Out
+    A sequence-level discriminator that:
+    - Uses convolutional blocks (with masked convolution)
+    - Optionally uses a CBAM block
+    - Applies attention pooling at the end
+    - Outputs a single logit (no sigmoid at the end)
 
-    No sigmoid at the end, please use BCEWithLogitsLoss
-    Use n_heads=0 for no attention
+    Note:
+    - No attention or GRU layers here. Those are handled in the parent.
+    - Requires x_mask and x_mask_conv from the parent for efficiency.
     """
 
-    def __init__(self, num_channels=1, num_conv_layers=3, conv_kernel_size=[3, 3, 3], hidden_dim=128, dropout=0.3,
-                 n_heads=4, att_dropout=0.3, gru_channels=0, use_cbam=True):
+    def __init__(self, hidden_dim=128, num_conv_layers=3, conv_kernel_size=[3, 3, 3], dropout=0.3, use_cbam=True):
         super(AdvSeqDiscriminator, self).__init__()
 
-        self.proj = nn.Linear(num_channels, hidden_dim)
-        self.att_drop = nn.Dropout(att_dropout)
-        self.drop1 = nn.Dropout(0.1)
-        self.n_heads = n_heads
-        self.gru_channels = gru_channels  # Store gru_channels for conditional GRU usage
         self.use_cbam = use_cbam
-
-        # Attention mechanism (if enabled)
-        if self.n_heads > 0:
-            self.attention = MultiHeadAttention(hidden_dim, self.n_heads, alibi_alpha=1.5, start_i_increment=4,
-                                                num_persistent=16)
-            self.norm = nn.LayerNorm(hidden_dim)
-
-        in_channels = hidden_dim
 
         # Convolutional blocks
         self.blocks = nn.ModuleList(
-            [
-                ConvBlock1D(in_channels, in_channels, kernel_size=conv_kernel_size[i], dropout=dropout) for i in
-                range(num_conv_layers)
-            ])
+            [ConvBlock1D(hidden_dim, hidden_dim, kernel_size=ks, dropout=dropout) for ks in conv_kernel_size]
+        )
 
+        # Optional CBAM block
         if self.use_cbam:
             self.cbam = MaskedCBAM1d(hidden_dim, pooling='att')
 
-        # GRU layer (optional)
-        if self.gru_channels > 0:
-            self.gru = nn.GRU(input_size=hidden_dim, hidden_size=self.gru_channels, batch_first=True,
-                              bidirectional=True)
-            self.gru_proj = nn.Sequential(
-              nn.Linear(gru_channels * 2, hidden_dim),
-              nn.Dropout(0.35))
-
-        self.fc = nn.Sequential(
-            nn.Linear(hidden_dim, 1),
-        )
-
-        # Attention pooling layer
+        # Attention-based pooling
         self.att_pooling = AttentionPooling(hidden_dim)
 
-    def run_rnn(self, x, seq_lens):
-        # Run the GRU with packed sequences to handle variable-length inputs
-        x_seq_len_orig = x.size(1)
-        x_packed = pack_padded_sequence(x, seq_lens.detach().cpu(), batch_first=True, enforce_sorted=False)
-        x_packed, _ = self.gru(x_packed)
-        x_unpacked, _ = pad_packed_sequence(x_packed, batch_first=True, total_length=x_seq_len_orig)
-        return x_unpacked
+        # Final linear for classification
+        self.fc = nn.Linear(hidden_dim, 1)
 
-    def forward(self, x, seq_lens, hidden_in=None, emotion_in=None):
+    def forward(self, x, x_mask, x_mask_conv):
         """
-        Forward pass through the sequence-level discriminator with masked global average pooling.
-        :param x: Durations (real or fake), size (batch, seq_len)
-        :param seq_lens: Int tensor of length for each batch, size (batch,)
-        :param hidden_in: Text hidden states, (batch, seq_len, channels)
-        :param emotion_in: Emotion hidden states, (batch, 1, channels)
-        :return: Probability that each sequence is real, size (batch, 1).
+        Forward pass through the discriminator.
+
+        :param x: Input tensor of shape (batch, seq_len, hidden_dim),
+                  already pre-processed by parent.
+        :param x_mask: Boolean mask (batch, seq_len) for padding.
+        :param x_mask_conv: Boolean mask (batch, 1, seq_len) for convolutional operations.
+        :return: Tensor of shape (batch, 1) representing logits.
         """
-        # Create masks
-        x_mask = sequence_mask(x.size(1), seq_lens)  # (batch, seq_len)
-        att_mask = mask_to_attention_mask(x_mask)    # (batch, seq_len)
 
-        x = x.unsqueeze(-1)  # (batch, seq_len) => (batch, seq_len, 1)
-
-        # Initial projection
-        x = self.proj(x)  # (batch, seq_len, 1) => (batch, seq_len, hidden_dim)
-
-        # Add optional hidden and emotion inputs
-        if hidden_in is not None:
-            x = x + hidden_in[:, :x.size(1), :]
-
-        if emotion_in is not None:
-            x = x + emotion_in
-
-        # Apply attention if enabled
-        if self.n_heads > 0:
-            x_att = self.attention(x, x, x, mask=att_mask)
-            x = x + self.att_drop(x_att)
-            x = self.norm(x)
-            x = self.drop1(x)
-
-        # Prepare for convolutional layers
-        x = x.transpose(1, 2)  # (batch, seq_len, hidden_dim) => (batch, hidden_dim, seq_len)
-        x_mask_conv = x_mask.unsqueeze(1)  # (batch, seq_len) => (batch, 1, seq_len)
+        # (batch, seq_len, hidden_dim) => (batch, hidden_dim, seq_len)
+        x = x.transpose(1, 2)
 
         # Apply convolutional blocks with masking
         for layer in self.blocks:
             x = x.masked_fill(x_mask_conv, 0)
             x = layer(x, x_mask_conv)
 
+        # Apply CBAM if used
         if self.use_cbam:
             x = self.cbam(x, x_mask_conv)
 
-        # If GRU is used
-        if self.gru_channels > 0:
-            # Transpose for GRU input
-            x = x.transpose(1, 2)  # (batch, hidden_dim, seq_len) => (batch, seq_len, hidden_dim)
+        # Attention pooling
+        # (batch, hidden_dim, seq_len) => (batch, seq_len, hidden_dim)
+        x_pooled, _ = self.att_pooling(x.transpose(1, 2), x_mask)
 
-            # Run GRU
-            x = x + self.gru_proj(self.run_rnn(x, seq_lens))  # (batch, seq_len, gru_channels)
-
-            # Transpose back for pooling
-            x = x.transpose(1, 2)  # (batch, seq_len, gru_channels) => (batch, gru_channels, seq_len)
-        else:
-            # If no GRU, x remains as is
-            pass  # x is already in (batch, hidden_dim, seq_len)
-
-        x, _ = self.att_pooling(x.transpose(1, 2), x_mask_conv.squeeze(1))
-
-        # Fully connected layer
-        x = self.fc(x)  # (batch_size, 1)
-
-        return x
+        # Final linear
+        out = self.fc(x_pooled)  # (batch, 1)
+        return out
 
 
-    def masked_global_avg_pool1d(self, x, seq_lens):
-        """
-        Perform masked global average pooling.
-        :param x: Input tensor of shape (batch_size, hidden_dim, seq_len)
-        :param seq_lens: Int tensor of shape (batch_size,) indicating the valid length of each sequence
-        :return: Pooled tensor of shape (batch_size, hidden_dim)
-        """
-        batch_size, hidden_dim, max_len = x.size()
-
-        # Create mask based on sequence lengths
-        mask = torch.arange(max_len, device=x.device).expand(batch_size, max_len) < seq_lens.unsqueeze(1)
-        mask = mask.unsqueeze(1).float()  # Shape: (batch_size, 1, seq_len)
-
-        # Apply mask to the input
-        x = x * mask
-
-        # Sum over the sequence length dimension and divide by the actual lengths
-        x = x.sum(dim=2) / seq_lens.unsqueeze(1).float()  # Shape: (batch_size, hidden_dim)
-
-        return x
-
+########################################
+# Updated MultiLengthDiscriminator
+########################################
 
 class MultiLengthDiscriminator(nn.Module):
     """
-    Multi-Length Discriminator employs multiple discriminator at lengths and kernel sizes.
+    Multi-Length Discriminator that:
+    - Takes in raw input sequences and optional text/emotion features.
+    - Applies a single shared projection layer to raw input.
+    - Optionally processes the concatenated features (x + text_hidden + emotion) via a shared GRU.
+    - Optionally applies multi-head attention.
+    - Then computes x_mask and x_mask_conv once and passes them to multiple AdvSeqDiscriminators of different kernel sizes.
+    - Aggregates their outputs.
     """
-    def __init__(self, text_hidden=256, num_channels=1, hidden_dim=768,
-                 n_heads=0, dropout=0.5, kernel_size=[[3, 3], [7, 9]], gru_size=[256, 0], emotion_hidden=256):
+
+    def __init__(self,
+                 text_hidden=256, num_channels=1, hidden_dim=768,
+                 n_heads=0, dropout=0.5, kernel_size=[[3, 3], [7, 9]],
+                 gru_size=256, emotion_hidden=256,
+                 use_gru=True, use_cbam=True, att_dropout=0.3):
         super(MultiLengthDiscriminator, self).__init__()
 
+        self.text_hidden = text_hidden
         self.emotion_hidden = emotion_hidden
+        self.hidden_dim = hidden_dim
+        self.use_gru = use_gru and gru_size > 0
+        self.n_heads = n_heads
 
+        # Projection layer for input features
+        self.proj = nn.Linear(num_channels, hidden_dim)
+
+        self.pre = ConvBlock1D(hidden_dim, hidden_dim, 5, dropout=0.5)
+
+        # Compress text features if provided
         if text_hidden > 0:
-            self.text_compress = (
-                nn.Conv1d(text_hidden, hidden_dim, 3, padding="same")
-                if text_hidden != hidden_dim else nn.Identity()
-            )
+            if text_hidden != hidden_dim:
+                self.text_compress = nn.Linear(text_hidden, hidden_dim)
+            else:
+                self.text_compress = nn.Identity()
+        else:
+            self.text_compress = None
 
+        # Project emotion features if provided
         if self.emotion_hidden > 0:
             self.em_proj = nn.Sequential(
                 nn.Linear(emotion_hidden, hidden_dim),
                 nn.ReLU(inplace=True),
                 nn.Dropout(0.5),
             )
+        else:
+            self.em_proj = None
 
-        # Create a list of discriminators for each set of kernel sizes
+        # Optional shared GRU layer
+        if self.use_gru:
+            self.gru_channels = gru_size
+            self.gru = nn.GRU(input_size=hidden_dim, hidden_size=self.gru_channels, batch_first=True,
+                              bidirectional=True)
+            self.gru_proj = nn.Sequential(nn.Linear(self.gru_channels * 2, hidden_dim), nn.Dropout(0.35))
+        else:
+            self.gru = None
+            self.gru_proj = None
+
+        # Optional Attention mechanism at the parent level
+        if self.n_heads > 0:
+            self.attention = MultiHeadAttention(hidden_dim, self.n_heads, alibi_alpha=1.5, start_i_increment=4,
+                                                num_persistent=16)
+            self.norm = nn.LayerNorm(hidden_dim)
+            self.att_drop = nn.Dropout(att_dropout)
+            self.drop1 = nn.Dropout(0.1)
+        else:
+            self.attention = None
+
+        # Instantiate discriminators
         self.discriminators = nn.ModuleList()
-        for i, ks in enumerate(kernel_size):
-            discriminator = AdvSeqDiscriminator(
-                num_channels=num_channels,
-                num_conv_layers=len(ks),
+        for ks in kernel_size:
+            d = AdvSeqDiscriminator(
                 hidden_dim=hidden_dim,
-                n_heads=n_heads,
-                dropout=dropout,
+                num_conv_layers=len(ks),
                 conv_kernel_size=ks,
-                gru_channels=gru_size[i]
+                dropout=dropout,
+                use_cbam=use_cbam
             )
-            self.discriminators.append(discriminator)
+            self.discriminators.append(d)
+
+    def run_rnn(self, x, seq_lens):
+        """
+        Run the GRU with packed sequences to handle variable-length inputs.
+
+        :param x: Tensor (batch, seq_len, hidden_dim)
+        :param seq_lens: Tensor (batch,) with lengths
+        """
+        x_seq_len_orig = x.size(1)
+        x_packed = pack_padded_sequence(x, seq_lens.cpu(), batch_first=True, enforce_sorted=False)
+        x_packed, _ = self.gru(x_packed)
+        x_unpacked, _ = pad_packed_sequence(x_packed, batch_first=True, total_length=x_seq_len_orig)
+        return x_unpacked
 
     def forward(self, x, seq_lens, text_hidden=None, em_hidden=None):
         """
@@ -256,24 +239,56 @@ class MultiLengthDiscriminator(nn.Module):
         :param seq_lens: Sequence lengths tensor of shape (batch_size,)
         :param text_hidden: Optional text features of shape (batch_size, seq_len, text_hidden)
         :param em_hidden: Optional emotion features of shape (batch_size, emotion_hidden)
-        :return: Combined discriminator scores
+        :return: Combined discriminator scores of shape (batch_size, num_discriminators)
         """
-        if text_hidden is not None:
-            text_hidden = self.text_compress(text_hidden.transpose(1, 2)).transpose(1, 2)
 
+        x = x.unsqueeze(-1)  # (batch, seq_len) => (batch, seq_len, 1)
+
+        # Project the base input
+        x = self.proj(x)  # (batch, seq_len, hidden_dim)
+
+        # Add text features if present
+        if text_hidden is not None and self.text_hidden > 0:
+            text_hidden = self.text_compress(text_hidden)
+            x = x + text_hidden
+
+        # Add emotion features if present
         if em_hidden is not None and self.emotion_hidden > 0:
-            em_hidden = self.em_proj(em_hidden)
-        else:
-            em_hidden = None
+            em_h = self.em_proj(em_hidden).unsqueeze(1)  # (batch, 1, hidden_dim)
+            x = x + em_h
 
-        # Collect scores from all discriminators
+        # Run GRU if specified
+        if self.use_gru:
+            x_rnn = self.run_rnn(x, seq_lens)
+            x = x + self.gru_proj(x_rnn)
+
+        # Apply attention if enabled
+        if self.n_heads > 0 and self.attention is not None:
+            x_mask = sequence_mask(x.size(1), seq_lens)  # (batch, seq_len)
+            att_mask = mask_to_attention_mask(x_mask)  # (batch, seq_len)
+
+            x_att = self.attention(x, x, x, mask=att_mask)
+            x = x + self.att_drop(x_att)
+            x = self.norm(x)
+            x = self.drop1(x)
+        else:
+            # If no attention, still need masks for convolutional ops
+            x_mask = sequence_mask(x.size(1), seq_lens)
+
+        # Prepare masks for convolutional blocks
+        x_mask_conv = x_mask.unsqueeze(1)  # (batch, 1, seq_len)
+
+        # Discriminator pre-net
+        x = x + self.pre(x.transpose(1, 2), x_mask_conv).transpose(1, 2)
+
+        # Pass through each discriminator
         scores = []
         for discriminator in self.discriminators:
-            score = discriminator(x, seq_lens, text_hidden, em_hidden)
+            score = discriminator(x, x_mask, x_mask_conv)  # (batch, 1)
             scores.append(score)
 
-        # Concatenate all scores along the channel dimension
-        combined_score = torch.cat(scores, dim=1)
+        # Concatenate all scores along the last dimension
+        combined_score = torch.cat(scores, dim=1)  # (batch, num_discriminators)
 
         return combined_score
 
