@@ -139,7 +139,7 @@ class MaskedSEBlock1D(nn.Module):
         # Compute masked global average pooling
         if self.pooling == "att":
             # att pooling returns attention weights
-            y, _ = self.avg_pool(x, # AttentionPooling takes (batch, seq), maskedavg takes (batch, 1, seq)
+            y, _ = self.avg_pool(x.transpose(1,2), # AttentionPooling takes (batch, seq), maskedavg takes (batch, 1, seq)
                           mask.squeeze(1))
         else:
             y = self.avg_pool(x, mask)

@@ -1,7 +1,7 @@
 import torch
 import torch.nn as nn
 import torch.optim as optim
-from .attentions import SEBlock1D, TransposeRMSNorm, TransposeLayerNorm, MultiHeadAttention, APTx, ResidualBlock1D, MaskedCBAM1d
+from .attentions import SEBlock1D, TransposeRMSNorm, AttentionPooling, TransposeLayerNorm, MultiHeadAttention, APTx, ResidualBlock1D, MaskedCBAM1d
 from .submodels import sequence_mask, mask_to_attention_mask
 from torch.nn.utils.rnn import pack_padded_sequence, pad_packed_sequence
 
@@ -99,7 +99,7 @@ class AdvSeqDiscriminator(nn.Module):
             ])
 
         if self.use_cbam:
-            self.cbam = MaskedCBAM1d(hidden_dim)
+            self.cbam = MaskedCBAM1d(hidden_dim, pooling='att')
 
         # GRU layer (optional)
         if self.gru_channels > 0:
@@ -112,6 +112,9 @@ class AdvSeqDiscriminator(nn.Module):
         self.fc = nn.Sequential(
             nn.Linear(hidden_dim, 1),
         )
+
+        # Attention pooling layer
+        self.att_pooling = AttentionPooling(hidden_dim)
 
     def run_rnn(self, x, seq_lens):
         # Run the GRU with packed sequences to handle variable-length inputs
@@ -179,8 +182,7 @@ class AdvSeqDiscriminator(nn.Module):
             # If no GRU, x remains as is
             pass  # x is already in (batch, hidden_dim, seq_len)
 
-        # Masked global average pooling
-        x = self.masked_global_avg_pool1d(x, seq_lens)  # (batch_size, channels)
+        x, _ = self.att_pooling(x.transpose(1, 2), x_mask_conv.squeeze(1))
 
         # Fully connected layer
         x = self.fc(x)  # (batch_size, 1)
@@ -212,7 +214,7 @@ class AdvSeqDiscriminator(nn.Module):
 
 class MultiLengthDiscriminator(nn.Module):
     """
-    Borrowing from HiFi-GAN, Multi-Length Discriminator employs multiple discriminator at lengths and kernel sizes.
+    Multi-Length Discriminator employs multiple discriminator at lengths and kernel sizes.
     """
     def __init__(self, text_hidden=256, num_channels=1, hidden_dim=768,
                  n_heads=0, dropout=0.5, kernel_size=[[3, 3], [7, 9]], gru_size=[256, 0], emotion_hidden=256):
