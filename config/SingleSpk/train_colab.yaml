@@ -22,3 +22,7 @@ step:
   synth_step: 1000
   val_step: 1000
   save_step: 10000
+
+disc:
+  start_step: 5000
+  lr: 0.00001

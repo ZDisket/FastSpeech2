@@ -10,7 +10,7 @@ from tqdm import tqdm
 
 from utils.model import get_model, get_vocoder, get_param_num, load_pretrained_weights
 from utils.tools import to_device, log, synth_one_sample, test_one_fs2, log_attention_maps
-from model import FastSpeech3Loss, DualDiscriminator, AdvSeqDiscriminator, AdEMAMix, MultiLengthDiscriminator
+from model import FastSpeech3Loss, AdEMAMix, MultiLengthDiscriminator, AdvSeqDiscriminatorS4
 from model.loss import LSGANLoss
 from dataset import Dataset
 from torch.cuda.amp import GradScaler, autocast
@@ -82,12 +82,16 @@ def main(args, configs):
     if len(args.pretrained):
         load_pretrained_weights(model, args.pretrained)
 
-    discriminator = MultiLengthDiscriminator(n_heads=0, hidden_dim=1024, dropout=0.5,
-                                                kernel_size=[[3, 3, 5, 5], [5, 7, 9, 11]], emotion_hidden=0, gru_size=0).to(device)
+    disc_config = model_config["discriminator"]
+
+    discriminator = MultiLengthDiscriminator(text_hidden=model_config["transformer"]["encoder_hidden"],n_heads=0,
+                                            hidden_dim=disc_config["hidden_size"], dropout=disc_config["conv_dropout"],
+                                            kernel_size=disc_config["kernel_sizes"], emotion_hidden=0, ssm_dropout=disc_config["ssm_dropout"],
+                                            ssm_depths=disc_config["ssm_depth"]).to(device)
     discriminator.apply(weights_init_he)
     discriminator.train()
     criterion_lsgan = LSGANLoss(use_lecam=True)
-    optimizer_d = AdEMAMix(discriminator.parameters(), lr=0.00001)
+    optimizer_d = AdEMAMix(discriminator.parameters(), lr=train_config["disc"]["lr"])
     if args.restore_step:
         ckpt_path = os.path.join(
             train_config["path"]["ckpt_path"],
@@ -142,7 +146,7 @@ def main(args, configs):
     scaler_d = GradScaler()
     use_aligner_rope_steps = 5000 if not len(args.pretrained) else 250
 
-    discriminator_train_start_steps = 555555555555
+    discriminator_train_start_steps = train_config["disc"]["start_step"]
 
     while True:
         inner_bar = tqdm(total=len(loader), desc=f"Epoch {epoch}", position=1)

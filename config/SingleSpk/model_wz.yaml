@@ -18,9 +18,12 @@ variance_predictor:
   dropout: 0.5
   dropout_on_emb: 0.1 # dropout applied to pitch&energy embs before adding to decoder input, doesn't affect predictors directly
 
+
+# If you are using adversarial training, you can enable bidirectional and use_cbam
+# Otherwise, on simple regression objective, it will overfit.
 duration_predictor:
   type: "lstm" # support tcn (TCN-Attention) or lstm (Conv+Decoder+LSTM)
-  bidirectional: false # both: bidirectional
+  bidirectional: true # both: bidirectional
   att_dropout: 0.5 # only applies to TCN duration pred, dropout applied to attention
   tcn_channels: [256, 256] # only applies to TCN duration pred
   tcn_heads: [0, 2] #tcn: attention heads for each layer. you can use 0 to disable multi-head and use squeeze-excite
@@ -28,13 +31,22 @@ duration_predictor:
   backwards_tcn_channels: [256, 256]
   backwards_heads: [0, 0]
   backwards_kernel_sizes: [3, 3]
-  decoder_depth: 2 # lstm: depth of auxiliary decoder
   conv_depth: 2 # lstm: depth of pre-convs
   kernel_size: 3 # lstm: conv kernel size
-  heads: 2 # lstm: attention heads
   filter_size: 256 # lstm: hidden size
   dropout: 0.5 # both: dropout
+  use_cbam: true #LSTM: use CBAM
 
+# The discriminator config is very flexible
+# You can define one or multiple discriminators, with diff conv sizes and S4 layers (or lack thereof) for each.
+discriminator:
+  kernel_sizes: [ [3, 3, 5, 7, 9, 11] ] # List of lists detailing kernel sizes for each discriminator
+  # kernel_sizes: [[3, 3, 5, 5], [5, 7, 9, 11]] builds 2 discriminators, one with [3, 3, 5, 5] convs, and the other [5, 7, 9, 11].
+
+  ssm_depth: [6] # Num of S4 layers for each discriminator. You can set to 0 for no S4 layers.
+  ssm_dropout: 0.3 # Dropout on S4 layers (if there are any)
+  conv_dropout: 0.5 # Dropout on Conv layers
+  hidden_size: 1024 # Hidden dim.
 
 
 variance_embedding:

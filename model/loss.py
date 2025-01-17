@@ -333,6 +333,7 @@ class FastSpeech3Loss(nn.Module):
         self.duration_kl_loss_weight = 1.0
         self.pitch_energy_kl_loss_weight = 1.0
 
+
         # With all our new losses (attention, masked duration, temporal), the mel loss (individual) goes from being 20% of the loss
         # to just 6% and audio quality suffers greatly. We re-weight, although too much is detrimental.
         self.mel_loss_weight = 1.0
@@ -462,6 +463,7 @@ class FastSpeech3Loss(nn.Module):
         kl_pitch = self.kl_loss(model.variance_adaptor.pitch_predictor)
 
         kl_pitch_energy = kl_energy + kl_pitch
+
 
         total_kl = kl_duration * self.duration_kl_loss_weight + kl_pitch_energy * self.pitch_energy_kl_loss_weight
 

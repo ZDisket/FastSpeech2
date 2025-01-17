@@ -363,13 +363,14 @@ class VarianceAdaptor(nn.Module):
                 text_channels=model_config["transformer"]["encoder_hidden"],
                 filter_channels=model_config["duration_predictor"]["filter_size"],
                 depth=model_config["duration_predictor"]["decoder_depth"],
-                heads=model_config["duration_predictor"]["heads"],
+                heads=None,
                 p_dropout=model_config["duration_predictor"]["dropout"],
                 final_dropout=model_config["duration_predictor"]["att_dropout"],
                 kernel_size=model_config["duration_predictor"]["kernel_size"],
                 conv_depth=model_config["duration_predictor"]["conv_depth"],
                 start_i=3,
                 lstm_bidirectional=model_config["duration_predictor"]["bidirectional"],
+                use_cbam=model_config["duration_predictor"]["use_cbam"],
             )
             dp_output_channels = model_config["duration_predictor"]["filter_size"]
 

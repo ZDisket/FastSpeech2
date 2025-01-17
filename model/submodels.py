@@ -5,7 +5,7 @@ from .attentions import TransformerEncoder, TemporalConvNet, MultiHeadAttention,
     ConvReluNorm
 from torch.nn.utils.rnn import pack_padded_sequence, pad_packed_sequence
 import torch.nn.functional as F
-from .attblocks import CBAM2d, MaskedSEBlock1D, MaskedCBAM1d
+from .attblocks import CBAM2d, MaskedSEBlock1D, CBAM1D
 from .subatts import init_weights_he
 import monotonic_align, math
 from torchbnn import BayesLinear
@@ -304,13 +304,14 @@ def generate_masks_from_float_mask(float_mask):
 
 class VariantDurationPredictor(nn.Module):
     def __init__(self, text_channels, filter_channels=256, depth=4, heads=4, kernel_size=3, p_dropout=0.2,
-                 final_dropout=0.2, conv_depth=2, lstm_bidirectional=True, start_i=0, bayesian=True):
+                 final_dropout=0.2, conv_depth=2, lstm_bidirectional=True, start_i=0, bayesian=True, use_cbam=True):
         super(VariantDurationPredictor, self).__init__()
 
         print("Using Variant Duration Predictor")
         self.use_dual_proj = False
         self.lstm_bidirectional = lstm_bidirectional
         self.conv_depth = conv_depth
+        self.use_cbam = use_cbam
 
         self.conv_layers = nn.ModuleList()
 
@@ -319,6 +320,8 @@ class VariantDurationPredictor(nn.Module):
                 ConvReluNorm(filter_channels, filter_channels, kernel_size, 1, act="relu", causal=False,
                              dropout=p_dropout))
 
+        if self.use_cbam:
+            self.cbam = CBAM1D(filter_channels)
 
         self.lstm_channels = filter_channels
 
@@ -360,6 +363,10 @@ class VariantDurationPredictor(nn.Module):
 
         # Apply mask after convolutions
         x = x.masked_fill(conv_mask, 0)
+
+        if self.use_cbam:
+            x = self.cbam(x)
+
 
         # Transpose for LSTM
         x = x.transpose(1, 2)  # (b, text_channels, seq_len) -> (b, seq_len, channels)
