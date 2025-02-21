@@ -983,7 +983,7 @@ class NeoTCNAttention(nn.Module):
                 if num_heads > 0 else nn.Identity()  # append an identity so it still occupies an index i in the list
 
             )
-            self.layers.append(ConvReluNorm(current_channels, out_channels, k_size, dilation_size, act=act, dropout=dropout))
+            self.layers.append(ConvReluNorm(current_channels, out_channels, k_size, dilation_size, act=act, dropout=dropout, causal=False))
 
             current_channels = out_channels  # The output of the current block is the input for the next
 

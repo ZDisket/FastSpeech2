@@ -34,7 +34,7 @@ class FastSpeech2(nn.Module):
             model_config["transformer"]["encoder_kernel_sizes"],
             1.5,
             3,
-            emotion_channels=self.emotion_channels,
+            emotion_channels=model_config["em_enc_sizes"][-1],
             speaker_channels=self.speaker_channels,
         )
         self.variance_adaptor = VarianceAdaptor(preprocess_config, model_config)
@@ -50,7 +50,7 @@ class FastSpeech2(nn.Module):
                                           emotion_size=self.emotion_channels,
                                           speaker_channels=self.speaker_channels)
 
-        self.emotion_encoder = nn.Identity()
+        self.emotion_encoder = EmotionEncoder(model_config["em_enc_sizes"],0.5)
         self.mel_linear = nn.Identity()
 
         self.postnet = PostNet(n_mel_channels=preprocess_config["preprocessing"]["mel"]["n_mel_channels"])
@@ -133,11 +133,12 @@ class FastSpeech2(nn.Module):
 
         # (batch, 1, spk_channels)
         spk_emb = self.speaker_emb(speakers).unsqueeze(1) if self.speaker_emb is not None else torch.zeros(1)
+        encoded_emotion = self.emotion_encoder(em_hidden) if self.emotion_channels > 0 else torch.zeros(1)
 
-        output = self.text_encoder(texts, src_lens, em_blocks, em_lens, spk_emb)
+        output = self.text_encoder(texts, src_lens, encoded_emotion, spk_emb)
         encoded_text = output
 
-        encoded_emotion = self.emotion_encoder(em_hidden) if self.emotion_channels > 0 else torch.zeros(1)
+
 
         # src_masks -> [batch, mxlen] => [batch, 1, mxlen]
         if self.aligner_type == "rad":
@@ -229,10 +230,9 @@ class FastSpeech2(nn.Module):
         mel_masks = None
 
         spk_emb = self.speaker_emb(speakers).unsqueeze(1) if self.speaker_emb is not None else torch.zeros(1)
+        encoded_emotion = self.emotion_encoder(em_hidden) if self.emotion_channels > 0 else torch.zeros(1) # (batch, hidden)
 
-        output = self.text_encoder(texts, src_lens, em_blocks, em_lens, spk_emb)
-
-        encoded_emotion = self.emotion_encoder(em_hidden) if self.emotion_channels > 0 else torch.zeros(1)
+        output = self.text_encoder(texts, src_lens, encoded_emotion, spk_emb)
 
         attn_soft, attn_logprob, attn_hard, attn_hard_dur = torch.zeros(1), torch.zeros(1), torch.zeros(1), torch.zeros(1)
 

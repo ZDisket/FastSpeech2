@@ -166,7 +166,8 @@ class TextEncoder(nn.Module):
         super(TextEncoder, self).__init__()
         self.embed = NormalizedEmbedding(vocab_size, embed_size, norm=False)
         self.encoder = TransformerEncoder(embed_size, num_heads, num_layers, forward_expansion, dropout,
-                                          alibi_alpha=alibi_alpha, start_i=start_i, multi_scale=True, kernel_size=kernel_sizes)
+                                          alibi_alpha=alibi_alpha, start_i=start_i, multi_scale=True, kernel_size=kernel_sizes,
+                                          act="relugtz")
         self.use_prenet = True
         if self.use_prenet:
             self.pre = Prenet(embed_size, 384, embed_size, 5, 3, 0.5, "aptx")
@@ -178,18 +179,7 @@ class TextEncoder(nn.Module):
             self.spk_cond = nn.Sequential(nn.Linear(speaker_channels, embed_size),
                                           nn.Dropout(0.1), )
 
-        if self.emotion_channels > 0:
-            self.cond_heads = 4
-            self.cond_head_size = embed_size // self.cond_heads
-
-            #self.em_proj = ResNetEmProj(self.emotion_channels, embed_size, self.cond_heads, 3)
-            self.em_proj = SimpleEmProj(self.emotion_channels, self.cond_head_size, 1)
-
-            self.cond_att = MultiHeadAttention(embed_size, self.cond_heads, alibi_alpha=1.5, start_i_increment=4,
-                                               num_persistent=16)
-            self.cond_drop = nn.Dropout(0.5)
-
-    def forward(self, token_ids, seq_lens, em_blocks, em_lens, spk_emb=None):
+    def forward(self, token_ids, seq_lens, encoded_em, spk_emb=None):
         # Embed token_ids
         x = self.embed(token_ids)  # Shape: (batch, max_seq_len, embed_size)
 
@@ -198,30 +188,14 @@ class TextEncoder(nn.Module):
         mask = torch.arange(max_len, device=seq_lens.device).expand(len(seq_lens), max_len) >= seq_lens.unsqueeze(1)
         x_mask = sequence_mask(max_len, seq_lens)
 
-        #   ======================== ZEPHYR CONDITIONING ========================
-        # em_blocks = [batch, n_blocks, seq_len, hidden]
-
-        if self.emotion_channels > 0:
-            y_mask = sequence_mask(em_blocks.size(2), em_lens)
-            y = self.em_proj(em_blocks, y_mask).transpose(1, 3)  # ==> (batch, hidden, seq_len, n_blocks)
-
-            # Attention-on-Blocks
-            y = y.permute(0, 2, 3, 1)  # ==> (batch, seq_len, n_blocks, hidden)
-            xy_att_mask = expand_masks(x_mask, y_mask)
-
-            xy_att = self.cond_att(y, y, x, mask=xy_att_mask)
-            xy_att = self.cond_drop(xy_att)
-
-            # x, xy_att = (batch, seq_len, channels)
-            x = x + xy_att
-
-        #   ======================== ZEPHYR CONDITIONING ========================
-
         if self.speaker_channels > 0:
             x = x + self.spk_cond(spk_emb)
 
         if self.use_prenet:
             x = self.pre(x, x_mask.unsqueeze(1))
+
+        if self.emotion_channels > 0:
+            x[:, :, :self.emotion_channels] = encoded_em.unsqueeze(1)
 
         # Pass through the transformer encoder
         x = self.encoder(x, mask.unsqueeze(1).unsqueeze(2))
@@ -365,7 +339,7 @@ class VariantDurationPredictor(nn.Module):
         x = x.masked_fill(conv_mask, 0)
 
         if self.use_cbam:
-            x = self.cbam(x)
+            x = self.cbam(x, conv_mask)
 
 
         # Transpose for LSTM
@@ -549,7 +523,7 @@ class SpectrogramDecoder(nn.Module):
         self.dec = TransformerEncoder(filter_channels, heads=heads, num_layers=depth,
                                       forward_expansion=forward_expansion, dropout=dropout,
                                       alibi_alpha=alibi_alpha, start_i=4, kernel_size=kernel_sizes,
-                                      act="aptxs1", rma_mem_dim=0, conv_att=True, multi_scale=True, talking_heads=True,
+                                      act="relugt", rma_mem_dim=0, conv_att=True, multi_scale=True, talking_heads=True,
                                       dynamic_alibi=True, coarse_fine=True)
 
         self.mel_fc = nn.Linear(filter_channels, mel_channels)
@@ -765,33 +739,23 @@ class DynamicDurationPredictor(nn.Module):
 
 
 class EmotionEncoder(nn.Module):
-    def __init__(self, input_dim, hidden_dim):
-        super(EmotionEncoder, self).__init__()
+    def __init__(self, enc_sizes, dropout_prob=0.5):
+        super().__init__()
+        layers = []
+        # Build layers from enc_sizes list: each pair defines a linear layer
+        for i in range(1, len(enc_sizes)):
+            layers.append(nn.Linear(enc_sizes[i - 1], enc_sizes[i]))
+            layers.append(nn.ReLU())
+            layers.append(nn.Dropout(dropout_prob))
 
-        self.feedforward = nn.Sequential(
-            nn.Conv1d(input_dim, hidden_dim, 3, padding="same"),
-            APTxS1(trainable=True),
-            nn.Dropout(0.1),
-            nn.Conv1d(hidden_dim, input_dim, 1, padding="same"),
-        )
-        self.norm = nn.LayerNorm(input_dim)
+        # Normally we use LayerNorm for 1D; but our final channel dim tends to be VERY small
+        # so BatchNorm is better.
+        layers.append(nn.BatchNorm1d(enc_sizes[-1]))
 
-    def forward(self, x, mask=None):
-        """
-        Encode the final hidden states into a conditioning vector.
+        self.net = nn.Sequential(*layers)
 
-        Args:
-            x (torch.Tensor): Tensor of shape (batch, seq_len, channels).
-            mask (torch.Tensor, optional): Tensor of shape (batch, seq_len), where True indicates padding.
-
-        Returns:
-            torch.Tensor: Tensor of shape (batch, 1, channels).
-        """
-        # Apply feedforward network
-        x = self.feedforward(x.transpose(1,2)).transpose(1,2)  # Shape: (batch, seq_len, channels)
-        x = self.norm(x)
-
-        return x
+    def forward(self, x):
+        return self.net(x)
 
 
 def safe_log(tensor, epsilon=1e-6):

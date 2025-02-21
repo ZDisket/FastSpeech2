@@ -147,6 +147,9 @@ def main(args, configs):
     use_aligner_rope_steps = 5000 if not len(args.pretrained) else 250
 
     discriminator_train_start_steps = train_config["disc"]["start_step"]
+    # Negative values means no discriminator training
+    if 0 > discriminator_train_start_steps:
+        discriminator_train_start_steps = 555555555555555555555
 
     while True:
         inner_bar = tqdm(total=len(loader), desc=f"Epoch {epoch}", position=1)
@@ -161,9 +164,9 @@ def main(args, configs):
 
                     # =========================== DISCRIMINATOR ==================================
 
-                    attn_hard_dur = output[5].detach()  # we don't want to optimize the AlignmentEncoder
+                    attn_hard_dur = output[5].detach()
                     durations_fake = output[4]
-                    text_enc = output[14]  # no optimizing the text-encoder
+                    text_enc = output[14]
                     seq_lens = batch[2 + 2]
                     em_hids = batch[12]
 

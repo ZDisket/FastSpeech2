@@ -73,7 +73,6 @@ class S4Block1D(nn.Module):
     """
     def __init__(self, in_channels, out_channels, dropout=0.3, act="relu", d_state=64):
         super(S4Block1D, self).__init__()
-        # S4 doesn't require kernel_size the same way Conv1D does, but we keep parameters for interface consistency.
         # Make sure in_channels == out_channels for simplicity (as in the original code with hidden_dim)
         assert in_channels == out_channels, "For simplicity, in_channels should match out_channels."
         
@@ -108,7 +107,6 @@ class AdvSeqDiscriminatorS4(nn.Module):
     ConvBlocks -> S4Blocks
 
     I tried residual design but found that it's hard to optimize.
-    And, unlike AdvSeqDiscriminator, this is designed to be used independently.
     """
     def __init__(self, hidden_dim=1024, num_ssm_layers=6, conv_kernel_size=[3, 7, 11], conv_dropout=0.5, ssm_dropout=0.3, use_cbam=True):
         """
@@ -128,7 +126,7 @@ class AdvSeqDiscriminatorS4(nn.Module):
         self.convs = nn.ModuleList(
             [ConvBlock1D(hidden_dim, hidden_dim, kernel_size=ks, dropout=conv_dropout) for ks in conv_kernel_size]
         )
-        # Replace ConvBlock1D with S4Block1D
+
         self.ssms = nn.ModuleList(
             [S4Block1D(hidden_dim, hidden_dim, dropout=ssm_dropout) for _ in range(num_ssm_layers)]
         )
@@ -252,19 +250,6 @@ class MultiLengthDiscriminator(nn.Module):
                 use_cbam=use_cbam
             )
             self.discriminators.append(d)
-
-    def run_rnn(self, x, seq_lens):
-        """
-        Run the GRU with packed sequences to handle variable-length inputs.
-
-        :param x: Tensor (batch, seq_len, hidden_dim)
-        :param seq_lens: Tensor (batch,) with lengths
-        """
-        x_seq_len_orig = x.size(1)
-        x_packed = pack_padded_sequence(x, seq_lens.cpu(), batch_first=True, enforce_sorted=False)
-        x_packed, _ = self.gru(x_packed)
-        x_unpacked, _ = pad_packed_sequence(x_packed, batch_first=True, total_length=x_seq_len_orig)
-        return x_unpacked
 
     def forward(self, x, seq_lens, text_hidden=None, em_hidden=None):
         """

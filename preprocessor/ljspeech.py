@@ -16,6 +16,7 @@ def prepare_align(config):
     cleaners = config["preprocessing"]["text"]["text_cleaners"]
     speaker = "LJSpeech"
     printed_ms_notice = False
+    unique_speakers = set()  # Set to keep track of unique speakers
     with open(os.path.join(in_dir, "filelist.txt"), encoding="utf-8") as f:
         for line in tqdm(f):
             parts = line.strip().split("|")
@@ -31,8 +32,9 @@ def prepare_align(config):
                     print("Multispeaker filelist detected. Third part will be used as speaker name")
 
                 speaker = parts[2]
-
                 printed_ms_notice = True
+                # Add the current speaker to the set of unique speakers
+                unique_speakers.add(speaker)
 
 
 
@@ -51,3 +53,5 @@ def prepare_align(config):
                     "w",encoding="utf-8"
                 ) as f1:
                     f1.write(text)
+
+    print(f"Number of speakers (unique): {len(unique_speakers)}")

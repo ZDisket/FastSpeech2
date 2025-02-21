@@ -6,10 +6,12 @@ import tgt
 import librosa
 import numpy as np
 import pyworld as pw
+import torch.cuda
 from scipy.interpolate import interp1d
 from sklearn.preprocessing import StandardScaler
 from tqdm import tqdm
 from zephyrfe import ZephyrFrontEnd
+from bertfe import BERTFrontEnd
 from preprocessor.emotion import EmotionProcessorV2
 
 import audio as Audio
@@ -24,10 +26,18 @@ class Preprocessor:
         self.sampling_rate = config["preprocessing"]["audio"]["sampling_rate"]
         self.hop_length = config["preprocessing"]["stft"]["hop_length"]
         self.zephyr_model = None
+        self.bert_model = None
 
         if len(config["preprocessing"]["zephyr_model"]):
             proc_em = EmotionProcessorV2()
             self.zephyr_model = ZephyrFrontEnd(model_path=config["preprocessing"]["zephyr_model"], processor=proc_em)
+
+        if len(config["preprocessing"]["bert_model"]):
+            if self.zephyr_model is not None:
+                raise RuntimeError("Cannot have both BERT and Zephyr models. Please select one.")
+
+            self.bert_model = BERTFrontEnd(torch.cuda.is_available(), config["preprocessing"]["bert_model"])
+
 
 
         assert config["preprocessing"]["pitch"]["feature"] in [
@@ -218,6 +228,19 @@ class Preprocessor:
             np.save(
                 os.path.join(self.out_dir, "emotion", hidden_filename), final_hid.cpu().numpy()
             )
+
+        if self.bert_model is not None:
+            encoded_layers, pooled = self.bert_model.infer(raw_text)
+
+            bert_filename, pooled_filename = f"{speaker}-bert-{basename}.npy", f"{speaker}-hid-{basename}.npy"
+
+            np.save(
+                os.path.join(self.out_dir, "emotion", bert_filename), encoded_layers.cpu().numpy()
+            )
+            np.save(
+                os.path.join(self.out_dir, "emotion", pooled_filename), pooled.cpu().numpy()
+            )
+
 
         pitch_filename = "{}-pitch-{}.npy".format(speaker, basename)
         np.save(os.path.join(self.out_dir, "pitch", pitch_filename), pitch)

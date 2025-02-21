@@ -6,7 +6,7 @@ import numpy as np
 from torch.utils.data import Dataset
 
 from text import text_to_sequence, cleaned_text_to_sequence
-from utils.tools import pad_1D, pad_2D, pad_zephyr_outputs
+from utils.tools import pad_1D, pad_2D, pad_zephyr_outputs, pad_bert_outputs
 
 
 class Dataset(Dataset):
@@ -26,6 +26,7 @@ class Dataset(Dataset):
             self.speaker_map = json.load(f)
         self.sort = sort
         self.drop_last = drop_last
+
 
     def __len__(self):
         return len(self.text)
@@ -58,7 +59,7 @@ class Dataset(Dataset):
         emotion_block_path = os.path.join(
             self.preprocessed_path,
             "emotion",
-            f"{speaker}-blocks-{basename}.npy",
+            f"{speaker}-bert-{basename}.npy",
         )
 
         emotion_hidden_path = os.path.join(
@@ -121,7 +122,7 @@ class Dataset(Dataset):
         energies = pad_1D(energies)
         emotion_hiddens = np.array(emotion_hiddens)
 
-        emotion_blocks, emotion_lens = pad_zephyr_outputs(emotion_blocks)
+        emotion_blocks, emotion_lens = pad_bert_outputs(emotion_blocks)
 
         return (
             ids,

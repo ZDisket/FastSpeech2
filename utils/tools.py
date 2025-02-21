@@ -369,6 +369,32 @@ def pad_zephyr_outputs(hidden_blocks_list):
 
     return padded_hidden_blocks, lengths
 
+
+def pad_bert_outputs(hidden_blocks_list):
+    """
+    Zero-pads a list of numpy arrays along the sequence length dimension.
+
+    Args:
+        hidden_blocks_list (list of np.ndarray): Each array has shape (1, seq_len, hidden_dim).
+
+    Returns:
+        tuple: A numpy array of shape (batch_size, max_seq_len, hidden_dim) with zero-padding,
+               and a numpy array of the original sequence lengths.
+    """
+    # Calculate the sequence lengths and maximum sequence length
+    seq_lengths = np.array([arr.shape[1] for arr in hidden_blocks_list])
+    max_seq_len = seq_lengths.max()
+
+    # Pad each array along the sequence dimension and concatenate along the batch axis
+    padded_arrays = [
+        np.pad(arr, pad_width=((0, 0), (0, max_seq_len - arr.shape[1]), (0, 0)), mode='constant')
+        for arr in hidden_blocks_list
+    ]
+    padded_hidden_blocks = np.concatenate(padded_arrays, axis=0)
+
+    return padded_hidden_blocks, seq_lengths
+
+
 def pad_1D(inputs, PAD=0):
     def pad_data(x, length, PAD):
         x_padded = np.pad(
