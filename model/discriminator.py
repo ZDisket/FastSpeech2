@@ -8,25 +8,7 @@ from .submodels import sequence_mask, mask_to_attention_mask, Prenet
 from torch.nn.utils.rnn import pack_padded_sequence, pad_packed_sequence
 from .s4 import S4Block as S4 
 from torch.cuda.amp import GradScaler, autocast
-
-class ConvBlock1D(nn.Module):
-    """
-    Simple Conv1D+ReLU+TransposeRMSNorm block for sequence modeling.
-    """
-
-    def __init__(self, in_channels, out_channels, kernel_size=3, dilation=1, dropout=0.3, act="relu"):
-        super(ConvBlock1D, self).__init__()
-        self.conv1 = nn.Conv1d(in_channels, out_channels, kernel_size, dilation=dilation, padding="same")
-        self.norm1 = TransposeLayerNorm(out_channels)  # Using TransposeRMSNorm
-        self.relu = APTx() if act == "aptx" else nn.ReLU()  # Activation logic
-        self.dropout = nn.Dropout(dropout)
-
-    def forward(self, x, x_mask):
-        out = self.conv1(x).masked_fill(x_mask, 0)
-        out = self.norm1(out).masked_fill(x_mask, 0)
-        out = self.relu(out).masked_fill(x_mask, 0)
-        out = self.dropout(out)
-        return out
+from torch.nn.utils import spectral_norm
 
 
 class SequenceNormalization(nn.Module):
@@ -67,39 +49,81 @@ class SequenceNormalization(nn.Module):
         return scaled_x
 
 
-class S4Block1D(nn.Module):
+class ConvBlock1D(nn.Module):
     """
-    S4D + ReLU + TransposeLayerNorm + Dropout
-    """
-    def __init__(self, in_channels, out_channels, dropout=0.3, act="relu", d_state=64):
-        super(S4Block1D, self).__init__()
-        # Make sure in_channels == out_channels for simplicity (as in the original code with hidden_dim)
-        assert in_channels == out_channels, "For simplicity, in_channels should match out_channels."
-        
-        # S4 layer
-        self.s4 = S4(
-            d_model=out_channels,
-            d_state=d_state,
-            dropout=dropout,
-            transposed=True  # Input/Output are in (B, H, L) format
-        )
+    Simple block for sequence modeling with configurable normalization.
 
-        self.norm1 = TransposeLayerNorm(out_channels)
-        self.relu = APTx() if act == "aptx" else nn.ReLU()
+    If norm=="layer", uses TransposeLayerNorm.
+    If norm=="spectral", applies spectral normalization to the Conv1d and uses nn.Identity.
+    """
+
+    def __init__(self, in_channels, out_channels, kernel_size=3, dilation=1, dropout=0.3, act="relu", norm="layer"):
+        super(ConvBlock1D, self).__init__()
+
+        if norm == "layer":
+            self.conv1 = nn.Conv1d(in_channels, out_channels, kernel_size, dilation=dilation, padding="same")
+            self.norm1 = TransposeLayerNorm(out_channels)
+        elif norm == "spectral":
+            self.conv1 = spectral_norm(
+                nn.Conv1d(in_channels, out_channels, kernel_size, dilation=dilation, padding="same"))
+            self.norm1 = nn.Identity()
+        else:
+            raise ValueError("norm must be either 'layer' or 'spectral'")
+
+        self.act = APTx() if act == "aptx" else nn.ReLU()
         self.dropout = nn.Dropout(dropout)
 
     def forward(self, x, x_mask):
-        # x: (B, C, L) with C=out_channels
-        
-        out, _ = self.s4(x.float())  # S4D returns (output, state), ignore state here
-
-        
-        out = out.masked_fill(x_mask, 0)
+        # x: (B, C, L)
+        out = self.conv1(x).masked_fill(x_mask, 0)
         out = self.norm1(out).masked_fill(x_mask, 0)
-        out = self.relu(out).masked_fill(x_mask, 0)
+        out = self.act(out).masked_fill(x_mask, 0)
         out = self.dropout(out)
         return out
 
+
+class S4Block1D(nn.Module):
+    """
+    S4D + ReLU + configurable normalization + Dropout.
+
+    For norm=="layer", uses TransposeLayerNorm.
+    For norm=="spectral", applies spectral normalization to the S4 layer and replaces
+    the normalization layer with nn.Identity.
+
+    Note: We assume the S4 module is compatible with spectral_norm.
+    """
+
+    def __init__(self, in_channels, out_channels, dropout=0.3, act="relu", d_state=64, norm="layer"):
+        super(S4Block1D, self).__init__()
+        # For simplicity, in_channels should equal out_channels
+        assert in_channels == out_channels, "in_channels should match out_channels."
+
+        if norm == "layer":
+            self.s4 = S4(d_model=out_channels,
+                         d_state=d_state,
+                         dropout=dropout,
+                         transposed=True)  # Expects input shape (B, C, L)
+            self.norm1 = TransposeLayerNorm(out_channels)
+        elif norm == "spectral":
+            self.s4 = spectral_norm(S4(d_model=out_channels,
+                                       d_state=d_state,
+                                       dropout=dropout,
+                                       transposed=True))
+            self.norm1 = nn.Identity()
+        else:
+            raise ValueError("norm must be either 'layer' or 'spectral'")
+
+        self.act = APTx() if act == "aptx" else nn.ReLU()
+        self.dropout = nn.Dropout(dropout)
+
+    def forward(self, x, x_mask):
+        # x: (B, C, L)
+        out, _ = self.s4(x.float())  # S4 returns (output, state); state is ignored.
+        out = out.masked_fill(x_mask, 0)
+        out = self.norm1(out).masked_fill(x_mask, 0)
+        out = self.act(out).masked_fill(x_mask, 0)
+        out = self.dropout(out)
+        return out
 
 class AdvSeqDiscriminatorS4(nn.Module):
     """
@@ -108,7 +132,7 @@ class AdvSeqDiscriminatorS4(nn.Module):
 
     I tried residual design but found that it's hard to optimize.
     """
-    def __init__(self, hidden_dim=1024, num_ssm_layers=6, conv_kernel_size=[3, 7, 11], conv_dropout=0.5, ssm_dropout=0.3, use_cbam=True):
+    def __init__(self, hidden_dim=1024, num_ssm_layers=6, conv_kernel_size=[3, 7, 11], conv_dropout=0.5, ssm_dropout=0.3, use_cbam=True, norm="layer"):
         """
         Init S4+Conv D
         :param hidden_dim: Hidden dimension size for all layers
@@ -120,15 +144,15 @@ class AdvSeqDiscriminatorS4(nn.Module):
         """
         super(AdvSeqDiscriminatorS4, self).__init__()
 
-        self.use_cbam = True
+        self.use_cbam = use_cbam
         self.num_ssm_layers = num_ssm_layers
 
         self.convs = nn.ModuleList(
-            [ConvBlock1D(hidden_dim, hidden_dim, kernel_size=ks, dropout=conv_dropout) for ks in conv_kernel_size]
+            [ConvBlock1D(hidden_dim, hidden_dim, kernel_size=ks, dropout=conv_dropout, norm=norm) for ks in conv_kernel_size]
         )
 
         self.ssms = nn.ModuleList(
-            [S4Block1D(hidden_dim, hidden_dim, dropout=ssm_dropout) for _ in range(num_ssm_layers)]
+            [S4Block1D(hidden_dim, hidden_dim, dropout=ssm_dropout, norm=norm) for _ in range(num_ssm_layers)]
         )
         
         # Optional CBAM block (unchanged)
@@ -197,7 +221,7 @@ class MultiLengthDiscriminator(nn.Module):
                  text_hidden=256, num_channels=1, hidden_dim=1024,
                  n_heads=0, dropout=0.5, kernel_size=[[3, 3, 5], [7, 7, 9, 11]],
                  emotion_hidden=0,use_cbam=True, att_dropout=0.3,
-                 ssm_dropout=0.3, ssm_depths = [ 0, 0 ]):
+                 ssm_dropout=0.3, ssm_depths = [ 0, 0 ], norm="layer"):
         super(MultiLengthDiscriminator, self).__init__()
 
         self.text_hidden = text_hidden
@@ -247,7 +271,8 @@ class MultiLengthDiscriminator(nn.Module):
                 num_ssm_layers=ssm_depths[i],
                 conv_dropout=dropout,
                 ssm_dropout=ssm_dropout,
-                use_cbam=use_cbam
+                use_cbam=use_cbam,
+                norm=norm,
             )
             self.discriminators.append(d)
 

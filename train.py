@@ -87,7 +87,7 @@ def main(args, configs):
     discriminator = MultiLengthDiscriminator(text_hidden=model_config["transformer"]["encoder_hidden"],n_heads=0,
                                             hidden_dim=disc_config["hidden_size"], dropout=disc_config["conv_dropout"],
                                             kernel_size=disc_config["kernel_sizes"], emotion_hidden=0, ssm_dropout=disc_config["ssm_dropout"],
-                                            ssm_depths=disc_config["ssm_depth"]).to(device)
+                                            ssm_depths=disc_config["ssm_depth"], norm=disc_config["norm"]).to(device)
     discriminator.apply(weights_init_he)
     discriminator.train()
     criterion_lsgan = LSGANLoss(use_lecam=True)

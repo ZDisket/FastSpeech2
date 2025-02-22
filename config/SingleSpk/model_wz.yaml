@@ -35,7 +35,7 @@ duration_predictor:
   kernel_size: 3 # lstm: conv kernel size
   filter_size: 256 # lstm: hidden size
   dropout: 0.5 # both: dropout
-  use_cbam: true #LSTM: use CBAM
+  use_cbam: false #LSTM: use CBAM
 
 # The discriminator config is very flexible
 # You can define one or multiple discriminators, with diff conv sizes and S4 layers (or lack thereof) for each.
@@ -44,9 +44,10 @@ discriminator:
   # kernel_sizes: [[3, 3, 5, 5], [5, 7, 9, 11]] builds 2 discriminators, one with [3, 3, 5, 5] convs, and the other [5, 7, 9, 11].
 
   ssm_depth: [6] # Num of S4 layers for each discriminator. You can set to 0 for no S4 layers.
-  ssm_dropout: 0.3 # Dropout on S4 layers (if there are any)
-  conv_dropout: 0.5 # Dropout on Conv layers
+  ssm_dropout: 0.2 # Dropout on S4 layers (if there are any)
+  conv_dropout: 0.35 # Dropout on Conv layers
   hidden_size: 1024 # Hidden dim.
+  norm: "layer" # accepts "layer" or "spectral"
 
 
 variance_embedding:

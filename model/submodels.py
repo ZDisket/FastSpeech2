@@ -841,8 +841,8 @@ class Aligner(nn.Module):
         self.attn_type = "simple" # mha is BROKEN (you could probably fix it with a LR warmup)
         self.n_heads = heads
 
-        self.mel_proj = SwiGLUConvFFN(mel_channels, mas_channels * 2, mas_channels, 5, 0.1, act="aptxs1")
-        self.text_proj = SwiGLUConvFFN(text_channels, mas_channels * 2, mas_channels, 3, 0.1, act="aptxs1")
+        self.mel_proj = SwiGLUConvFFN(mel_channels, mas_channels * 2, mas_channels, 5, 0.1, act="relugt")
+        self.text_proj = SwiGLUConvFFN(text_channels, mas_channels * 2, mas_channels, 3, 0.1, act="relugt")
 
         self.num_persistent = num_persistent
 
