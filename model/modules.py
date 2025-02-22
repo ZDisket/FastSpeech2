@@ -362,7 +362,7 @@ class VarianceAdaptor(nn.Module):
             self.duration_predictor = VariantDurationPredictor(
                 text_channels=model_config["transformer"]["encoder_hidden"],
                 filter_channels=model_config["duration_predictor"]["filter_size"],
-                depth=model_config["duration_predictor"]["decoder_depth"],
+                depth=0,
                 heads=None,
                 p_dropout=model_config["duration_predictor"]["dropout"],
                 final_dropout=model_config["duration_predictor"]["att_dropout"],

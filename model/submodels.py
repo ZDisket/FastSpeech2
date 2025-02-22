@@ -523,8 +523,8 @@ class SpectrogramDecoder(nn.Module):
         self.dec = TransformerEncoder(filter_channels, heads=heads, num_layers=depth,
                                       forward_expansion=forward_expansion, dropout=dropout,
                                       alibi_alpha=alibi_alpha, start_i=4, kernel_size=kernel_sizes,
-                                      act="relugt", rma_mem_dim=0, conv_att=True, multi_scale=True, talking_heads=True,
-                                      dynamic_alibi=True, coarse_fine=True)
+                                      act="relugt", rma_mem_dim=0, conv_att=False, multi_scale=True, talking_heads=True,
+                                      dynamic_alibi=True, coarse_fine=False)
 
         self.mel_fc = nn.Linear(filter_channels, mel_channels)
         self.do_em_cond = False

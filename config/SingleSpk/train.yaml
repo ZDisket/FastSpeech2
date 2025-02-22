@@ -24,5 +24,5 @@ step:
   save_step: 10000
 
 disc:
-  start_step: 5000
+  start_step: 10000
   lr: 0.00001
