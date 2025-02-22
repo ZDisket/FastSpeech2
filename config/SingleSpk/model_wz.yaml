@@ -68,6 +68,7 @@ emotion_size: 256
 speaker_channels: 0
 aligner: "mas"
 mas_channels: 256
+em_enc_sizes: [312, 128, 64, 16]
 
 vocoder:
   model: "iSTFTNet" # support 'HiFi-GAN', 'MelGAN'

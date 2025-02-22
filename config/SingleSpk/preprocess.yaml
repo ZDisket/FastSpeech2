@@ -8,7 +8,8 @@ path:
 
 preprocessing:
   val_size: 512 # ignored
-  bert_model: "answerdotai/ModernBERT-base"
+  bert_model: "huawei-noah/TinyBERT_General_4L_312D"
+  zephyr_model: ""
   text:
     text_cleaners: ["english_cleaners2"]
     language: "en"

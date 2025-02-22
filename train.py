@@ -14,7 +14,7 @@ from model import FastSpeech3Loss, AdEMAMix, MultiLengthDiscriminator, AdvSeqDis
 from model.loss import LSGANLoss
 from dataset import Dataset
 from torch.cuda.amp import GradScaler, autocast
-from zephyrfe import ZephyrFrontEnd
+from bertfe import BERTFrontEnd
 from preprocessor.emotion import EmotionProcessorV2
 
 from evaluate import evaluate
@@ -114,8 +114,11 @@ def main(args, configs):
     vocoder = get_vocoder(model_config, device)
 
     if len(preprocess_config["preprocessing"]["zephyr_model"]):
-        proc_em = EmotionProcessorV2()
-        zephyr_model = ZephyrFrontEnd(model_path=preprocess_config["preprocessing"]["zephyr_model"], processor=proc_em)
+        raise RuntimeError("Not supported")
+
+
+    if len(preprocess_config["preprocessing"]["bert_model"]):
+        bert_model = BERTFrontEnd(torch.cuda.is_available(), preprocess_config["preprocessing"]["bert_model"])
 
     # Init logger
     for p in train_config["path"].values():
@@ -289,7 +292,7 @@ def main(args, configs):
                         "Now I see. Black human beings dislike the sound of rubbing glass probably the sound wave of the whistle"]
 
                     for i, sent in enumerate(test_sentences):
-                        _, (blocks, hid, _) = zephyr_model.predict_emotions(sent)
+                        blocks, hid = bert_model.infer(sent)
                         t_aud = test_one_fs2(model.module, vocoder, sent, blocks.cpu().numpy(), hid.cpu().numpy())
                         if t_aud is None:
                             continue

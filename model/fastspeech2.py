@@ -20,7 +20,7 @@ class FastSpeech2(nn.Module):
     def __init__(self, preprocess_config, model_config):
         super(FastSpeech2, self).__init__()
         self.model_config = model_config
-        self.emotion_channels = model_config["emotion_size"]
+        self.emotion_channels = model_config["em_enc_sizes"][-1]
         self.speaker_channels = model_config["speaker_channels"]
         self.aligner_type = model_config["aligner"]
 
@@ -34,7 +34,7 @@ class FastSpeech2(nn.Module):
             model_config["transformer"]["encoder_kernel_sizes"],
             1.5,
             3,
-            emotion_channels=model_config["em_enc_sizes"][-1],
+            emotion_channels=self.emotion_channels,
             speaker_channels=self.speaker_channels,
         )
         self.variance_adaptor = VarianceAdaptor(preprocess_config, model_config)
@@ -47,7 +47,7 @@ class FastSpeech2(nn.Module):
                                           model_config["transformer"]["decoder_kernel_sizes"],
                                           model_config["transformer"]["decoder_dropout"],
                                           alibi_alpha=1.25,
-                                          emotion_size=self.emotion_channels,
+                                          emotion_size=0,
                                           speaker_channels=self.speaker_channels)
 
         self.emotion_encoder = EmotionEncoder(model_config["em_enc_sizes"],0.5)

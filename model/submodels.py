@@ -755,6 +755,7 @@ class EmotionEncoder(nn.Module):
         self.net = nn.Sequential(*layers)
 
     def forward(self, x):
+        x = x.squeeze(1) # (batch, 1, channels) = (batch, channels)
         return self.net(x)
 
 
