@@ -152,7 +152,7 @@ class AdvSeqDiscriminatorS4(nn.Module):
         )
 
         self.ssms = nn.ModuleList(
-            [S4Block1D(hidden_dim, hidden_dim, dropout=ssm_dropout, norm=norm) for _ in range(num_ssm_layers)]
+            [S4Block1D(hidden_dim, hidden_dim, dropout=ssm_dropout, norm="layer") for _ in range(num_ssm_layers)]
         )
         
         # Optional CBAM block (unchanged)

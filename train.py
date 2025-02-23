@@ -143,6 +143,13 @@ def main(args, configs):
     outer_bar.n = args.restore_step
     outer_bar.update()
 
+    mp_dtype = torch.float16
+    if torch.cuda.is_bf16_supported():
+        print("Current GPU supports BF16. Using instead of fp16...")
+        mp_dtype = torch.bfloat16
+
+
+
     # torch.autograd.set_detect_anomaly(True, True)
 
     scaler = GradScaler()
@@ -159,7 +166,7 @@ def main(args, configs):
         for batchs in loader:
             for batch in batchs:
 
-                with autocast(enabled=True):
+                with autocast(enabled=True,dtype=mp_dtype):
                     batch = to_device(batch, device)
 
                     # Forward pass and loss computation with autocast
