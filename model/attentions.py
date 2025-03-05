@@ -535,35 +535,35 @@ class TransformerEncoderLayer(nn.Module):
             hidden_features=forward_expansion * embed_size,
             out_features=embed_size,
             kernel_size=kernel_size,
-            drop=0.1,
+            drop=dropout,
             act=act,
             conv_att=conv_att,
         )
         self.dropout = nn.Dropout(dropout)
 
-    def forward(self, value, key, query, mask, conv_mask=None, mem_kv=None, coarse_features=None, coarse_mask=None):
-        # Multi-head attention
-        attn_output = self.attention(value, key, query, mask, mem_kv)
-        # Apply dropout and add the residual (skip connection)
-        x = query + self.dropout(attn_output)
-        # Normalize after the residual connection
-        x = self.norm1(x)
+    def forward(self, x, mask, conv_mask=None, mem_kv=None, coarse_features=None, coarse_mask=None):
+        # Compute normalized x for coarse attention if needed, using the original x
+        if self.coarse_fine:
+            norm_x_coarse = self.norm3(x)
 
+        # Primary attention
+        norm_x_primary = self.norm1(x)
+        attn_output = self.attention(norm_x_primary, norm_x_primary, norm_x_primary, mask, mem_kv)
+        x = x + self.dropout(attn_output)
+
+        # Coarse attention (if applicable)
         if self.coarse_fine:
             coarse_fine_attn_mask = expand_masks(conv_mask.squeeze(1), coarse_mask.squeeze(1))
-
-            # better perf if we use the query rather than x post attn+norm
-            coarse_attn_output = self.coarse_attention(coarse_features, coarse_features, query, coarse_fine_attn_mask)
+            coarse_attn_output = self.coarse_attention(coarse_features, coarse_features, norm_x_coarse,
+                                                       coarse_fine_attn_mask)
             x = x + self.dropout(coarse_attn_output)
-            x = self.norm3(x)
 
-        # Feed-forward network
-        ff_output = self.feed_forward(x, mask if conv_mask is None else conv_mask)
-        # Apply dropout and add the residual (skip connection)
+        # Feed-forward
+        norm_x_ff = self.norm2(x)
+        ff_output = self.feed_forward(norm_x_ff, mask if conv_mask is None else conv_mask)
         x = x + self.dropout(ff_output)
-        # Normalize after the residual connection
-        x = self.norm2(x)
 
+        # Return persistent key-value pairs if using RMA
         kv_ret = (self.attention.persistent_keys, self.attention.persistent_values) if self.use_rma else None
         return x, kv_ret
 
@@ -625,8 +625,7 @@ class TransformerEncoder(nn.Module):
         coarse_x, coarse_mask = x, conv_mask
 
         for i, layer in enumerate(self.encoder_layers):
-            x, current_kv = layer(x, x, x,
-                                  mask, conv_mask, (recurr_keys, recurr_values) if recurr_keys is not None else None,
+            x, current_kv = layer(x, mask, conv_mask, (recurr_keys, recurr_values) if recurr_keys is not None else None,
                                   coarse_x, coarse_mask)  # Here x serves as query, key, and value
 
             # Break at the last layer after processing;
