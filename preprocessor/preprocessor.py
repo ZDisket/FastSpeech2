@@ -192,7 +192,7 @@ class Preprocessor:
         wav, _ = librosa.load(wav_path, sr=self.sampling_rate)
         duration = len(wav) / self.sampling_rate
 
-        if duration < 1.5 or duration > 10.5:
+        if duration < 1.1 or duration > 12.0:
             print(f"File {wav_path} is too short or long, duration {duration}. Skipping this one...")
             return None
 

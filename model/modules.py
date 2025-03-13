@@ -381,8 +381,7 @@ class VarianceAdaptor(nn.Module):
             raise RuntimeError(f"Invalid duration predictor type: {dp_type}. Valid are tcn and lstm")
 
         if self.spk_channels > 0:
-            self.pe_spk_cond = nn.Sequential(nn.Linear(self.spk_channels, model_config["transformer"]["encoder_hidden"]),
-                                             nn.Dropout(0.1),)
+            self.pe_spk_cond = nn.Sequential(nn.Linear(self.spk_channels, model_config["transformer"]["encoder_hidden"]),)
 
         self.length_regulator = LengthRegulator()
         self.pitch_predictor = TemporalVariancePredictor(
@@ -498,15 +497,15 @@ class VarianceAdaptor(nn.Module):
             e_control=1.0,
             d_control=1.0,
     ):
+        if self.spk_channels > 0:
+            x = x + self.pe_spk_cond(in_spk)
+
         log_duration_prediction, x_mask, dur_hidden = self.duration_predictor(x, src_lens, in_emotion, in_spk)
 
         dur_hidden = self.hid_proj(dur_hidden).masked_fill(x_mask.unsqueeze(-1), 0)
 
         if self.pitch_feature_level == "phoneme_level":
             x = x + dur_hidden
-
-        if self.spk_channels > 0:
-            x = x + self.pe_spk_cond(in_spk)
 
         if self.pitch_feature_level == "phoneme_level":
             if duration_target is not None:

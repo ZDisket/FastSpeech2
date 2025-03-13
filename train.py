@@ -2,12 +2,15 @@ import argparse
 import os
 
 import torch
+
+# having this True is bad (both for CUDA and ROCm) when we use diff lens each batch
+torch.backends.cudnn.benchmark = False
 import yaml
 import torch.nn as nn
 from torch.utils.data import DataLoader
 from torch.utils.tensorboard import SummaryWriter
 from tqdm import tqdm
-
+import itertools
 from utils.model import get_model, get_vocoder, get_param_num, load_pretrained_weights
 from utils.tools import to_device, log, synth_one_sample, test_one_fs2, log_attention_maps
 from model import FastSpeech3Loss, AdEMAMix, MultiLengthDiscriminator, AdvSeqDiscriminatorS4
@@ -291,16 +294,15 @@ def main(args, configs):
                         f.write(message + "\n")
                     outer_bar.write(message)
 
-                    test_sentences = [
-                        "The quick brown fox jumps over the lazy dog, while the sun sets over the peaceful valley",
-                        "When I visited Rome, the capital of Italy, I saw the Colosseum, the Vatican, and St. Peter's Basilica",
-                        "Even though John loves chocolate, strawberries, and ice cream, he decided to try the vanilla cake instead",
-                        "Peter Piper picked a peck of pickled peppers, how many pickled peppers did Peter Piper pick?",
-                        "Now I see. Black human beings dislike the sound of rubbing glass probably the sound wave of the whistle"]
+                    speakers = train_config['test_speakers']
+                    sentences = train_config['test_sentences']
 
-                    for i, sent in enumerate(test_sentences):
+                    # Generate all combinations of speakers and sentences
+                    pairs = list(itertools.product(speakers, sentences))
+
+                    for idx, (spkid, sent) in enumerate(pairs, start=1):
                         blocks, hid = bert_model.infer(sent)
-                        t_aud = test_one_fs2(model.module, vocoder, sent, blocks.cpu().numpy(), hid.cpu().numpy())
+                        t_aud = test_one_fs2(model.module, vocoder, sent, blocks.cpu().numpy(), hid.cpu().numpy(), int(spkid))
                         if t_aud is None:
                             continue
                         log(
@@ -308,7 +310,7 @@ def main(args, configs):
                             step=step,
                             audio=t_aud,
                             sampling_rate=preprocess_config["preprocessing"]["audio"]["sampling_rate"],
-                            tag=f"Test/sentence_{i}"
+                            tag=f"Test/sentence_{idx}"
                         )
 
                     model.train()

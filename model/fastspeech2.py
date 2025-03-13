@@ -55,7 +55,7 @@ class FastSpeech2(nn.Module):
 
         self.postnet = PostNet(n_mel_channels=preprocess_config["preprocessing"]["mel"]["n_mel_channels"])
 
-        if self.speaker_channels > 0:
+        if self.speaker_channels > 0 and self.aligner_type == "rad":
             self.alenc_spk_cond = nn.Sequential(nn.Linear(self.speaker_channels, model_config["transformer"]["encoder_hidden"]),
                                                 nn.Dropout(0.1),)
         if self.aligner_type == "rad":
@@ -69,7 +69,7 @@ class FastSpeech2(nn.Module):
             self.mas_channels = model_config["mas_channels"]
 
             self.aligner = Aligner(preprocess_config["preprocessing"]["mel"]["n_mel_channels"],
-                                   model_config["transformer"]["encoder_hidden"], self.mas_channels, 1)
+                                   model_config["transformer"]["encoder_hidden"], self.mas_channels, 1, speaker_channels=self.speaker_channels)
 
 
         self.speaker_emb = None
@@ -158,9 +158,10 @@ class FastSpeech2(nn.Module):
 
         if self.aligner_type == "mas":
             # (self, mel_hidden_states, text_hidden_states, x_lens, y_lens):
-
-            attn_soft, attn_logprob, attn_hard, attn_hard_dur = self.aligner(mels, encoded_text, src_lens,
-                                                                             mel_lens)
+                                                                            # text encoder shouldn't optimize for alignment; we discard the aligner during inference
+                                                                        # also helps prevent NaN loss by simplifying gradient flow (maybe?)
+            attn_soft, attn_logprob, attn_hard, attn_hard_dur = self.aligner(mels, encoded_text.detach(), src_lens,
+                                                                             mel_lens, spk_emb.detach())
 
             total_durs = attn_hard_dur.squeeze(1)
 

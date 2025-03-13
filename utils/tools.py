@@ -457,13 +457,13 @@ def preproc_text(in_txt, cleaners = ["english_cleaners2"]):
     return txt_arr
 
 
-def fs2_infer(inmodel, text, in_blocks, in_hid):
+def fs2_infer(inmodel, text, in_blocks, in_hid, in_speakers):
     src_len = torch.from_numpy(np.array([text.shape[1]])).to(device)
     text = torch.IntTensor(text).to(device)
     em_len = torch.from_numpy(np.array([in_hid.shape[1]])).to(device)
     in_blocks = torch.from_numpy(in_blocks).to(device)
     in_hid = torch.from_numpy(in_hid).to(device).unsqueeze(0)
-    speakers = torch.IntTensor([0])
+    speakers = torch.IntTensor([in_speakers]).to(device)
 
     predictions = inmodel.infer(speakers, text, src_len, src_len[0], in_blocks, in_hid, em_len)
     mel, mel_postnet = predictions[0], predictions[1]
@@ -476,14 +476,14 @@ def fs2_infer(inmodel, text, in_blocks, in_hid):
     return mel, mel_postnet, mel_torch, mel_postnet_torch
 
 
-def test_one_fs2(inmodel, invocoder, in_txt, in_blocks, in_hid):
+def test_one_fs2(inmodel, invocoder, in_txt, in_blocks, in_hid, in_spkid=0):
     with torch.no_grad():
         txt = preproc_text(in_txt)
         # [text_len] => [1, text_len]
 
         txt = np.expand_dims(txt, 0)
         try:
-            mel, mel_postnet, mel_torch, mel_postnet_torch = fs2_infer(inmodel, txt, in_blocks, in_hid)
+            mel, mel_postnet, mel_torch, mel_postnet_torch = fs2_infer(inmodel, txt, in_blocks, in_hid, in_spkid)
         except RuntimeError:
             print(f"Error inferring {txt}")
             return None

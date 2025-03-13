@@ -278,7 +278,7 @@ def generate_masks_from_float_mask(float_mask):
 
 class VariantDurationPredictor(nn.Module):
     def __init__(self, text_channels, filter_channels=256, depth=4, heads=4, kernel_size=3, p_dropout=0.2,
-                 final_dropout=0.2, conv_depth=2, lstm_bidirectional=True, start_i=0, bayesian=True, use_cbam=True):
+                 final_dropout=0.2, conv_depth=2, lstm_bidirectional=True, start_i=0, bayesian=False, use_cbam=True):
         super(VariantDurationPredictor, self).__init__()
 
         print("Using Variant Duration Predictor")
@@ -286,6 +286,7 @@ class VariantDurationPredictor(nn.Module):
         self.lstm_bidirectional = lstm_bidirectional
         self.conv_depth = conv_depth
         self.use_cbam = use_cbam
+        bayesian = False
 
         self.conv_layers = nn.ModuleList()
 
@@ -535,8 +536,7 @@ class SpectrogramDecoder(nn.Module):
                                          nn.Dropout(0.5),)
 
         if self.speaker_channels > 0:
-            self.spk_cond = nn.Sequential(nn.Linear(speaker_channels, filter_channels),
-                                          nn.Dropout(0.1),)
+            self.spk_cond = nn.Sequential(nn.Linear(speaker_channels, filter_channels),)
 
 
     # x_mask : True=exclude mask size (batch, mel_lens)
@@ -835,11 +835,12 @@ class PositionalEncoding(nn.Module):
 
 
 class Aligner(nn.Module):
-    def __init__(self, mel_channels, text_channels, mas_channels, heads, num_persistent=16):
+    def __init__(self, mel_channels, text_channels, mas_channels, heads, num_persistent=16, speaker_channels=0):
         super(Aligner, self).__init__()
         self.proj_type = "conv"
         self.attn_type = "simple" # mha is BROKEN (you could probably fix it with a LR warmup)
         self.n_heads = heads
+        self.spk_cond = nn.Linear(speaker_channels, mas_channels) if speaker_channels > 0 else None
 
         self.mel_proj = SwiGLUConvFFN(mel_channels, mas_channels * 2, mas_channels, 5, 0.1, act="relugt")
         self.text_proj = SwiGLUConvFFN(text_channels, mas_channels * 2, mas_channels, 3, 0.1, act="relugt")
@@ -855,7 +856,7 @@ class Aligner(nn.Module):
         if self.proj_type == "conv" and self.n_heads > 1:
             self.mha_proj = nn.Conv2d(heads, 1, 3, padding="same")
 
-    def forward(self, mel_hidden_states, text_hidden_states, x_lens, y_lens):
+    def forward(self, mel_hidden_states, text_hidden_states, x_lens, y_lens, in_spk=None):
 
         x_mask = sequence_mask(text_hidden_states.size(1), x_lens)
         y_mask = sequence_mask(mel_hidden_states.size(1), y_lens)
@@ -863,6 +864,11 @@ class Aligner(nn.Module):
         # Project mel and text hidden states to mas_channels
         text_proj = self.text_proj(text_hidden_states, x_mask.unsqueeze(1))
         mel_proj = self.mel_proj(mel_hidden_states, y_mask.unsqueeze(1))
+
+        if self.spk_cond is not None:
+            cond_spk = self.spk_cond(in_spk)
+            mel_proj += cond_spk
+            text_proj += cond_spk
 
         mha_mask = expand_masks(y_mask, x_mask)
 
