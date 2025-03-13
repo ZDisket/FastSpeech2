@@ -163,7 +163,7 @@ class SimpleEmProj(nn.Module):
 class TextEncoder(nn.Module):
     def __init__(self, vocab_size, embed_size, num_heads, num_layers, forward_expansion, dropout, kernel_sizes, alibi_alpha=1.0,
                  start_i=0, emotion_channels=256, speaker_channels=0):
-        super(TextEncoder, self).__init__()
+        super().__init__()
         self.embed = NormalizedEmbedding(vocab_size, embed_size, norm=False)
         self.encoder = TransformerEncoder(embed_size, num_heads, num_layers, forward_expansion, dropout,
                                           alibi_alpha=alibi_alpha, start_i=start_i, multi_scale=True, kernel_size=kernel_sizes,
@@ -552,7 +552,8 @@ class DecoderPrenet(nn.Module):
 class SpectrogramDecoderAR(nn.Module):
     def __init__(self, mel_channels, filter_channels, depth, heads, dropout=0.1,
                  alibi_alpha=1.0, forward_expansion=4):
-        super(SpectrogramDecoderAR, self).__init__()
+        super().__init__()
+
 
         self.filter_channels = filter_channels
         self.mel_channels = mel_channels
@@ -584,7 +585,7 @@ class SpectrogramDecoderAR(nn.Module):
         lin_x_mask = x_mask_b.unsqueeze(-1) # (B, L, 1)
         conv_x_mask = x_mask_b.unsqueeze(1) # (B, 1, L)
 
-        sa_mask = mask_to_attention_mask(conv_x_mask)
+        sa_mask = mask_to_attention_mask(x_mask_b)
         ca_mask = expand_masks(x_mask_b,
                                y_mask.bool())
 

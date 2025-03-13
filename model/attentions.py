@@ -14,8 +14,6 @@ from .attblocks import *
 from .subatts import *
 
 
-
-
 class PartialConv1d(torch.nn.Conv1d):
     """
     Zero padding creates a unique identifier for where the edge of the data is, such that the model can almost always identify
@@ -314,10 +312,6 @@ class SwiGLUConvFFN(nn.Module):
         return out.transpose(1, 2)
 
 
-
-
-
-
 class MultiHeadAttention(nn.Module):
     """
     Modern Multi Head Attention. Contains:
@@ -388,7 +382,6 @@ class MultiHeadAttention(nn.Module):
 
         if self.weighted_heads:
             self.head_weights = nn.Parameter(torch.ones(self.heads))
-
 
     def forward(self, values, keys, queries, mask=None, recurr_persistent=None, return_weights=False):
         """
@@ -480,10 +473,10 @@ class MultiHeadAttention(nn.Module):
 
         out = torch.einsum("nhql,nlhd->nqhd", [attention, values])
 
-        if self.weighted_heads: # (batch, len, n_heads, head_dim)
+        if self.weighted_heads:  # (batch, len, n_heads, head_dim)
             out = out * self.head_weights.view(1, 1, -1, 1)
 
-        out = out.reshape(N,query_len, self.heads * self.head_dim)
+        out = out.reshape(N, query_len, self.heads * self.head_dim)
 
         out = self.fc_out(out)
 
@@ -521,14 +514,15 @@ class TransformerEncoderLayer(nn.Module):
 
         self.attention = MultiHeadAttention(embed_size, heads, alibi_alpha=alibi_alpha,
                                             start_i_increment=start_i_increment, num_persistent=rma_mem_dim,
-                                            rma_inp_dim=embed_size // heads if self.use_rma else 0, use_talking_heads=talking_heads,
+                                            rma_inp_dim=embed_size // heads if self.use_rma else 0,
+                                            use_talking_heads=talking_heads,
                                             dynamic_alibi=dynamic_alibi)
 
         if self.coarse_fine:
             self.coarse_attention = MultiHeadAttention(embed_size, 1, alibi_alpha=alibi_alpha,
-                                                start_i_increment=start_i_increment, num_persistent=0,
-                                                rma_inp_dim=0,
-                                                use_talking_heads=False)
+                                                       start_i_increment=start_i_increment, num_persistent=0,
+                                                       rma_inp_dim=0,
+                                                       use_talking_heads=False)
             self.norm3 = nn.LayerNorm(embed_size)
 
         self.feed_forward = SwiGLUConvFFN(
@@ -569,7 +563,6 @@ class TransformerEncoderLayer(nn.Module):
         return x, kv_ret
 
 
-
 class TransformerDecoderLayer(nn.Module):
     def __init__(self, embed_size, heads, forward_expansion, dropout, alibi_alpha=1.0, start_i_increment=0,
                  kernel_size=1, act="swiglu", conv_att=False, talking_heads=True, dynamic_alibi=False):
@@ -584,10 +577,9 @@ class TransformerDecoderLayer(nn.Module):
                                             dynamic_alibi=dynamic_alibi)
 
         self.cross_attention = MultiHeadAttention(embed_size, heads, alibi_alpha=alibi_alpha,
-                                            start_i_increment=start_i_increment, num_persistent=0,
-                                            rma_inp_dim=0, use_talking_heads=talking_heads,
-                                            dynamic_alibi=dynamic_alibi)
-
+                                                  start_i_increment=start_i_increment, num_persistent=0,
+                                                  rma_inp_dim=0, use_talking_heads=talking_heads,
+                                                  dynamic_alibi=dynamic_alibi)
 
         self.feed_forward = SwiGLUConvFFN(
             in_features=embed_size,
@@ -645,30 +637,22 @@ def make_mask_causal(mask: torch.Tensor) -> torch.Tensor:
     return new_mask
 
 
-
-
 class TransformerDecoder(nn.Module):
     def __init__(self, embed_size, heads, num_layers, forward_expansion, dropout, alibi_alpha=1.0, start_i=0
-                 ,act="swiglu", talking_heads=True, dynamic_alibi=False, alibi_scaling_fac=None):
-        super(TransformerDecoder, self).__init__()
+                 , act="swiglu", talking_heads=True, dynamic_alibi=False, alibi_scaling_fac=None):
+        super().__init__()
         self.use_conv_att = False
         if alibi_scaling_fac is None:
             alibi_scaling_fac = heads // 2
 
-
-        # Our design is coarse fine attention for all layers except the first.
-        coarse_fine_vec = [self.coarse_fine] * num_layers
-        # if coarse_fine=True, this will be all True except for the first layer (what we want)
-        coarse_fine_vec[0] = False
-
         self.encoder_layers = nn.ModuleList([  # Layer-Scaled ALiBi
             TransformerDecoderLayer(embed_size, heads, forward_expansion, dropout, alibi_alpha=alibi_alpha,
-                                    start_i_increment=start_i + ((i * heads) // alibi_scaling_fac), kernel_size=1, act=act
-                                    ,talking_heads=talking_heads,
+                                    start_i_increment=start_i + ((i * heads) // alibi_scaling_fac), kernel_size=1,
+                                    act=act
+                                    , talking_heads=talking_heads,
                                     dynamic_alibi=dynamic_alibi)
             for i in range(num_layers)
         ])
-
 
     def forward(self, x, y, mask, cross_attn_mask, conv_mask=None):
         """
@@ -686,16 +670,17 @@ class TransformerDecoder(nn.Module):
         mask = make_mask_causal(mask)
 
         for i, layer in enumerate(self.encoder_layers):
-            x, current_kv = layer(x, y, mask, cross_attn_mask, conv_mask)  # Here x serves as query, key, and value
-
+            x = layer(x, y, mask, cross_attn_mask, conv_mask)  # Here x serves as query, key, and value
 
         return x
 
+
 class TransformerEncoder(nn.Module):
     def __init__(self, embed_size, heads, num_layers, forward_expansion, dropout, alibi_alpha=1.0, start_i=0,
-                 kernel_size=3, act="swiglu", rma_mem_dim=0, conv_att=False, multi_scale=False, talking_heads=True, coarse_fine=False,
+                 kernel_size=3, act="swiglu", rma_mem_dim=0, conv_att=False, multi_scale=False, talking_heads=True,
+                 coarse_fine=False,
                  dynamic_alibi=False, alibi_scaling_fac=None):
-        super(TransformerEncoder, self).__init__()
+        super().__init__()
         self.use_conv_att = conv_att
         self.coarse_fine = coarse_fine
         if alibi_scaling_fac is None:
@@ -708,8 +693,10 @@ class TransformerEncoder(nn.Module):
 
         self.encoder_layers = nn.ModuleList([  # Layer-Scaled ALiBi
             TransformerEncoderLayer(embed_size, heads, forward_expansion, dropout, alibi_alpha=alibi_alpha,
-                                    start_i_increment=start_i + ((i * heads) // alibi_scaling_fac), kernel_size=[kernel_size[i], 1] if multi_scale else kernel_size, act=act,
-                                    rma_mem_dim=rma_mem_dim, conv_att=self.use_conv_att and i == num_layers - 1, talking_heads=talking_heads, coarse_fine=coarse_fine_vec[i],
+                                    start_i_increment=start_i + ((i * heads) // alibi_scaling_fac),
+                                    kernel_size=[kernel_size[i], 1] if multi_scale else kernel_size, act=act,
+                                    rma_mem_dim=rma_mem_dim, conv_att=self.use_conv_att and i == num_layers - 1,
+                                    talking_heads=talking_heads, coarse_fine=coarse_fine_vec[i],
                                     dynamic_alibi=dynamic_alibi)
             for i in range(num_layers)
         ])
@@ -764,8 +751,8 @@ class TransformerEncoder(nn.Module):
                 coarse_mask = F.max_pool1d(conv_mask.float(), kernel_size=5, stride=2).bool()
 
                 coarse_x = self.coarse_projs[i](
-                    x.transpose(1,2)
-                ).masked_fill(coarse_mask, 0).transpose(1,2)
+                    x.transpose(1, 2)
+                ).masked_fill(coarse_mask, 0).transpose(1, 2)
 
             if self.use_rma:
                 key_r, val_r = current_kv
@@ -785,6 +772,7 @@ class TransformerEncoder(nn.Module):
 
         return x
 
+
 def make_conv(bayesian, in_channels, out_channels, kernel_size, stride=1, padding=0, dilation=1, WN=True):
     if bayesian:
         return BayesConv1d(0.0, 0.1, in_channels, out_channels, kernel_size,
@@ -792,10 +780,10 @@ def make_conv(bayesian, in_channels, out_channels, kernel_size, stride=1, paddin
     else:
         if WN:
             return weight_norm(nn.Conv1d(in_channels, out_channels, kernel_size,
-                                stride=stride, padding=padding, dilation=dilation))
+                                         stride=stride, padding=padding, dilation=dilation))
         else:
             return nn.Conv1d(in_channels, out_channels, kernel_size,
-                      stride=stride, padding=padding, dilation=dilation)
+                             stride=stride, padding=padding, dilation=dilation)
 
 
 class TemporalBlock(nn.Module):
@@ -955,9 +943,6 @@ def mask_to_causal_attention_mask(mask):
     return attention_mask
 
 
-
-
-
 class ResidualBlock1D(nn.Module):
     """
     Conv1D+Squeeze-Excite+RMSNorm residual block for sequence modeling
@@ -1029,7 +1014,8 @@ class CausalConv1d(nn.Module):
 
 
 class ConvReluNorm(nn.Module):
-    def __init__(self, in_channels, out_channels, kernel_size, dilation=1, normalization='layer', act="aptx", dropout=0.5, causal=True):
+    def __init__(self, in_channels, out_channels, kernel_size, dilation=1, normalization='layer', act="aptx",
+                 dropout=0.5, causal=True):
         super(ConvReluNorm, self).__init__()
         self.causal = causal
 
@@ -1068,7 +1054,8 @@ class ConvReluNorm(nn.Module):
 
 class NeoTCNAttention(nn.Module):
     def __init__(self, num_inputs, num_channels, kernel_size=[2, 2, 2], dropout=0.2, att_dropout=0.3, heads=[2, 2, 2],
-                 alibi_alpha=1.25, start_i_increment=1, dilation_growth="", act="aptx", bayesian=False, integrated=False, conv_att="se"):
+                 alibi_alpha=1.25, start_i_increment=1, dilation_growth="", act="aptx", bayesian=False,
+                 integrated=False, conv_att="se"):
         super(NeoTCNAttention, self).__init__()
 
         self.layers = nn.ModuleList()
@@ -1107,7 +1094,9 @@ class NeoTCNAttention(nn.Module):
                 if num_heads > 0 else nn.Identity()  # append an identity so it still occupies an index i in the list
 
             )
-            self.layers.append(ConvReluNorm(current_channels, out_channels, k_size, dilation_size, act=act, dropout=dropout, causal=False))
+            self.layers.append(
+                ConvReluNorm(current_channels, out_channels, k_size, dilation_size, act=act, dropout=dropout,
+                             causal=False))
 
             current_channels = out_channels  # The output of the current block is the input for the next
 
@@ -1141,7 +1130,7 @@ class NeoTCNAttention(nn.Module):
                 x = x.transpose(1, 2)  # (batch, channels, seq)
 
             x = layer(x, mask)
-        
+
         if self.conv_att is not None:
             x = self.conv_att(x, mask)
 
