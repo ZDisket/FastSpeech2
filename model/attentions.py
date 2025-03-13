@@ -511,7 +511,8 @@ def expand_masks(x_mask, y_mask):
 
 class TransformerEncoderLayer(nn.Module):
     def __init__(self, embed_size, heads, forward_expansion, dropout, alibi_alpha=1.0, start_i_increment=0,
-                 kernel_size=3, act="swiglu", rma_mem_dim=0, conv_att=False, talking_heads=True, coarse_fine=False, dynamic_alibi=False):
+                 kernel_size=3, act="swiglu", rma_mem_dim=0, conv_att=False, talking_heads=True,
+                 coarse_fine=False, dynamic_alibi=False):
         super(TransformerEncoderLayer, self).__init__()
         self.norm1 = nn.LayerNorm(embed_size)
         self.norm2 = nn.LayerNorm(embed_size)
@@ -568,13 +569,137 @@ class TransformerEncoderLayer(nn.Module):
         return x, kv_ret
 
 
+
+class TransformerDecoderLayer(nn.Module):
+    def __init__(self, embed_size, heads, forward_expansion, dropout, alibi_alpha=1.0, start_i_increment=0,
+                 kernel_size=1, act="swiglu", conv_att=False, talking_heads=True, dynamic_alibi=False):
+        super(TransformerDecoderLayer, self).__init__()
+        self.norm1 = nn.LayerNorm(embed_size)
+        self.norm2 = nn.LayerNorm(embed_size)
+        self.norm3 = nn.LayerNorm(embed_size)
+
+        self.attention = MultiHeadAttention(embed_size, heads, alibi_alpha=alibi_alpha,
+                                            start_i_increment=start_i_increment, num_persistent=0,
+                                            rma_inp_dim=0, use_talking_heads=talking_heads,
+                                            dynamic_alibi=dynamic_alibi)
+
+        self.cross_attention = MultiHeadAttention(embed_size, heads, alibi_alpha=alibi_alpha,
+                                            start_i_increment=start_i_increment, num_persistent=0,
+                                            rma_inp_dim=0, use_talking_heads=talking_heads,
+                                            dynamic_alibi=dynamic_alibi)
+
+
+        self.feed_forward = SwiGLUConvFFN(
+            in_features=embed_size,
+            hidden_features=forward_expansion * embed_size,
+            out_features=embed_size,
+            kernel_size=kernel_size,
+            drop=dropout,
+            act=act,
+            conv_att=conv_att,
+        )
+        self.dropout = nn.Dropout(dropout)
+
+    def forward(self, x, y, mask, cross_attn_mask, conv_mask=None):
+        # Primary attention
+        norm_x = self.norm1(x)
+        attn_output = self.attention(norm_x, norm_x, norm_x, mask, None)
+        x = x + self.dropout(attn_output)
+
+        # Cross-attention
+        norm_x = self.norm2(x)
+        cross_attn_output = self.cross_attention(y, y, norm_x, mask=cross_attn_mask)
+        x = x + self.dropout(cross_attn_output)
+
+        # Feed-forward
+        norm_x_ff = self.norm3(x)
+        ff_output = self.feed_forward(norm_x_ff, mask if conv_mask is None else conv_mask)
+        x = x + self.dropout(ff_output)
+
+        return x
+
+
+def make_mask_causal(mask: torch.Tensor) -> torch.Tensor:
+    """
+    Given a self-attention mask of shape (batch_size, 1, seq_length, seq_length)
+    where True indicates a valid (non-padded) token, this function modifies the mask
+    to enforce causality (only allow attending to the current and previous positions),
+    while ensuring that no positions are turned True if they weren't already valid.
+
+    Args:
+        mask (torch.Tensor): Input mask tensor with shape (batch_size, 1, seq_length, seq_length),
+                             where True indicates valid and False indicates padded.
+
+    Returns:
+        torch.Tensor: A new causal mask of the same shape.
+    """
+    batch_size, _, seq_length, _ = mask.shape
+    device = mask.device
+    # Create a causal mask: lower triangular matrix where positions (i,j) are True if j <= i.
+    causal_mask = torch.tril(torch.ones(seq_length, seq_length, dtype=torch.bool, device=device))
+    # Expand causal_mask dimensions to match mask shape: (1, 1, seq_length, seq_length)
+    causal_mask = causal_mask.unsqueeze(0).unsqueeze(0)
+    # Combine the original mask with the causal mask.
+    # Only positions that are valid in the original mask AND allowed by causality remain True.
+    new_mask = mask & causal_mask
+    return new_mask
+
+
+
+
+class TransformerDecoder(nn.Module):
+    def __init__(self, embed_size, heads, num_layers, forward_expansion, dropout, alibi_alpha=1.0, start_i=0
+                 ,act="swiglu", talking_heads=True, dynamic_alibi=False, alibi_scaling_fac=None):
+        super(TransformerDecoder, self).__init__()
+        self.use_conv_att = False
+        if alibi_scaling_fac is None:
+            alibi_scaling_fac = heads // 2
+
+
+        # Our design is coarse fine attention for all layers except the first.
+        coarse_fine_vec = [self.coarse_fine] * num_layers
+        # if coarse_fine=True, this will be all True except for the first layer (what we want)
+        coarse_fine_vec[0] = False
+
+        self.encoder_layers = nn.ModuleList([  # Layer-Scaled ALiBi
+            TransformerDecoderLayer(embed_size, heads, forward_expansion, dropout, alibi_alpha=alibi_alpha,
+                                    start_i_increment=start_i + ((i * heads) // alibi_scaling_fac), kernel_size=1, act=act
+                                    ,talking_heads=talking_heads,
+                                    dynamic_alibi=dynamic_alibi)
+            for i in range(num_layers)
+        ])
+
+
+    def forward(self, x, y, mask, cross_attn_mask, conv_mask=None):
+        """
+        Args:
+            x: Input tensor of shape (batch_size, seq_length, embed_size).
+            y: Input tensor of shape (batch_size, seq_2_length, embed_size)
+            mask: Mask tensor of shape (batch_size, 1, seq_length, seq_length) or similar.
+            cross_attn_mask: Mask tensor of shape (batch_size, 1, seq_length, seq_2_length)
+            conv_mask: Convolutional mask size (batch, 1, seq_length) where True is padded and False is valid
+
+            Note: mask does not need to be causal, this call automatically does that.
+        Returns:
+            The output of the last encoder layer.
+        """
+        mask = make_mask_causal(mask)
+
+        for i, layer in enumerate(self.encoder_layers):
+            x, current_kv = layer(x, y, mask, cross_attn_mask, conv_mask)  # Here x serves as query, key, and value
+
+
+        return x
+
 class TransformerEncoder(nn.Module):
     def __init__(self, embed_size, heads, num_layers, forward_expansion, dropout, alibi_alpha=1.0, start_i=0,
                  kernel_size=3, act="swiglu", rma_mem_dim=0, conv_att=False, multi_scale=False, talking_heads=True, coarse_fine=False,
-                 dynamic_alibi=False):
+                 dynamic_alibi=False, alibi_scaling_fac=None):
         super(TransformerEncoder, self).__init__()
         self.use_conv_att = conv_att
         self.coarse_fine = coarse_fine
+        if alibi_scaling_fac is None:
+            alibi_scaling_fac = heads // 2
 
         # Our design is coarse fine attention for all layers except the first.
         coarse_fine_vec = [self.coarse_fine] * num_layers
@@ -583,7 +708,7 @@ class TransformerEncoder(nn.Module):
 
         self.encoder_layers = nn.ModuleList([  # Layer-Scaled ALiBi
             TransformerEncoderLayer(embed_size, heads, forward_expansion, dropout, alibi_alpha=alibi_alpha,
-                                    start_i_increment=start_i + (i * heads), kernel_size=[kernel_size[i], 1] if multi_scale else kernel_size, act=act,
+                                    start_i_increment=start_i + ((i * heads) // alibi_scaling_fac), kernel_size=[kernel_size[i], 1] if multi_scale else kernel_size, act=act,
                                     rma_mem_dim=rma_mem_dim, conv_att=self.use_conv_att and i == num_layers - 1, talking_heads=talking_heads, coarse_fine=coarse_fine_vec[i],
                                     dynamic_alibi=dynamic_alibi)
             for i in range(num_layers)

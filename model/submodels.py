@@ -2,7 +2,7 @@ import torch
 import torch.nn as nn
 from .attentions import TransformerEncoder, TemporalConvNet, MultiHeadAttention, \
     mask_to_causal_attention_mask, TransposeLayerNorm, AttentionPooling, APTxS1, APTx, SwiGLUConvFFN, NeoTCNAttention, \
-    ConvReluNorm
+    ConvReluNorm, TransformerDecoder
 from torch.nn.utils.rnn import pack_padded_sequence, pad_packed_sequence
 import torch.nn.functional as F
 from .attblocks import CBAM2d, MaskedSEBlock1D, CBAM1D
@@ -507,6 +507,154 @@ class TemporalVariancePredictor(nn.Module):
             x = x.masked_fill(x_mask.squeeze(1), 0.0)
 
         return x
+
+
+class DecoderPrenet(nn.Module):
+    """
+    Tacotron2-style decoder prenet.
+
+    This prenet applies a sequence of linear layers followed by ReLU activations
+    and dropout. Dropout is applied even during inference.
+
+    Args:
+        in_dim (int): Dimensionality of the input features.
+        sizes (list of int): List of output sizes for each linear layer.
+        dropout (float): Dropout probability.
+    """
+
+    def __init__(self, in_dim, sizes=[256, 256], dropout=0.5):
+        super(DecoderPrenet, self).__init__()
+        self.dropout = dropout
+        self.layers = nn.ModuleList()
+        prev_size = in_dim
+        for size in sizes:
+            self.layers.append(nn.Linear(prev_size, size))
+            prev_size = size
+
+    def forward(self, x, x_mask):
+        """
+        Forward pass for the prenet.
+
+        Args:
+            x (torch.Tensor): Input tensor of shape (B, L, in_dim) or (B, in_dim).
+            x_mask: Mask for x shape (B, L, 1)
+        Returns:
+            torch.Tensor: Processed tensor.
+        """
+        for linear in self.layers:
+            x = F.relu(linear(x).masked_fill(x_mask, 0))
+            # Force dropout to be active at all times by setting training=True.
+            x = F.dropout(x, p=self.dropout, training=True)
+        return x
+
+
+
+class SpectrogramDecoderAR(nn.Module):
+    def __init__(self, mel_channels, filter_channels, depth, heads, dropout=0.1,
+                 alibi_alpha=1.0, forward_expansion=4):
+        super(SpectrogramDecoderAR, self).__init__()
+
+        self.filter_channels = filter_channels
+        self.mel_channels = mel_channels
+
+        self.prenet = DecoderPrenet(mel_channels, [filter_channels, filter_channels])
+
+        self.dec = TransformerDecoder(filter_channels, heads=heads, num_layers=depth,
+                                      forward_expansion=forward_expansion, dropout=dropout,
+                                      alibi_alpha=alibi_alpha, start_i=0, act="relugt", talking_heads=True,
+                                      dynamic_alibi=True)
+
+        self.mel_proj = nn.Linear(filter_channels, mel_channels)
+        self.gate_proj = nn.Linear(filter_channels, 1) # no sigmoid, we use BCEWithLogitsLoss
+
+
+    def forward(self, x, x_mask, y, y_mask):
+        """
+        Forward pass, decode mel spectrogram
+
+        :param x: Melspectrogram size (batch, mel_len, mel_channels)
+        :param x_mask: True=padded mask size (batch, mel_lens)
+        :param y: Text hidden states size (batch, text_len, text_channels)
+        :param y_mask: True=padded mask size (batch, text_lens)
+
+        :return: Mel pred (batch, mel_len, mel_channels); gate (batch, mel_len, 1)
+        """
+        x_mask_b = x_mask.bool()
+
+        lin_x_mask = x_mask_b.unsqueeze(-1) # (B, L, 1)
+        conv_x_mask = x_mask_b.unsqueeze(1) # (B, 1, L)
+
+        sa_mask = mask_to_attention_mask(conv_x_mask)
+        ca_mask = expand_masks(x_mask_b,
+                               y_mask.bool())
+
+        x = self.prenet(x, lin_x_mask)
+
+        x = self.dec(x, y, sa_mask, ca_mask, conv_x_mask)
+
+        mel, gate = self.mel_proj(x), self.gate_proj(x)
+
+        return mel, gate
+
+    def infer(self, y, y_mask, max_length=1000, gate_threshold=0.5):
+        """
+        Autoregressive inference function.
+
+        Args:
+            y (torch.Tensor): Encoded text features of shape (B, text_len, text_channels).
+            y_mask (torch.Tensor): Boolean mask of shape (B, text_len) where True indicates padded.
+            max_length (int): Maximum number of decoder steps.
+            gate_threshold (float): Threshold on gate prediction to stop decoding.
+
+        Returns:
+            mel_outputs (torch.Tensor): Generated mel spectrogram of shape (B, mel_len, mel_channels).
+            gate_outputs (torch.Tensor): Gate predictions for each frame (B, mel_len, 1).
+        """
+        B = y.size(0)
+        device = y.device
+
+        # Initialize mel spectrogram with a single "go" frame: zeros.
+        # Shape: (B, 1, mel_channels)
+        decoder_input = torch.zeros(B, 1, self.mel_channels, device=device)
+
+        # To store all predictions
+        mel_outputs = []
+        gate_outputs = []
+
+        # A flag to indicate which examples have finished decoding.
+        finished = torch.zeros(B, dtype=torch.bool, device=device)
+
+        for t in range(max_length):
+            current_length = decoder_input.size(1)
+            # In autoregressive inference, no positions are padded so x_mask is all False.
+            x_mask = torch.zeros(B, current_length, dtype=torch.bool, device=device)
+
+            # Run forward pass to get predictions for the current sequence.
+            mel_pred, gate_pred = self.forward(decoder_input, x_mask, y, y_mask)
+            # mel_pred: (B, current_length, mel_channels)
+            # gate_pred: (B, current_length, 1)
+
+            # Get the last time-step's predictions.
+            last_mel = mel_pred[:, -1:, :]   # shape: (B, 1, mel_channels)
+            last_gate = gate_pred[:, -1, :]    # shape: (B, 1)
+
+            mel_outputs.append(last_mel)
+            gate_outputs.append(last_gate)
+
+            # Append the last mel frame to the decoder input for the next step.
+            decoder_input = torch.cat([decoder_input, last_mel], dim=1)
+
+            # Check which examples have predicted a gate value exceeding the threshold.
+            finished = finished | (last_gate.squeeze(1) > gate_threshold)
+            # If all sequences are finished, stop inference.
+            if finished.all():
+                break
+
+        # Concatenate all predicted mel frames along time.
+        # Note that the first frame (initial zero "go" frame) is removed.
+        mel_outputs = torch.cat(mel_outputs, dim=1)  # shape: (B, mel_len, mel_channels)
+        gate_outputs = torch.cat(gate_outputs, dim=1)  # shape: (B, mel_len, 1)
+        return mel_outputs, gate_outputs
 
 
 class SpectrogramDecoder(nn.Module):
