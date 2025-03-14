@@ -598,7 +598,7 @@ class SturmLoss(nn.Module):
             gate_loss: Scalar BCE loss for the gate prediction.
         """
         mel_pred, gate_pred, text_mask, mel_mask = model_out
-        mels_target = batch[3]  # (B, T, mel_dim)
+        mels_target = batch[5]  # (B, T, mel_dim)
         mel_lens = batch[4]  # (B,)
 
         # Create a valid mask for mel loss: invert mel_mask (assumed to be True for padded)

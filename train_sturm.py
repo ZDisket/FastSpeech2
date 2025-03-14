@@ -32,6 +32,13 @@ def weights_init_he(m):
 
 from torch.optim.lr_scheduler import LRScheduler
 
+def supports_native_bf16(device_index=0):
+    # Get the compute capability of the GPU.
+    major, minor = torch.cuda.get_device_capability(device_index)
+    # NVIDIA Ampere GPUs (and newer) have compute capability 8.0 or higher.
+    return major >= 8
+
+
 class WarmupExponentialLR(LRScheduler):
     def __init__(self, optimizer, gamma, warmup_steps, last_epoch=-1):
         self.gamma = gamma
@@ -85,22 +92,16 @@ def main(args, configs):
     if len(args.pretrained):
         load_pretrained_weights(model, args.pretrained)
 
-    disc_config = model_config["discriminator"]
+    encoder_param = get_param_num(model.encoder)
+    decoder_param = get_param_num(model.decoder)
+    total_param = get_param_num(model)
 
-
-    if args.restore_step:
-        ckpt_path = os.path.join(
-            train_config["path"]["ckpt_path"],
-            "D_{}.pth.tar".format(args.restore_step),
-        )
-        ckpt = torch.load(ckpt_path)
-
-
+    print("Number of Encoder Parameters: {:.2f}M".format(encoder_param / 1e6))
+    print("Number of Decoder Parameters: {:.2f}M".format(decoder_param / 1e6))
+    print("Total Number of Sturmschlag Parameters: {:.2f}M".format(total_param / 1e6))
 
     model = nn.DataParallel(model)
-    num_param = get_param_num(model)
     Loss = SturmLoss(8.0).to(device)
-    print("Number of Sturmchlag Parameters:", num_param)
 
     # Load vocoder
     vocoder = get_vocoder(model_config, device)
@@ -135,10 +136,12 @@ def main(args, configs):
     outer_bar.n = args.restore_step
     outer_bar.update()
 
-    mp_dtype = torch.float16
-    if torch.cuda.is_bf16_supported():
-        print("Current GPU supports BF16. Using instead of fp16...")
+    if supports_native_bf16(device):
+        print("GPU natively supports BF16. Using BF16...")
         mp_dtype = torch.bfloat16
+    else:
+        print("GPU does NOT natively support BF16. Using FP16 instead...")
+        mp_dtype = torch.float16
 
 
 
@@ -222,9 +225,9 @@ def main(args, configs):
                     )
 
                     attn_weights = model.module.decoder.dec.decoder_layers[-1].last_weights # (B, H, L1, L2)
-                    attn_soft = attn_weights.mean(dim=1).detach().cpu().numpy()
+                    attn_soft = attn_weights.mean(dim=1).detach().cpu()
 
-                    log_attention_maps(train_logger, attn_soft,
+                    log_attention_maps(train_logger, attn_soft.transpose(1,2),
                                        batch[6].detach().cpu().numpy(), batch[4].detach().cpu().numpy(),
                                        step, tag_prefix="Training")
 
