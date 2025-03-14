@@ -46,7 +46,7 @@ device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 from text import text_to_sequence, sequence_to_text, cleaned_text_to_sequence
 
 
-def to_device(data, device):
+def to_device(data, device, reduced=False):
     if len(data) == 11 + 3:
         (
             ids,
@@ -65,15 +65,30 @@ def to_device(data, device):
             emotion_lens,
         ) = data
 
+        # For both modes, convert the items that will be used
         speakers = torch.from_numpy(speakers).long().to(device)
         texts = torch.from_numpy(texts).long().to(device)
         src_lens = torch.from_numpy(src_lens).to(device)
         mels = torch.from_numpy(mels).float().to(device)
         mel_lens = torch.from_numpy(mel_lens).to(device)
+        emotion_hiddens = torch.from_numpy(emotion_hiddens).to(device)
+
+        if reduced:
+            return (
+                ids,
+                raw_texts,
+                speakers,
+                texts,
+                src_lens,
+                mels,
+                mel_lens,
+                emotion_hiddens
+            )
+
+        # Only create these if not reduced
         pitches = torch.from_numpy(pitches).float().to(device)
         energies = torch.from_numpy(energies).to(device)
         emotion_blocks = torch.from_numpy(emotion_blocks).to(device)
-        emotion_hiddens = torch.from_numpy(emotion_hiddens).to(device)
         emotion_lens = torch.from_numpy(emotion_lens).to(device)
 
         return (
@@ -142,17 +157,22 @@ def log(
     logger, step=None, losses=None, fig=None, audio=None, sampling_rate=22050, tag=""
 ):
     if losses is not None:
-        logger.add_scalar("Loss/total_loss", losses[0], step)
-        logger.add_scalar("Loss/mel_loss", losses[1], step)
-        logger.add_scalar("Loss/mel_postnet_loss", losses[2], step)
-        logger.add_scalar("Loss/pitch_loss", losses[3], step)
-        logger.add_scalar("Loss/energy_loss", losses[4], step)
-        logger.add_scalar("Loss/duration_loss", losses[5], step)
-        logger.add_scalar("Loss/attention_loss", losses[6], step)
-        logger.add_scalar("Loss/duration_temporal_loss", losses[7], step)
-        logger.add_scalar("Loss/total_temporal_loss", losses[8], step)
-        logger.add_scalar("Loss/duration_kl_loss", losses[9], step)
-        logger.add_scalar("Loss/pitch_energy_kl_loss", losses[10], step)
+        if len(losses) == 3: #Sturmschlag
+            logger.add_scalar("Loss/total_loss", losses[0], step)
+            logger.add_scalar("Loss/mel_loss", losses[1], step)
+            logger.add_scalar("Loss/gate_loss", losses[2], step)
+        else: #FastSpeech2
+            logger.add_scalar("Loss/total_loss", losses[0], step)
+            logger.add_scalar("Loss/mel_loss", losses[1], step)
+            logger.add_scalar("Loss/mel_postnet_loss", losses[2], step)
+            logger.add_scalar("Loss/pitch_loss", losses[3], step)
+            logger.add_scalar("Loss/energy_loss", losses[4], step)
+            logger.add_scalar("Loss/duration_loss", losses[5], step)
+            logger.add_scalar("Loss/attention_loss", losses[6], step)
+            logger.add_scalar("Loss/duration_temporal_loss", losses[7], step)
+            logger.add_scalar("Loss/total_temporal_loss", losses[8], step)
+            logger.add_scalar("Loss/duration_kl_loss", losses[9], step)
+            logger.add_scalar("Loss/pitch_energy_kl_loss", losses[10], step)
         if len(losses) > 11:
             logger.add_scalar("Loss/dur_discriminator_loss", losses[11], step)
             logger.add_scalar("Loss/dur_gan_loss", losses[12], step)
@@ -238,6 +258,64 @@ def synth_one_sample(targets, predictions, vocoder, model_config, preprocess_con
         wav_reconstruction = wav_prediction = None
 
     return fig, wav_reconstruction, wav_prediction, basename, attn_soft
+
+
+def synth_one_sample_st(targets, predictions, vocoder, model_config, preprocess_config):
+    """
+    Synthesize one sample for logging using Sturmschlag.
+
+    Args:
+        targets (tuple): (ids, raw_texts, speakers, texts, src_lens, mels, mel_lens, emotion_hiddens)
+        predictions (tuple): (mel, gate, text_mask, mel_mask)
+        vocoder: Vocoder model to reconstruct waveform.
+        model_config: Model configuration.
+        preprocess_config: Preprocessing configuration.
+
+    Returns:
+        fig: The plotted mel spectrogram figure.
+        wav_reconstruction: Waveform reconstructed from the ground-truth mel.
+        wav_prediction: Waveform reconstructed from the predicted mel.
+        basename: Identifier from the sample.
+    """
+    # Get the basename (e.g., file identifier)
+    basename = targets[0][0]
+
+    # Use mel length from targets (index 6)
+    mel_len = targets[6][0].item()
+
+    # Ground truth mel is at index 5 and predicted mel is at predictions index 0.
+    # Transpose to (mel_channels, time) for visualization.
+    mel_target = targets[5][0, :mel_len].detach().transpose(0, 1)
+    mel_prediction = predictions[0][0, :mel_len].detach().transpose(0, 1)
+
+    # Plot only the mel spectrograms.
+    # Here we use the simplified plot_mel function (that only plots mel) defined elsewhere.
+    fig = plot_mel_only(
+        [mel_prediction.cpu().numpy(), mel_target.cpu().numpy()],
+        titles=["Synthetized Spectrogram", "Ground-Truth Spectrogram"]
+    )
+
+    # Run vocoder inference if a vocoder is provided.
+    if vocoder is not None:
+        from .model import vocoder_infer
+
+        wav_reconstruction = vocoder_infer(
+            mel_target.unsqueeze(0),
+            vocoder,
+            model_config,
+            preprocess_config,
+        )[0]
+        wav_prediction = vocoder_infer(
+            mel_prediction.unsqueeze(0),
+            vocoder,
+            model_config,
+            preprocess_config,
+        )[0]
+    else:
+        wav_reconstruction = None
+        wav_prediction = None
+
+    return fig, wav_reconstruction, wav_prediction, basename
 
 
 def synth_samples(targets, predictions, vocoder, model_config, preprocess_config, path):
@@ -340,6 +418,30 @@ def plot_mel(data, stats, titles):
 
     return fig
 
+
+def plot_mel_only(data, titles=None):
+    """
+    Plots mel spectrograms.
+
+    Args:
+        data (list): A list where each element is a mel spectrogram array (2D).
+        titles (list, optional): A list of titles for each plot. Defaults to None.
+
+    Returns:
+        fig: A matplotlib figure containing the plotted mel spectrograms.
+    """
+    fig, axes = plt.subplots(len(data), 1, squeeze=False)
+    if titles is None:
+        titles = [None for _ in range(len(data))]
+
+    for i in range(len(data)):
+        mel = data[i]
+        axes[i][0].imshow(mel, origin="lower", aspect="auto")
+        axes[i][0].set_aspect("auto")
+        axes[i][0].set_title(titles[i], fontsize="medium")
+        axes[i][0].tick_params(labelsize="x-small", left=False, labelleft=False)
+
+    return fig
 
 def pad_zephyr_outputs(hidden_blocks_list):
     """

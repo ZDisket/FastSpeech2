@@ -68,6 +68,18 @@ class Sturmschlag(nn.Module):
             mel_lens,
             em_hidden=None,
     ):
+        """
+        Forward pass of Sturmschlag, training. For inference see .infer()
+        :param speakers: Int tensor size (batch,), speaker IDs. Can pass None if not multi speaker
+        :param texts: Int tensor size (batch, text_len), phoneme IDs
+        :param src_lens: Int tensor size (batch,), text lengths
+        :param mels: Float tensor size (batch, mel_len, mel_channels), mel spectrograms
+        :param mel_lens: Int tensor size (batch,), mel lengths
+        :param em_hidden: Float tensor size (batch, bert_hidden), pooled BERT embeds
+
+        :return: Tuple mel: (batch, mel_len, mel_channels), gate: (batch, mel_len, 1)
+                (text_mask: True=padded (batch, text_len), mel_mask (batch, mel_len)
+        """
 
         # (batch, 1, spk_channels)
         spk_emb = self.speaker_emb(speakers).unsqueeze(1) if self.speaker_emb is not None else torch.zeros(1)
@@ -128,4 +140,6 @@ class Sturmschlag(nn.Module):
                                            gate_threshold=gate_threshold)
 
         return mel, gate
+
+
 

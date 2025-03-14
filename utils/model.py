@@ -5,7 +5,7 @@ import torch
 import numpy as np
 
 import hifigan
-from model import FastSpeech2, ScheduledOptim, AdEMAMix
+from model import FastSpeech2, ScheduledOptim, AdEMAMix, Sturmschlag
 from istftnetfe import ISTFTNetFE
 
 def load_pretrained_weights(model, pretrained_path):
@@ -35,10 +35,14 @@ def load_pretrained_weights(model, pretrained_path):
     model.load_state_dict(model_dict, strict=False)
 
 
-def get_model(args, configs, device, train=False):
+def get_model(args, configs, device, train=False, model="fs"):
     (preprocess_config, model_config, train_config) = configs
 
-    model = FastSpeech2(preprocess_config, model_config).to(device)
+    if model == "fs":
+        model = FastSpeech2(preprocess_config, model_config).to(device)
+    elif model == "st":
+        model = Sturmschlag(preprocess_config, model_config).to(device)
+
     if args.restore_step:
         ckpt_path = os.path.join(
             train_config["path"]["ckpt_path"],
@@ -61,6 +65,7 @@ def get_model(args, configs, device, train=False):
     model.eval()
     model.requires_grad_ = False
     return model
+
 
 
 def get_param_num(model):

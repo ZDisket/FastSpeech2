@@ -1,0 +1,20 @@
+transformer:
+  encoder_layer: 6
+  encoder_head: 8
+  encoder_hidden: 256
+  decoder_layer: 6
+  decoder_head: 8
+  decoder_hidden: 256
+  encoder_dropout: 0.1
+  decoder_dropout: 0.1
+  encoder_kernel_sizes: [3, 3, 3, 3, 3, 5]
+
+multi_speaker: False
+speaker_channels: 0
+aligner: "mas"
+mas_channels: 256
+em_enc_sizes: [312, 128, 64, 16]
+
+vocoder:
+  model: "iSTFTNet"
+  speaker: "LJSpeech"

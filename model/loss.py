@@ -486,3 +486,144 @@ class FastSpeech3Loss(nn.Module):
             kl_pitch_energy,
         )
         return list(ret)
+
+
+class MaskedMAE(nn.Module):
+    """
+    A masked regression loss that can switch between MAE, MSE, and Charbonnier losses.
+
+    Args:
+        loss_type (str): One of 'mae', 'mse', or 'charbonnier'. Determines which loss to use.
+        epsilon (float): Small constant used in the Charbonnier loss. Default is 1e-6.
+    """
+
+    def __init__(self, loss_type="mae", epsilon=1e-6):
+        super(MaskedMAE, self).__init__()
+        if loss_type not in ["mae", "mse", "charbonnier"]:
+            raise ValueError("loss_type must be one of 'mae', 'mse', or 'charbonnier'")
+        self.loss_type = loss_type
+        self.epsilon = epsilon
+
+    def forward(self, pred, target, mask):
+        """
+        Args:
+            pred: Tensor of shape (B, T, mel_dim) containing predictions.
+            target: Tensor of shape (B, T, mel_dim) containing ground truth values.
+            mask: Float Tensor of shape (B, T, 1) with 1.0 for valid positions and 0.0 for padded positions.
+
+        Returns:
+            Scalar loss normalized by the number of valid (non-padded) elements.
+        """
+        error = pred - target
+
+        if self.loss_type == "mae":
+            loss = torch.abs(error)
+        elif self.loss_type == "mse":
+            loss = error ** 2
+        elif self.loss_type == "charbonnier":
+            loss = torch.sqrt(error ** 2 + self.epsilon ** 2)
+        else:
+            raise ValueError("Unsupported loss_type: {}".format(self.loss_type))
+
+        loss = loss * mask
+        total_loss = loss.sum() / mask.sum()
+        return total_loss
+
+class MaskedBCE(nn.Module):
+    """
+    Computes Binary Cross Entropy loss with logits on a per-element basis,
+    masking out the padded positions. A positive weight is applied to handle class imbalance.
+    """
+    def __init__(self, pos_weight=8.0):
+        super(MaskedBCE, self).__init__()
+        # pos_weight must be a tensor and registered so that it moves with the model.
+        self.register_buffer('pos_weight', torch.tensor(pos_weight))
+        self.bce_loss = nn.BCEWithLogitsLoss(reduction='none', pos_weight=self.pos_weight)
+
+    def forward(self, pred, target, mask):
+        """
+        Args:
+            pred: Tensor of shape (B, T), logits for the gate prediction.
+            target: Tensor of shape (B, T), where 1 indicates the stop token.
+            mask: Float Tensor of shape (B, T) with 1.0 for valid positions, 0.0 for padded.
+        Returns:
+            Scalar BCE loss normalized by the number of valid elements.
+        """
+        loss = self.bce_loss(pred, target)  # (B, T)
+        loss = loss * mask
+        total_loss = loss.sum() / mask.sum()
+        return total_loss
+
+
+class SturmLoss(nn.Module):
+    """
+    Loss function for the TTS model (Sturmschlag) that computes:
+      - MAE loss (L1 loss) for the mel spectrogram, using a mask to ignore padded positions.
+      - Gate loss using BCEWithLogitsLoss (with a positive weight of 8.0) for the stop token prediction,
+        again masked over the valid frames.
+
+    The expected input from the model's forward pass is a tuple:
+        (mel_pred, gate_pred, text_mask, mel_mask)
+    And the batch tuple is assumed to be:
+        (speakers, texts, src_lens, mels, mel_lens, em_hidden)
+    where:
+        - mel_pred: Predicted mel spectrogram, shape (B, T, mel_dim)
+        - gate_pred: Predicted gate logits, shape (B, T, 1)
+        - mel_mask: Boolean mask (B, T), where True indicates padded positions.
+        - mels: Ground truth mel spectrogram, shape (B, T, mel_dim)
+        - mel_lens: Actual lengths of each mel sequence (B,)
+    """
+
+    def __init__(self, pos_weight=8.0, mel_regression="mae"):
+        super(SturmLoss, self).__init__()
+        self.masked_mae = MaskedMAE(mel_regression)
+        self.masked_bce = MaskedBCE(pos_weight=pos_weight)
+
+    def forward(self, batch, model_out):
+        """
+        Args:
+            model_out (tuple): Contains:
+                mel_pred: Predicted mel spectrogram, shape (B, T, mel_dim)
+                gate_pred: Predicted gate logits, shape (B, T, 1)
+                text_mask: Mask for text (unused in loss computation)
+                mel_mask: Bool Tensor of shape (B, T), where True indicates padded positions.
+            batch (tuple): Contains:
+                speakers, texts, src_lens, mels, mel_lens, em_hidden
+                - mels: Ground truth mel spectrogram, shape (B, T, mel_dim)
+                - mel_lens: Tensor of shape (B,) containing the actual mel lengths.
+
+        Returns:
+            total_loss: Sum of mel loss and gate loss.
+            mel_loss: Scalar MAE loss for the mel spectrogram.
+            gate_loss: Scalar BCE loss for the gate prediction.
+        """
+        mel_pred, gate_pred, text_mask, mel_mask = model_out
+        mels_target = batch[3]  # (B, T, mel_dim)
+        mel_lens = batch[4]  # (B,)
+
+        # Create a valid mask for mel loss: invert mel_mask (assumed to be True for padded)
+        valid_mel_mask = (~mel_mask).unsqueeze(-1).float()  # (B, T, 1)
+        mel_loss = self.masked_mae(mel_pred, mels_target, valid_mel_mask)
+
+        # Build the gate target vectorized:
+        B, T, _ = gate_pred.size()
+        # Create a time index tensor: shape (B, T)
+        time_idx = torch.arange(T, device=gate_pred.device).unsqueeze(0).expand(B, T)
+        # For each sample, mark the last valid time step (mel_lens - 1) as the stop token (1), others 0.
+        gate_target = (time_idx == (mel_lens - 1).unsqueeze(1)).float()  # (B, T)
+
+        # Squeeze gate_pred from (B, T, 1) to (B, T)
+        gate_pred = gate_pred.squeeze(-1)
+        # Create a valid mask for gate loss: same as mel, but shape (B, T)
+        valid_gate_mask = (~mel_mask).float()
+        gate_loss = self.masked_bce(gate_pred, gate_target, valid_gate_mask)
+
+        total_loss = mel_loss + gate_loss
+
+        ret = (
+            total_loss,
+            mel_loss,
+            gate_loss,
+        )
+
+        return list(ret)

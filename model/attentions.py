@@ -590,6 +590,7 @@ class TransformerDecoderLayer(nn.Module):
             act=act,
             conv_att=conv_att,
         )
+        self.last_weights = None
         self.dropout = nn.Dropout(dropout)
 
     def forward(self, x, y, mask, cross_attn_mask, conv_mask=None):
@@ -600,13 +601,16 @@ class TransformerDecoderLayer(nn.Module):
 
         # Cross-attention
         norm_x = self.norm2(x)
-        cross_attn_output = self.cross_attention(y, y, norm_x, mask=cross_attn_mask)
+        cross_attn_output, cross_attn_weights = self.cross_attention(y, y, norm_x, mask=cross_attn_mask, return_weights=True)
         x = x + self.dropout(cross_attn_output)
 
         # Feed-forward
         norm_x_ff = self.norm3(x)
         ff_output = self.feed_forward(norm_x_ff, mask if conv_mask is None else conv_mask)
         x = x + self.dropout(ff_output)
+
+        # cache last attn weights
+        self.last_weights = cross_attn_weights
 
         return x
 
@@ -645,7 +649,7 @@ class TransformerDecoder(nn.Module):
         if alibi_scaling_fac is None:
             alibi_scaling_fac = heads // 2
 
-        self.encoder_layers = nn.ModuleList([  # Layer-Scaled ALiBi
+        self.decoder_layers = nn.ModuleList([  # Layer-Scaled ALiBi
             TransformerDecoderLayer(embed_size, heads, forward_expansion, dropout, alibi_alpha=alibi_alpha,
                                     start_i_increment=start_i + ((i * heads) // alibi_scaling_fac), kernel_size=1,
                                     act=act
@@ -669,7 +673,7 @@ class TransformerDecoder(nn.Module):
         """
         mask = make_mask_causal(mask)
 
-        for i, layer in enumerate(self.encoder_layers):
+        for i, layer in enumerate(self.decoder_layers):
             x = layer(x, y, mask, cross_attn_mask, conv_mask)  # Here x serves as query, key, and value
 
         return x
