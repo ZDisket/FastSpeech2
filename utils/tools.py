@@ -144,13 +144,13 @@ def log_attention_maps(logger, attention_tensor, widths, heights, step, tag_pref
         im = ax.imshow(attention_map, cmap='viridis', interpolation='nearest')
         # Adjust colorbar size by changing fraction and pad
         plt.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
-        plt.title(f'Attention Map {i + 1}')
-        plt.xlabel('Decoder Timestep')
-        plt.ylabel('Encoder Timestep')
+        plt.title(f'')
+        plt.xlabel('Dec T')
+        plt.ylabel('Enc T')
         plt.close(fig)  # Close the figure to prevent it from displaying
 
         # Log the figure to TensorBoard
-        logger.add_figure(f"{tag_prefix}/f{chart_title} {i + 1}", fig, global_step=step)
+        logger.add_figure(f"{tag_prefix}/{chart_title} {i + 1}", fig, global_step=step)
 
 
 def log(

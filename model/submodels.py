@@ -631,6 +631,9 @@ class SpectrogramDecoderAR(nn.Module):
         finished = torch.zeros(B, dtype=torch.bool, device=device)
 
         for t in range(max_length):
+            if t == max_length - 1:
+                print("Warning! Reached max decoder steps.")
+
             current_length = decoder_input.size(1)
             # In autoregressive inference, no positions are padded so x_mask is all False.
             x_mask = torch.zeros(B, current_length, dtype=torch.bool, device=device)

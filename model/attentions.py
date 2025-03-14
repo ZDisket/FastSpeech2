@@ -192,6 +192,7 @@ class SwiGLUConvFFN(nn.Module):
         self.has_gating = act in ["swiglu", "relugtz"]
 
         # In a test I found out that nn.Linear is 19% faster than Conv1D with kernel size 1
+        # (probably because it calls some special CUDA kernel)
         # so this is worth the extra complexity
         if kernel_size[0] == 1 and kernel_size[1] == 1:
             expand = 2 * hidden_features if self.has_gating else hidden_features
@@ -202,9 +203,12 @@ class SwiGLUConvFFN(nn.Module):
             conv_att = False
         else:
             self.conv1 = nn.Conv1d(in_features, hidden_features, kernel_size[0], bias=bias)
+
             # Efficient gating: Instead of doubling the expansion like in normal FFNs which can be expensive
             # for convs, we keep a separate gate_proj which is dense.
-            self.gate_proj = nn.Linear(in_features, hidden_features, bias=bias)
+            if self.has_gating:
+                self.gate_proj = nn.Linear(in_features, hidden_features, bias=bias)
+
 
             self.conv2 = nn.Conv1d(hidden_features, out_features, kernel_size[1], bias=bias)
 

@@ -20,7 +20,7 @@ from torch.cuda.amp import GradScaler, autocast
 from bertfe import BERTFrontEnd
 from preprocessor.emotion import EmotionProcessorV2
 
-from evaluate import evaluate
+from evaluate import evaluate_st
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
@@ -246,7 +246,7 @@ def main(args, configs):
 
                 if step % val_step == 0:
                     model.eval()
-                    message = evaluate(model, step, configs, val_logger, vocoder, epoch)
+                    message = evaluate_st(model, step, configs, val_logger, vocoder, epoch)
                     with open(os.path.join(val_log_path, "log.txt"), "a") as f:
                         f.write(message + "\n")
                     outer_bar.write(message)

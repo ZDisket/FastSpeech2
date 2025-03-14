@@ -3,14 +3,14 @@ path:
   log_path: "./output/log/LJSpeech"
   result_path: "./output/result/LJSpeech"
 optimizer:
-  batch_size: 32
+  batch_size: 16
   betas: [0.9, 0.98]
-  init_lr: 0.0002
+  init_lr: 0.0001
   gamma: 0.9998
   eps: 0.000000001
   weight_decay: 0.0
   grad_clip_thresh: 1.0
-  grad_acc_step: 2
+  grad_acc_step: 4
   warm_up_step: 4000
   anneal_steps: [300000, 400000, 500000]
   anneal_rate: 0.3
@@ -19,13 +19,21 @@ optimizer:
 step:
   total_step: 900000
   log_step: 100
-  synth_step: 1000
-  val_step: 1000
+  synth_step: 500
+  val_step: 500
   save_step: 10000
 
 disc:
   start_step: 5000
   lr: 0.00001
 
+test_speakers:
+  - 0
+test_sentences:
+  - "The quick brown fox jumps over the lazy dog, while the sun sets over the peaceful valley"
+  - "When I visited Rome, the capital of Italy, I saw the Colosseum, the Vatican, and St. Peter's Basilica"
+  - "Even though John loves chocolate, strawberries, and ice cream, he decided to try the vanilla cake instead"
+  - "Peter Piper picked a peck of pickled peppers, how many pickled peppers did Peter Piper pick?"
+  - "Now I see. Black human beings dislike the sound of rubbing glass probably the sound wave of the whistle"
 
 mel_regression: "mse" # for sturmschlag, can use mse, mae, or charbonnier
