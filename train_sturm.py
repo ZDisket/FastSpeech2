@@ -101,7 +101,7 @@ def main(args, configs):
     print("Total Number of Sturmschlag Parameters: {:.2f}M".format(total_param / 1e6))
 
     model = nn.DataParallel(model)
-    Loss = SturmLoss(8.0).to(device)
+    Loss = SturmLoss(8.0, train_config["mel_regression"]).to(device)
 
     # Load vocoder
     vocoder = get_vocoder(model_config, device)
@@ -224,12 +224,25 @@ def main(args, configs):
                         tag="Training/step_{}_{}_synthesized".format(step, tag),
                     )
 
-                    attn_weights = model.module.decoder.dec.decoder_layers[-1].last_weights # (B, H, L1, L2)
-                    attn_soft = attn_weights.mean(dim=1).detach().cpu()
+
+                    attn_weights = model.module.decoder.dec.decoder_layers[0].last_weights # (B, H, L1, L2)
+                    B = attn_weights.shape[0]
+
+                    attn_soft = attn_weights.mean(dim=1).detach().cpu()[:min(4, B)]
 
                     log_attention_maps(train_logger, attn_soft.transpose(1,2),
                                        batch[6].detach().cpu().numpy(), batch[4].detach().cpu().numpy(),
-                                       step, tag_prefix="Training")
+                                       step, tag_prefix="Training", chart_title="Dec First CA Mean")
+
+                    attn_weights = model.module.decoder.dec.decoder_layers[-1].last_weights # (B, H, L1, L2)
+                    attn_soft = attn_weights.mean(dim=1).detach().cpu()[:min(4, B)]
+
+                    log_attention_maps(train_logger, attn_soft.transpose(1,2),
+                                       batch[6].detach().cpu().numpy(), batch[4].detach().cpu().numpy(),
+                                       step, tag_prefix="Training", chart_title="Dec Last CA Mean")
+
+
+
 
                 if step % val_step == 0:
                     model.eval()
@@ -240,6 +253,10 @@ def main(args, configs):
 
                     speakers = train_config['test_speakers']
                     sentences = train_config['test_sentences']
+
+                    # turn off testing for now
+                    speakers = []
+                    sentences = []
 
                     # Generate all combinations of speakers and sentences
                     pairs = list(itertools.product(speakers, sentences))

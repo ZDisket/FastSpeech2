@@ -122,7 +122,7 @@ import matplotlib.pyplot as plt
 import torch
 
 
-def log_attention_maps(logger, attention_tensor, widths, heights, step, tag_prefix=""):
+def log_attention_maps(logger, attention_tensor, widths, heights, step, tag_prefix="", chart_title="Soft Attention"):
     """
     Log each attention map from the attention_tensor to TensorBoard, with given widths and heights.
 
@@ -150,7 +150,7 @@ def log_attention_maps(logger, attention_tensor, widths, heights, step, tag_pref
         plt.close(fig)  # Close the figure to prevent it from displaying
 
         # Log the figure to TensorBoard
-        logger.add_figure(f"{tag_prefix}/Soft Attention {i + 1}", fig, global_step=step)
+        logger.add_figure(f"{tag_prefix}/f{chart_title} {i + 1}", fig, global_step=step)
 
 
 def log(

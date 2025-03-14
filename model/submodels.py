@@ -164,11 +164,11 @@ class TextEncoder(nn.Module):
     def __init__(self, vocab_size, embed_size, num_heads, num_layers, forward_expansion, dropout, kernel_sizes, alibi_alpha=1.0,
                  start_i=0, emotion_channels=256, speaker_channels=0):
         super().__init__()
-        self.embed = NormalizedEmbedding(vocab_size, embed_size, norm=False)
+        self.embed = NormalizedEmbedding(vocab_size, embed_size)
         self.encoder = TransformerEncoder(embed_size, num_heads, num_layers, forward_expansion, dropout,
                                           alibi_alpha=alibi_alpha, start_i=start_i, multi_scale=True, kernel_size=kernel_sizes,
                                           act="relugtz")
-        self.use_prenet = True
+        self.use_prenet = False
         if self.use_prenet:
             self.pre = Prenet(embed_size, 384, embed_size, 5, 3, 0.5, "aptx")
 
@@ -176,8 +176,7 @@ class TextEncoder(nn.Module):
         self.speaker_channels = speaker_channels
 
         if self.speaker_channels > 0:
-            self.spk_cond = nn.Sequential(nn.Linear(speaker_channels, embed_size),
-                                          nn.Dropout(0.1), )
+            self.spk_cond = nn.Linear(speaker_channels, embed_size)
 
     def forward(self, token_ids, seq_lens, encoded_em, spk_emb=None):
         # Embed token_ids
@@ -550,13 +549,18 @@ class DecoderPrenet(nn.Module):
 
 
 class SpectrogramDecoderAR(nn.Module):
-    def __init__(self, mel_channels, filter_channels, depth, heads, dropout=0.1,
+    def __init__(self, encoder_channels, mel_channels, filter_channels, depth, heads, dropout=0.1,
                  alibi_alpha=1.0, forward_expansion=4):
         super().__init__()
 
 
         self.filter_channels = filter_channels
         self.mel_channels = mel_channels
+
+        if encoder_channels != filter_channels:
+            self.y_proj = nn.Linear(encoder_channels, filter_channels)
+        else:
+            self.y_proj = nn.Identity()
 
         self.prenet = DecoderPrenet(mel_channels, [filter_channels, filter_channels])
 
@@ -590,6 +594,7 @@ class SpectrogramDecoderAR(nn.Module):
                                y_mask.bool())
 
         x = self.prenet(x, lin_x_mask)
+        y = self.y_proj(y)
 
         x = self.dec(x, y, sa_mask, ca_mask, conv_x_mask)
 

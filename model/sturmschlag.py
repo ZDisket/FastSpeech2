@@ -36,7 +36,8 @@ class Sturmschlag(nn.Module):
         )
         self.emotion_encoder = EmotionEncoder(model_config["em_enc_sizes"], 0.5)
 
-        self.decoder = SpectrogramDecoderAR(preprocess_config["preprocessing"]["mel"]["n_mel_channels"],
+        self.decoder = SpectrogramDecoderAR(model_config["transformer"]["encoder_hidden"],
+                                            preprocess_config["preprocessing"]["mel"]["n_mel_channels"],
                                             model_config["transformer"]["decoder_hidden"],
                                             model_config["transformer"]["decoder_layer"],
                                             model_config["transformer"]["decoder_head"],
@@ -53,10 +54,7 @@ class Sturmschlag(nn.Module):
                     "r",
             ) as f:
                 n_speaker = len(json.load(f))
-            self.speaker_emb = NormalizedEmbedding(
-                n_speaker,
-                self.speaker_channels,
-            )
+            self.speaker_emb = nn.Embedding(n_speaker, self.speaker_channels)
 
 
     def forward(

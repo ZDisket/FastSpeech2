@@ -26,3 +26,6 @@ step:
 disc:
   start_step: 5000
   lr: 0.00001
+
+
+mel_regression: "mse" # for sturmschlag, can use mse, mae, or charbonnier

@@ -35,3 +35,6 @@ test_sentences:
   - "Even though John loves chocolate, strawberries, and ice cream, he decided to try the vanilla cake instead"
   - "Peter Piper picked a peck of pickled peppers, how many pickled peppers did Peter Piper pick?"
   - "Now I see. Black human beings dislike the sound of rubbing glass probably the sound wave of the whistle"
+
+
+mel_regression: "mse" # for sturmschlag, can use mse, mae, or charbonnier
