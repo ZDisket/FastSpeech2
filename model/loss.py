@@ -226,7 +226,7 @@ class BinLoss(torch.nn.modules.loss._Loss):
 class ForwardSumLoss(torch.nn.modules.loss._Loss):
     def __init__(self, blank_logprob=-1):
         super().__init__()
-        self.log_softmax = SafeLogSoftmax(dim=3)
+        self.log_softmax = nn.LogSoftmax(dim=3)
         self.ctc_loss = torch.nn.CTCLoss(zero_infinity=True)
         self.blank_logprob = blank_logprob
 
@@ -578,6 +578,7 @@ class SturmLoss(nn.Module):
         super(SturmLoss, self).__init__()
         self.masked_mae = MaskedMAE(mel_regression)
         self.masked_bce = MaskedBCE(pos_weight=pos_weight)
+        self.forward_sum = ForwardSumLoss()
 
     def forward(self, batch, model_out):
         """
@@ -588,18 +589,23 @@ class SturmLoss(nn.Module):
                 text_mask: Mask for text (unused in loss computation)
                 mel_mask: Bool Tensor of shape (B, T), where True indicates padded positions.
             batch (tuple): Contains:
-                speakers, texts, src_lens, mels, mel_lens, em_hidden
+                ids,
+                raw_texts,
+                speakers,
+                texts,
+                src_lens,
                 - mels: Ground truth mel spectrogram, shape (B, T, mel_dim)
                 - mel_lens: Tensor of shape (B,) containing the actual mel lengths.
-
+                emotion_hiddens
         Returns:
             total_loss: Sum of mel loss and gate loss.
             mel_loss: Scalar MAE loss for the mel spectrogram.
             gate_loss: Scalar BCE loss for the gate prediction.
         """
-        mel_pred, gate_pred, text_mask, mel_mask = model_out
+        mel_pred, gate_pred, text_mask, mel_mask, attn_logprob = model_out
         mels_target = batch[5]  # (B, T, mel_dim)
-        mel_lens = batch[4]  # (B,)
+        mel_lens = batch[6]  # (B,)
+        input_lengths = batch[4]
 
         # Create a valid mask for mel loss: invert mel_mask (assumed to be True for padded)
         valid_mel_mask = (~mel_mask).unsqueeze(-1).float()  # (B, T, 1)
@@ -618,12 +624,18 @@ class SturmLoss(nn.Module):
         valid_gate_mask = (~mel_mask).float()
         gate_loss = self.masked_bce(gate_pred, gate_target, valid_gate_mask)
 
-        total_loss = mel_loss + gate_loss
+        # sometimes (almost always for some reason), output_lengths.max() == attn_logprob.size(2) + 1
+        output_lengths = torch.clamp_max(mel_lens, attn_logprob.size(2))
+       # print(output_lengths, input_lengths, attn_logprob.size())
+        al_forward_sum = self.forward_sum(attn_logprob=attn_logprob, in_lens=input_lengths, out_lens=output_lengths)
+
+        total_loss = mel_loss + gate_loss + al_forward_sum
 
         ret = (
             total_loss,
             mel_loss,
             gate_loss,
+            al_forward_sum,
         )
 
         return list(ret)

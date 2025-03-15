@@ -5,7 +5,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from .submodels import TextEncoder, SpectrogramDecoderAR, EmotionEncoder, NormalizedEmbedding
+from .submodels import TextEncoder, SpectrogramDecoderAR, EmotionEncoder, NormalizedEmbedding, Aligner
 from text.symbols import symbols
 from .submodels import sequence_mask as seq_mask2
 
@@ -45,6 +45,7 @@ class Sturmschlag(nn.Module):
                                             alibi_alpha=1.0,
                                             forward_expansion=4)
 
+        self.last_logprobs = None
         self.speaker_emb = None
         if model_config["multi_speaker"]:
             with open(
@@ -83,17 +84,19 @@ class Sturmschlag(nn.Module):
         spk_emb = self.speaker_emb(speakers).unsqueeze(1) if self.speaker_emb is not None else torch.zeros(1)
         encoded_emotion = self.emotion_encoder(em_hidden) if self.emotion_channels > 0 else torch.zeros(1)
 
-        encoded_text = self.encoder(texts, src_lens, encoded_emotion, spk_emb)
+        text_mask, mel_mask = seq_mask2(texts.size(1), src_lens), seq_mask2(mels.size(1), mel_lens)
 
-        text_mask, mel_mask = seq_mask2(encoded_text.size(1), src_lens), seq_mask2(mels.size(1), mel_lens)
+        encoded_text = self.encoder(texts, text_mask, encoded_emotion, spk_emb)
 
-        mel, gate = self.decoder(mels, mel_mask, encoded_text, text_mask)
+        mel, gate, attn_logprob = self.decoder(mels, mel_mask, encoded_text, text_mask)
+        self.last_logprobs = attn_logprob
 
         return (
             mel,
             gate,
             text_mask,
-            mel_mask
+            mel_mask,
+            attn_logprob
         )
 
     def infer(self, speakers, texts, src_lens, em_hidden=None, max_length=1000, gate_threshold=0.5):
@@ -126,11 +129,11 @@ class Sturmschlag(nn.Module):
         else:
             encoded_emotion = torch.zeros(1, device=device)
 
-        # Encode the text using the text encoder.
-        encoded_text = self.encoder(texts, src_lens, encoded_emotion, spk_emb)
+        text_mask = seq_mask2(texts.size(1), src_lens)
 
-        # Create text mask: using a helper like seq_mask2 which produces a mask of shape (B, seq_length)
-        text_mask = seq_mask2(encoded_text.size(1), src_lens)  # True indicates padded
+        # Encode the text using the text encoder.
+        encoded_text = self.encoder(texts, text_mask, encoded_emotion, spk_emb)
+
 
         # Now hand off the encoded text to the decoder's inference method.
         # The decoder autoregressively generates mel spectrogram frames.

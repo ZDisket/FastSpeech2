@@ -155,7 +155,7 @@ class SwiGLUConvFFN(nn.Module):
             raise ValueError(f"Unknown activation {act}. Valid activations are {valid_acts}")
 
         if not isinstance(kernel_size, list):
-            kernel_size = [kernel_size] * 2
+            kernel_size = [kernel_size, 1]
 
         self.kernel_size = kernel_size
         self.causal = causal
@@ -359,7 +359,7 @@ class SwiGLUConvFFN(nn.Module):
 
         x12 = self.lin1(x)
 
-        hidden = self.act_fn(x12)
+        hidden = self.act_fn(x12.transpose(1, 2)).transpose(1, 2)
         hidden = self.drop(hidden)
 
         hidden = hidden.transpose(1, 2)
@@ -560,6 +560,17 @@ def expand_masks(x_mask, y_mask):
     attention_mask = x_mask_expanded & y_mask_expanded  # Shape: (batch_size, 1, mel_len, duration_len)
     attention_mask = ~attention_mask  # True=padded => True=valid
     return attention_mask
+
+
+def expand_self_attention_mask(mask):
+    """
+    Correct implementation for Transformer self-attention mask.
+    """
+    valid = ~mask
+    attn_mask = valid.unsqueeze(1) & valid.unsqueeze(2)
+    return attn_mask.unsqueeze(1)
+
+
 
 
 class TransformerEncoderLayer(nn.Module):

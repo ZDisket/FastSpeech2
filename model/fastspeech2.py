@@ -160,7 +160,7 @@ class FastSpeech2(nn.Module):
             # (self, mel_hidden_states, text_hidden_states, x_lens, y_lens):
                                                                             # text encoder shouldn't optimize for alignment; we discard the aligner during inference
                                                                         # also helps prevent NaN loss by simplifying gradient flow (maybe?)
-            attn_soft, attn_logprob, attn_hard, attn_hard_dur = self.aligner(mels, encoded_text.detach(), src_lens,
+            attn_soft, attn_logprob, attn_hard, attn_hard_dur, _ = self.aligner(mels, encoded_text.detach(), src_lens,
                                                                              mel_lens, spk_emb.detach())
 
             total_durs = attn_hard_dur.squeeze(1)

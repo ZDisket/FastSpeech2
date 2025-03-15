@@ -2,7 +2,7 @@ import torch
 import torch.nn as nn
 from .attentions import TransformerEncoder, TemporalConvNet, MultiHeadAttention, \
     mask_to_causal_attention_mask, TransposeLayerNorm, AttentionPooling, APTxS1, APTx, SwiGLUConvFFN, NeoTCNAttention, \
-    ConvReluNorm, TransformerDecoder
+    ConvReluNorm, TransformerDecoder, expand_self_attention_mask
 from torch.nn.utils.rnn import pack_padded_sequence, pad_packed_sequence
 import torch.nn.functional as F
 from .attblocks import CBAM2d, MaskedSEBlock1D, CBAM1D
@@ -178,14 +178,9 @@ class TextEncoder(nn.Module):
         if self.speaker_channels > 0:
             self.spk_cond = nn.Linear(speaker_channels, embed_size)
 
-    def forward(self, token_ids, seq_lens, encoded_em, spk_emb=None):
+    def forward(self, token_ids, x_mask, encoded_em, spk_emb=None):
         # Embed token_ids
         x = self.embed(token_ids)  # Shape: (batch, max_seq_len, embed_size)
-
-        # Create a mask based on sequence lengths
-        max_len = token_ids.size(1)
-        mask = torch.arange(max_len, device=seq_lens.device).expand(len(seq_lens), max_len) >= seq_lens.unsqueeze(1)
-        x_mask = sequence_mask(max_len, seq_lens)
 
         if self.speaker_channels > 0:
             x = x + self.spk_cond(spk_emb)
@@ -196,8 +191,10 @@ class TextEncoder(nn.Module):
         if self.emotion_channels > 0:
             x[:, :, :self.emotion_channels] = encoded_em.unsqueeze(1)
 
+        sa_mask = expand_self_attention_mask(x_mask)
+
         # Pass through the transformer encoder
-        x = self.encoder(x, mask.unsqueeze(1).unsqueeze(2))
+        x = self.encoder(x, sa_mask)
 
         return x
 
@@ -547,22 +544,32 @@ class DecoderPrenet(nn.Module):
         return x
 
 
+def expand_masks2(x_mask, y_mask):
+    """
+    Expand True=padded masks into an attention mask.
+    Inputs can be different or the same.
+    :param x_mask: Mask of x size (batch, seq_len), where True indicates padded positions.
+    :param y_mask: Mask of y size (batch, seq_2_len), where True indicates padded positions.
+    :return: Attention mask for MultiHeadAttention, where True indicates valid positions.
+    """
+    x_mask_expanded = x_mask.unsqueeze(1).unsqueeze(3)  # Shape: (batch_size, 1, seq_len, 1)
+    y_mask_expanded = y_mask.unsqueeze(1).unsqueeze(2)  # Shape: (batch_size, 1, 1, seq_2_len)
+    # Combine masks: If either token is padded, mark the pair as padded.
+    attention_mask = x_mask_expanded | y_mask_expanded  # True if padded in either sequence
+    attention_mask = ~attention_mask  # Invert: now True indicates valid positions.
+    return attention_mask
+
 
 class SpectrogramDecoderAR(nn.Module):
     def __init__(self, encoder_channels, mel_channels, filter_channels, depth, heads, dropout=0.1,
                  alibi_alpha=1.0, forward_expansion=4):
         super().__init__()
 
-
         self.filter_channels = filter_channels
         self.mel_channels = mel_channels
 
-        if encoder_channels != filter_channels:
-            self.y_proj = nn.Linear(encoder_channels, filter_channels)
-        else:
-            self.y_proj = nn.Identity()
-
-        self.prenet = DecoderPrenet(mel_channels, [filter_channels, filter_channels])
+        self.x_proj = SwiGLUConvFFN(mel_channels, filter_channels * 2, filter_channels, 5, 0.1, act="relugt")
+        self.y_proj = SwiGLUConvFFN(encoder_channels, filter_channels * 2, filter_channels, 3, 0.1, act="relugt")
 
         self.dec = TransformerDecoder(filter_channels, heads=heads, num_layers=depth,
                                       forward_expansion=forward_expansion, dropout=dropout,
@@ -570,8 +577,8 @@ class SpectrogramDecoderAR(nn.Module):
                                       dynamic_alibi=True)
 
         self.mel_proj = nn.Linear(filter_channels, mel_channels)
-        self.gate_proj = nn.Linear(filter_channels, 1) # no sigmoid, we use BCEWithLogitsLoss
-
+        self.gate_proj = nn.Linear(filter_channels, 1)  # no sigmoid, we use BCEWithLogitsLoss
+        self.pre_aligner = SimpleAttention(filter_channels, filter_channels)
 
     def forward(self, x, x_mask, y, y_mask):
         """
@@ -586,21 +593,26 @@ class SpectrogramDecoderAR(nn.Module):
         """
         x_mask_b = x_mask.bool()
 
-        lin_x_mask = x_mask_b.unsqueeze(-1) # (B, L, 1)
-        conv_x_mask = x_mask_b.unsqueeze(1) # (B, 1, L)
+        lin_x_mask = x_mask_b.unsqueeze(-1)  # (B, L, 1)
+        conv_x_mask = x_mask_b.unsqueeze(1)  # (B, 1, L)
 
-        sa_mask = mask_to_attention_mask(x_mask_b)
-        ca_mask = expand_masks(x_mask_b,
-                               y_mask.bool())
+        sa_mask = expand_self_attention_mask(x_mask_b)
+        ca_mask = expand_masks2(x_mask_b,
+                                y_mask.bool())
 
-        x = self.prenet(x, lin_x_mask)
-        y = self.y_proj(y)
+        x = self.x_proj(x, conv_x_mask)
+        y = self.y_proj(y, y_mask.unsqueeze(1))
+
+        x_pre, x_pre_weights = self.pre_aligner(x, y, y, mask=ca_mask.squeeze(1))
+        attn_logprob = safe_log(x_pre_weights.unsqueeze(1))
+
+        x = x + x_pre
 
         x = self.dec(x, y, sa_mask, ca_mask, conv_x_mask)
 
         mel, gate = self.mel_proj(x), self.gate_proj(x)
 
-        return mel, gate
+        return mel, gate, attn_logprob
 
     def infer(self, y, y_mask, max_length=1000, gate_threshold=0.5):
         """
@@ -1032,11 +1044,11 @@ class Aligner(nn.Module):
         # Run through MultiHeadAttention
         if self.attn_type == "simple":
             # query, key, value
-            _, attention_weights = self.attn(mel_proj, text_proj, text_proj, mask=mha_mask.squeeze(1))
+            attended, attention_weights = self.attn(mel_proj, text_proj, text_proj, mask=mha_mask.squeeze(1))
             attention_weights = attention_weights.unsqueeze(1)
         else:
             # values, keys, queries
-            _, attention_weights = self.attn(text_proj, text_proj, mel_proj, mha_mask, return_weights=True)
+            attended, attention_weights = self.attn(text_proj, text_proj, mel_proj, mha_mask, return_weights=True)
             attention_weights = attention_weights[:, :, :, :-self.num_persistent]
 
         # Average attention weights across heads
@@ -1068,7 +1080,7 @@ class Aligner(nn.Module):
 
         attn_hard_dur = attn_hard.sum(2)
 
-        return average_attention_weights, attn_logprob, attn_hard, attn_hard_dur
+        return average_attention_weights, attn_logprob, attn_hard, attn_hard_dur, attended
 
 # taken from glow-tts
 class Prenet(nn.Module):

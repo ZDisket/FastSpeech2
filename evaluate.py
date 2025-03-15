@@ -33,7 +33,7 @@ def evaluate_st(model, step, configs, logger=None, vocoder=None, epoch=0):
     Loss = SturmLoss(8.0, train_config["mel_regression"]).to(device)
 
     # Evaluation
-    loss_sums = [0 for _ in range(3)]
+    loss_sums = [0 for _ in range(4)]
     for batchs in loader:
         for batch in batchs:
             batch = to_device(batch, device, reduced=True)
@@ -49,7 +49,7 @@ def evaluate_st(model, step, configs, logger=None, vocoder=None, epoch=0):
 
     loss_means = [loss_sum / len(dataset) for loss_sum in loss_sums]
 
-    message = ("Validation Step {}, Total Loss: {:.4f}, Mel Loss: {:.4f},Gate Loss: {:.4f}").format(
+    message = ("Validation Step {}, Total Loss: {:.4f}, Mel Loss: {:.4f}, Gate Loss: {:.4f},  Forward Sum Loss: {:.4f}").format(
         *([step] + [l for l in loss_means])
     )
 

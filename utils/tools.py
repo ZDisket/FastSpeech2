@@ -7,6 +7,7 @@ import numpy as np
 import matplotlib
 from scipy.io import wavfile
 from matplotlib import pyplot as plt
+import math
 
 
 matplotlib.use("Agg")
@@ -117,9 +118,64 @@ def to_device(data, device, reduced=False):
 
         return (ids, raw_texts, speakers, texts, src_lens, max_src_len)
 
+def log_attention_maps_mh(logger, attention_tensor, widths, heights, step, tag_prefix="", chart_title="Map"):
+    """
+    Log separate attention maps for each head from the attention_tensor to TensorBoard.
 
-import matplotlib.pyplot as plt
-import torch
+    Args:
+        logger: The TensorBoard SummaryWriter instance.
+        attention_tensor: A tensor of shape (batch, num_heads, max_height, max_width) with attention maps.
+        widths: A 1D array-like of shape (batch,) with valid widths (encoder timesteps) for each sample.
+        heights: A 1D array-like of shape (batch,) with valid heights (decoder timesteps) for each sample.
+        step: The current training step.
+        tag_prefix: Prefix for the tag to categorize the logs in TensorBoard.
+    """
+    attention_tensor = attention_tensor.float()
+    batch_size, num_heads, max_height, max_width = attention_tensor.size()
+
+    for i in range(batch_size):
+        valid_height = heights[i]
+        valid_width = widths[i]
+
+        # Decide on grid layout: use up to 4 columns.
+        ncols = min(num_heads, 4)
+        nrows = math.ceil(num_heads / 4)
+        fig, axes = plt.subplots(nrows, ncols, figsize=(ncols * 3, nrows * 3))
+
+        # Ensure axes is 2D for consistent indexing.
+        if nrows == 1 and ncols == 1:
+            axes = [[axes]]
+        elif nrows == 1:
+            axes = [axes]
+        elif ncols == 1:
+            axes = [[ax] for ax in axes]
+
+        for j in range(num_heads):
+            row = j // 4
+            col = j % 4
+            ax = axes[row][col]
+
+            # Crop the attention map for this head.
+            attn_map = attention_tensor[i, j, :valid_height, :valid_width].detach().cpu().numpy()
+            im = ax.imshow(attn_map, cmap='viridis', interpolation='nearest', aspect='auto')
+            ax.set_title(f'Head {j + 1}', fontsize='small')
+            ax.set_xlabel('Encoder Timesteps', fontsize='x-small')
+            ax.set_ylabel('Decoder Timesteps', fontsize='x-small')
+            ax.tick_params(labelsize='x-small')
+            fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
+
+        # Remove extra subplots, if any.
+        total_subplots = nrows * ncols
+        for j in range(num_heads, total_subplots):
+            row = j // 4
+            col = j % 4
+            fig.delaxes(axes[row][col])
+
+        fig.suptitle(f'{tag_prefix} {chart_title} {i + 1}', fontsize='medium')
+        plt.tight_layout()
+        plt.close(fig)  # Prevent display in non-interactive environments.
+
+        logger.add_figure(f"{tag_prefix}/{chart_title} {i + 1}", fig, global_step=step)
 
 
 def log_attention_maps(logger, attention_tensor, widths, heights, step, tag_prefix="", chart_title="Soft Attention"):
@@ -134,6 +190,7 @@ def log_attention_maps(logger, attention_tensor, widths, heights, step, tag_pref
     :param tag_prefix: Prefix for the tag to categorize the logs in TensorBoard.
     """
     batch_size = attention_tensor.size(0)
+    attention_tensor = attention_tensor.float()
 
     for i in range(batch_size):
         fig_width = 5
@@ -157,10 +214,11 @@ def log(
     logger, step=None, losses=None, fig=None, audio=None, sampling_rate=22050, tag=""
 ):
     if losses is not None:
-        if len(losses) == 3: #Sturmschlag
+        if len(losses) == 4: #Sturmschlag
             logger.add_scalar("Loss/total_loss", losses[0], step)
             logger.add_scalar("Loss/mel_loss", losses[1], step)
             logger.add_scalar("Loss/gate_loss", losses[2], step)
+            logger.add_scalar("Loss/forward_sum_loss", losses[3], step)
         else: #FastSpeech2
             logger.add_scalar("Loss/total_loss", losses[0], step)
             logger.add_scalar("Loss/mel_loss", losses[1], step)
@@ -290,8 +348,8 @@ def synth_one_sample_st(targets, predictions, vocoder, model_config, preprocess_
 
     # Plot only the mel spectrograms.
     # Here we use the simplified plot_mel function (that only plots mel) defined elsewhere.
-    fig = plot_mel_only(
-        [mel_prediction.cpu().numpy(), mel_target.cpu().numpy()],
+    fig = plot_mel_only( # prevent numpy from bitching about bf16 tensors
+        [mel_prediction.cpu().float().numpy(), mel_target.cpu().float().numpy()],
         titles=["Synthetized Spectrogram", "Ground-Truth Spectrogram"]
     )
 

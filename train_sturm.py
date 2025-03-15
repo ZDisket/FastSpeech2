@@ -12,7 +12,7 @@ from torch.utils.tensorboard import SummaryWriter
 from tqdm import tqdm
 import itertools
 from utils.model import get_model, get_vocoder, get_param_num, load_pretrained_weights
-from utils.tools import to_device, log, synth_one_sample_st, test_one_fs2, log_attention_maps
+from utils.tools import to_device, log, synth_one_sample_st, test_one_fs2, log_attention_maps, log_attention_maps_mh
 from model import SturmLoss
 from model.loss import LSGANLoss
 from dataset import Dataset
@@ -24,13 +24,16 @@ from evaluate import evaluate_st
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
+
 def weights_init_he(m):
     if isinstance(m, nn.Conv1d) or isinstance(m, nn.Conv2d) or isinstance(m, nn.Linear):
         nn.init.kaiming_normal_(m.weight, nonlinearity='relu')
         if m.bias is not None:
             nn.init.constant_(m.bias, 0)
 
+
 from torch.optim.lr_scheduler import LRScheduler
+
 
 def supports_native_bf16(device_index=0):
     # Get the compute capability of the GPU.
@@ -52,6 +55,21 @@ class WarmupExponentialLR(LRScheduler):
         else:
             return [base_lr * (self.gamma ** (self.last_epoch - self.warmup_steps)) for base_lr in self.base_lrs]
 
+
+def init_weights(module):
+    """
+    Initialize the weights of the given module recursively using Xavier Uniform initialization.
+    """
+    if isinstance(module, nn.Linear):
+        nn.init.xavier_uniform_(module.weight)
+        if module.bias is not None:
+            nn.init.zeros_(module.bias)
+    elif isinstance(module, (nn.Conv1d, nn.Conv2d)):
+        nn.init.xavier_uniform_(module.weight)
+        if module.bias is not None:
+            nn.init.zeros_(module.bias)
+    elif isinstance(module, nn.Embedding):
+        nn.init.xavier_uniform_(module.weight)
 
 
 def main(args, configs):
@@ -85,8 +103,10 @@ def main(args, configs):
 
     # Prepare model
     model, optimizer = get_model(args, configs, device, train=True, model="st")
+    print("applying weights")
+    model.apply(init_weights)
     scheduler = WarmupExponentialLR(optimizer, gamma=train_config["optimizer"]["gamma"],
-                                                       last_epoch=last_epoch,
+                                    last_epoch=last_epoch,
                                     warmup_steps=5 if not len(args.pretrained) else 1)
 
     if len(args.pretrained):
@@ -108,7 +128,6 @@ def main(args, configs):
 
     if len(preprocess_config["preprocessing"]["zephyr_model"]):
         raise RuntimeError("Not supported")
-
 
     if len(preprocess_config["preprocessing"]["bert_model"]):
         bert_model = BERTFrontEnd(torch.cuda.is_available(), preprocess_config["preprocessing"]["bert_model"])
@@ -143,8 +162,6 @@ def main(args, configs):
         print("GPU does NOT natively support BF16. Using FP16 instead...")
         mp_dtype = torch.float16
 
-
-
     # torch.autograd.set_detect_anomaly(True, True)
 
     scaler = GradScaler()
@@ -154,7 +171,7 @@ def main(args, configs):
         for batchs in loader:
             for batch in batchs:
 
-                with autocast(enabled=True,dtype=mp_dtype):
+                with autocast(enabled=True, dtype=mp_dtype):
                     # run to_device with reduced features
                     batch = to_device(batch, device, reduced=True)
 
@@ -162,7 +179,6 @@ def main(args, configs):
                     output = model(*(batch[2:]))
 
                     losses = Loss(batch, output)
-
 
                     total_loss = losses[0] / grad_acc_step
 
@@ -183,8 +199,8 @@ def main(args, configs):
                     losses = [l.item() for l in losses]
                     message1 = "Step {}/{}, ".format(step, total_step)
                     message2 = (
-                        "Total Loss: {:.4f}, Mel Loss: {:.4f}, Gate Loss: {:.4f}"
-                        ).format(
+                        "Total Loss: {:.4f}, Mel Loss: {:.4f}, Gate Loss: {:.4f}, Forward Sum Loss: {:.4f}"
+                    ).format(
                         *losses
                     )
 
@@ -224,25 +240,40 @@ def main(args, configs):
                         tag="Training/step_{}_{}_synthesized".format(step, tag),
                     )
 
-
-                    attn_weights = model.module.decoder.dec.decoder_layers[0].last_weights # (B, H, L1, L2)
+                    attn_weights = model.module.decoder.dec.decoder_layers[
+                        0].last_weights.detach().cpu()  # (B, H, L1, L2)
                     B = attn_weights.shape[0]
+                    attn_weights = attn_weights[:min(4, B)]
 
-                    attn_soft = attn_weights.mean(dim=1).detach().cpu()[:min(4, B)]
+                    log_attention_maps_mh(train_logger, attn_weights.transpose(2, 3),
+                                          batch[6].detach().cpu().numpy(), batch[4].detach().cpu().numpy(),
+                                          step, tag_prefix="Training", chart_title="Dec First CA Heads")
 
-                    log_attention_maps(train_logger, attn_soft.transpose(1,2),
+                    attn_soft = attn_weights.mean(dim=1)
+
+                    log_attention_maps(train_logger, attn_soft.transpose(1, 2),
                                        batch[6].detach().cpu().numpy(), batch[4].detach().cpu().numpy(),
                                        step, tag_prefix="Training", chart_title="Dec First CA Mean")
 
-                    attn_weights = model.module.decoder.dec.decoder_layers[-1].last_weights # (B, H, L1, L2)
-                    attn_soft = attn_weights.mean(dim=1).detach().cpu()[:min(4, B)]
+                    attn_weights = model.module.decoder.dec.decoder_layers[
+                        -1].last_weights.detach().cpu()  # (B, H, L1, L2)
+                    B = attn_weights.shape[0]
+                    attn_weights = attn_weights[:min(4, B)]
 
-                    log_attention_maps(train_logger, attn_soft.transpose(1,2),
+                    log_attention_maps_mh(train_logger, attn_weights.transpose(2, 3),
+                                          batch[6].detach().cpu().numpy(), batch[4].detach().cpu().numpy(),
+                                          step, tag_prefix="Training", chart_title="Dec First CA Heads")
+
+                    attn_soft = attn_weights.mean(dim=1)
+
+                    log_attention_maps(train_logger, attn_soft.transpose(1, 2),
                                        batch[6].detach().cpu().numpy(), batch[4].detach().cpu().numpy(),
                                        step, tag_prefix="Training", chart_title="Dec Last CA Mean")
 
-
-
+                    attn_soft = torch.exp(model.module.last_logprobs.detach()[:min(4, B)].squeeze(1).float())
+                    log_attention_maps(train_logger, attn_soft.transpose(1, 2).detach(),
+                                       batch[6].detach().cpu().numpy(), batch[4].detach().cpu().numpy(),
+                                       step, tag_prefix="Training", chart_title="Aux Attn")
 
                 if step % val_step == 0:
                     model.eval()
@@ -263,7 +294,8 @@ def main(args, configs):
 
                     for idx, (spkid, sent) in enumerate(pairs, start=1):
                         blocks, hid = bert_model.infer(sent)
-                        t_aud = test_one_fs2(model.module, vocoder, sent, blocks.cpu().numpy(), hid.cpu().numpy(), int(spkid))
+                        t_aud = test_one_fs2(model.module, vocoder, sent, blocks.cpu().numpy(), hid.cpu().numpy(),
+                                             int(spkid))
                         if t_aud is None:
                             continue
                         log(
@@ -288,7 +320,6 @@ def main(args, configs):
                         ),
                     )
 
-
                 if step == total_step:
                     quit()
                 step += 1
@@ -296,7 +327,6 @@ def main(args, configs):
 
             inner_bar.update(1)
         scheduler.step()
-
 
         epoch += 1
 
