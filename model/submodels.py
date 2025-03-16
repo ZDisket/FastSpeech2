@@ -10,6 +10,7 @@ from .subatts import init_weights_he
 import monotonic_align, math
 from torchbnn import BayesLinear
 
+
 # Applying LayerNorm + Dropout on embeddings increases performance, probably due to the regularizing effect
 # Thanks dathudeptrai from TensorFlowTTS for discovering this.
 class NormalizedEmbedding(nn.Module):
@@ -159,14 +160,15 @@ class SimpleEmProj(nn.Module):
         return x
 
 
-
 class TextEncoder(nn.Module):
-    def __init__(self, vocab_size, embed_size, num_heads, num_layers, forward_expansion, dropout, kernel_sizes, alibi_alpha=1.0,
+    def __init__(self, vocab_size, embed_size, num_heads, num_layers, forward_expansion, dropout, kernel_sizes,
+                 alibi_alpha=1.0,
                  start_i=0, emotion_channels=256, speaker_channels=0):
         super().__init__()
         self.embed = NormalizedEmbedding(vocab_size, embed_size)
         self.encoder = TransformerEncoder(embed_size, num_heads, num_layers, forward_expansion, dropout,
-                                          alibi_alpha=alibi_alpha, start_i=start_i, multi_scale=True, kernel_size=kernel_sizes,
+                                          alibi_alpha=alibi_alpha, start_i=start_i, multi_scale=True,
+                                          kernel_size=kernel_sizes,
                                           act="relugtz")
         self.use_prenet = False
         if self.use_prenet:
@@ -299,23 +301,21 @@ class VariantDurationPredictor(nn.Module):
         self.lstm_channels = filter_channels
 
         self.lstm = nn.GRU(input_size=filter_channels, hidden_size=self.lstm_channels, batch_first=True,
-                            bidirectional=self.lstm_bidirectional)
+                           bidirectional=self.lstm_bidirectional)
         if self.lstm_bidirectional:
             print("BiGRU")
 
         if not bayesian:
             self.out_proj = nn.Linear(self.lstm_channels * 2 if self.lstm_bidirectional else self.lstm_channels, 1)
         else:
-            self.out_proj = BayesLinear(prior_mu=0.0, prior_sigma=0.01, # very low prior sigma because we operate in the log domain
+            self.out_proj = BayesLinear(prior_mu=0.0, prior_sigma=0.01,
+                                        # very low prior sigma because we operate in the log domain
                                         in_features=self.lstm_channels * 2 if self.lstm_bidirectional else self.lstm_channels,
                                         out_features=1)
-
-
 
         self.final_dropout = nn.Dropout(final_dropout)
         self.drop = nn.Dropout(0.1)
         self.use_pre_proj = False
-
 
         if text_channels != filter_channels:
             self.pre_proj = nn.Conv1d(text_channels, filter_channels, 1)
@@ -340,7 +340,6 @@ class VariantDurationPredictor(nn.Module):
         if self.use_cbam:
             x = self.cbam(x, conv_mask)
 
-
         # Transpose for LSTM
         x = x.transpose(1, 2)  # (b, text_channels, seq_len) -> (b, seq_len, channels)
 
@@ -355,13 +354,13 @@ class VariantDurationPredictor(nn.Module):
         x = self.drop(x)
 
         # Project using 1D convolution
-        log_durations = self.out_proj(x.transpose(1,2)).transpose(1,2)
+        log_durations = self.out_proj(x.transpose(1, 2)).transpose(1, 2)
 
         log_durations = log_durations.masked_fill(conv_mask, 0)
 
         log_durations = log_durations.squeeze(1)  # (batch, 1, seq_len) => (batch, seq_len)
 
-        return log_durations, conv_mask.squeeze(1), x.transpose(1,2)
+        return log_durations, conv_mask.squeeze(1), x.transpose(1, 2)
 
     def run_rnn(self, x, x_lengths):
         # Pack padded sequence
@@ -375,7 +374,8 @@ class VariantDurationPredictor(nn.Module):
         # LSTM pass
         x, _ = self.lstm(x)
         # Unpack the sequence
-        x, lens_unpacked = pad_packed_sequence(x, batch_first=True, total_length=x_seq_len_orig)  # x_lstm:  (batch, seq_len, lstm_channels)
+        x, lens_unpacked = pad_packed_sequence(x, batch_first=True,
+                                               total_length=x_seq_len_orig)  # x_lstm:  (batch, seq_len, lstm_channels)
 
         return x
 
@@ -395,13 +395,15 @@ def expand_masks(x_mask, y_mask):
     attention_mask = ~attention_mask  # True=padded => True=valid
     return attention_mask
 
+
 # VariancePredictor but using TCNs for cheaper-than-RNN temporal dependencies.
 class TemporalVariancePredictor(nn.Module):
 
     def __init__(self, input_channels, num_channels, kernel_size=2, dropout=0.2, cond_input_size=None):
         super(TemporalVariancePredictor, self).__init__()
         # Temporal Convolutional Network
-        self.tcn = NeoTCNAttention(input_channels, num_channels, kernel_size, dropout, dropout, [0] * len(num_channels), dilation_growth="", act="relu")
+        self.tcn = NeoTCNAttention(input_channels, num_channels, kernel_size, dropout, dropout, [0] * len(num_channels),
+                                   dilation_growth="", act="relu")
 
         self.cond_input_size = cond_input_size
         self.input_channels = input_channels
@@ -411,7 +413,6 @@ class TemporalVariancePredictor(nn.Module):
         # Duration-Spectrogram pre-conditioning
         # Conv1D => ReLU => AllAttention(duration_hidden,spec) => LayerNorm => ReLU => Dropout
         if self.cond_input_size is not None:
-
             self.cond_proj = nn.Conv1d(self.cond_input_size, self.input_channels,
                                        3, padding="same")
 
@@ -438,7 +439,6 @@ class TemporalVariancePredictor(nn.Module):
                 if m.bias is not None:
                     nn.init.constant_(m.bias, 0)
 
-
     def make_cond_vector(self, x, y, x_mask, y_mask):
         """
         Create conditioning vector
@@ -454,7 +454,7 @@ class TemporalVariancePredictor(nn.Module):
         # (batch, seq_len, channels) <<=> (batch, channels, seq_len)
         y = self.cond_proj(
             y.transpose(1, 2)
-        ).transpose(1,2).masked_fill(y_mask.unsqueeze(-1), 0)
+        ).transpose(1, 2).masked_fill(y_mask.unsqueeze(-1), 0)
 
         y = self.cond_act(y)
         y = self.inter_cond_drop(y)
@@ -570,8 +570,8 @@ class SpectrogramDecoderAR(nn.Module):
         self.filter_channels = filter_channels
         self.mel_channels = mel_channels
 
-        self.x_proj = SwiGLUConvFFN(mel_channels, filter_channels * 2, filter_channels, 5, 0.1, act="relugt")
-        self.y_proj = SwiGLUConvFFN(encoder_channels, filter_channels * 2, filter_channels, 3, 0.1, act="relugt")
+        self.x_proj = DecoderPrenet(mel_channels, [256, filter_channels], 0.1)
+        self.y_proj = nn.Identity()
 
         self.dec = TransformerDecoder(filter_channels, heads=heads, num_layers=depth,
                                       forward_expansion=forward_expansion, dropout=dropout,
@@ -584,37 +584,50 @@ class SpectrogramDecoderAR(nn.Module):
 
     def forward(self, x, x_mask, y, y_mask):
         """
-        Forward pass, decode mel spectrogram
+        Autoregressive next-frame prediction:
+          - x is the full ground-truth mel (B, L, mel_channels),
+            but we only feed frames [0..L-2] into the network.
+          - We produce L-1 outputs that correspond to predicting the *next* frame.
 
-        :param x: Melspectrogram size (batch, mel_len, mel_channels)
-        :param x_mask: True=padded mask size (batch, mel_lens)
-        :param y: Text hidden states size (batch, text_len, text_channels)
-        :param y_mask: True=padded mask size (batch, text_lens)
+        Args:
+            x: FloatTensor of shape (B, L, mel_channels), ground-truth mel
+            x_mask: BoolTensor of shape (B, L) with True indicating padding
+            y: FloatTensor of shape (B, text_len, text_channels), encoder outputs
+            y_mask: BoolTensor of shape (B, text_len), True=padded
 
-        :return: Mel pred (batch, mel_len, mel_channels); gate (batch, mel_len, 1)
+        Returns:
+            mel_pred: (B, L-1, mel_channels)
+            gate_pred: (B, L-1, 1)
+            attn_logprob: Log of pre-aligner attention weights, shape depends on your aligner
+            x_mask_in: The shifted mask (B, L-1) so you can pass it to the loss if needed
         """
-        x_mask_b = x_mask.bool()
+        # 1) Shift the input by dropping the last frame, so the model predicts the next frame.
+        x_in = x[:, :-1, :]  # (B, L-1, mel_channels)
+        x_mask_in = x_mask[:, :-1]  # (B, L-1), same shift
 
-        lin_x_mask = x_mask_b.unsqueeze(-1)  # (B, L, 1)
-        conv_x_mask = x_mask_b.unsqueeze(1)  # (B, 1, L)
+        # Create masks
+        sa_mask = expand_self_attention_mask(x_mask_in)  # self-attention
+        ca_mask = expand_masks2(x_mask_in, y_mask.bool())  # cross-attention
+        lin_x_mask = x_mask_in.unsqueeze(-1)  # (B, L-1, 1)
+        conv_x_mask = x_mask_in.unsqueeze(1)  # (B, 1, L-1)
 
-        sa_mask = expand_self_attention_mask(x_mask_b)
-        ca_mask = expand_masks2(x_mask_b,
-                                y_mask.bool())
+        # 2) Project the input mel frames and text
+        x_proj = self.x_proj(x_in, lin_x_mask)
+        y_proj = self.y_proj(y)
 
-        x = self.x_proj(x, conv_x_mask)
-        y = self.y_proj(y, y_mask.unsqueeze(1))
-
-        x_pre, x_pre_weights = self.pre_aligner(x, y, y, mask=ca_mask.squeeze(1))
+        # 3) Pre-aligner: helps with alignment signals
+        x_pre, x_pre_weights = self.pre_aligner(x_proj, y_proj, y_proj, mask=ca_mask.squeeze(1))
         attn_logprob = safe_log(x_pre_weights.unsqueeze(1))
 
-        x = x + x_pre
+        # 4) Residual + Transformer Decoder
+        x_in_aligned = x_proj + x_pre
+        dec_out = self.dec(x_in_aligned, y_proj, sa_mask, ca_mask, conv_x_mask)
 
-        x = self.dec(x, y, sa_mask, ca_mask, conv_x_mask)
+        # 5) Final projections to mel frames + gate
+        mel_pred = self.mel_proj(dec_out)  # (B, L-1, mel_channels)
+        gate_pred = self.gate_proj(dec_out)  # (B, L-1, 1)
 
-        mel, gate = self.mel_proj(x), self.gate_proj(x)
-
-        return mel, gate, attn_logprob
+        return mel_pred, gate_pred, attn_logprob, x_mask_in
 
     def infer(self, y, y_mask, max_length=1000, gate_threshold=0.5):
         """
@@ -658,8 +671,8 @@ class SpectrogramDecoderAR(nn.Module):
             # gate_pred: (B, current_length, 1)
 
             # Get the last time-step's predictions.
-            last_mel = mel_pred[:, -1:, :]   # shape: (B, 1, mel_channels)
-            last_gate = gate_pred[:, -1, :]    # shape: (B, 1)
+            last_mel = mel_pred[:, -1:, :]  # shape: (B, 1, mel_channels)
+            last_gate = gate_pred[:, -1, :]  # shape: (B, 1)
 
             mel_outputs.append(last_mel)
             gate_outputs.append(last_gate)
@@ -704,11 +717,10 @@ class SpectrogramDecoder(nn.Module):
         if self.do_em_cond:
             self.em_cond = nn.Sequential(nn.Linear(emotion_size, filter_channels),
                                          nn.ReLU(inplace=True),
-                                         nn.Dropout(0.5),)
+                                         nn.Dropout(0.5), )
 
         if self.speaker_channels > 0:
-            self.spk_cond = nn.Sequential(nn.Linear(speaker_channels, filter_channels),)
-
+            self.spk_cond = nn.Sequential(nn.Linear(speaker_channels, filter_channels), )
 
     # x_mask : True=exclude mask size (batch, mel_lens)
     # x: (batch, mel_lens, channels)
@@ -828,13 +840,11 @@ class DynamicDurationPredictor(nn.Module):
             self.fw_projection = nn.Linear(self.tcn_output_channels + self.bw_tcn_output_channels,
                                            self.tcn_output_channels)
 
-    #    self.refiner = ConvReluNorm(self.tcn_output_channels + self.bw_tcn_output_channels, self.tcn_output_channels + self.bw_tcn_output_channels, 5, 1, "layer", dropout=0.5)
+        #    self.refiner = ConvReluNorm(self.tcn_output_channels + self.bw_tcn_output_channels, self.tcn_output_channels + self.bw_tcn_output_channels, 5, 1, "layer", dropout=0.5)
         self.linear_projection = nn.Linear(self.tcn_output_channels, 1)
 
         if self.use_mul:
             self.multiplier_proj = nn.Conv1d(self.tcn_output_channels, 1, 5, padding="same")
-
-
 
         if self.speaker_channels > 0:
             self.spk_cond = nn.Sequential(nn.Linear(self.speaker_channels, num_inputs),
@@ -884,7 +894,7 @@ class DynamicDurationPredictor(nn.Module):
             # cat and project back to normal
             x = torch.cat((x, x_reversed), dim=-1)
 
-     #       x = x + self.refiner(x.transpose(1,2), mask.unsqueeze(1)).transpose(1,2)
+            #       x = x + self.refiner(x.transpose(1,2), mask.unsqueeze(1)).transpose(1,2)
             x = x.masked_fill(mask.unsqueeze(-1), 0)
 
             x = self.fw_projection(x)
@@ -901,7 +911,6 @@ class DynamicDurationPredictor(nn.Module):
             mul = mul.squeeze(-1)
         else:
             mul = 1.0
-
 
         durations = durations.squeeze(-1) * mul
         durations = durations.masked_fill(mask, 0)
@@ -926,7 +935,7 @@ class EmotionEncoder(nn.Module):
         self.net = nn.Sequential(*layers)
 
     def forward(self, x):
-        x = x.squeeze(1) # (batch, 1, channels) = (batch, channels)
+        x = x.squeeze(1)  # (batch, 1, channels) = (batch, channels)
         return self.net(x)
 
 
@@ -944,7 +953,9 @@ def safe_log(tensor, epsilon=1e-6):
     safe_log_tensor = torch.nan_to_num(log_tensor, nan=epsilon)  # Replace NaNs with -inf
     return safe_log_tensor
 
+
 from rotary_embedding_torch import RotaryEmbedding
+
 
 class SimpleAttention(nn.Module):
     def __init__(self, input_dim, attention_dim, use_positional_encoding=False):
@@ -955,7 +966,8 @@ class SimpleAttention(nn.Module):
         self.attention_dim = attention_dim
         self.use_positional_encoding = use_positional_encoding
         self.rotary_emb = RotaryEmbedding(dim=attention_dim // 2)
-            #self.positional_encoding = PositionalEncoding(attention_dim)
+        # self.positional_encoding = PositionalEncoding(attention_dim)
+
     def forward(self, query, key, value, mask=None):
         # Compute the query, key, and value
         query = self.query_layer(query)
@@ -967,8 +979,8 @@ class SimpleAttention(nn.Module):
             key_seq_length = key.size(1)
             query = self.rotary_emb.rotate_queries_or_keys(query.unsqueeze(1)).squeeze(1)
             key = self.rotary_emb.rotate_queries_or_keys(key.unsqueeze(1)).squeeze(1)
-         #   query += self.positional_encoding(query_seq_length)
-          #  key += self.positional_encoding(key_seq_length)
+        #   query += self.positional_encoding(query_seq_length)
+        #  key += self.positional_encoding(key_seq_length)
 
         # Compute attention scores
         attention_scores = torch.matmul(query, key.transpose(-2, -1)) / (self.attention_dim ** 0.5)
@@ -1009,7 +1021,7 @@ class Aligner(nn.Module):
     def __init__(self, mel_channels, text_channels, mas_channels, heads, num_persistent=16, speaker_channels=0):
         super(Aligner, self).__init__()
         self.proj_type = "conv"
-        self.attn_type = "simple" # mha is BROKEN (you could probably fix it with a LR warmup)
+        self.attn_type = "simple"  # mha is BROKEN (you could probably fix it with a LR warmup)
         self.n_heads = heads
         self.spk_cond = nn.Linear(speaker_channels, mas_channels) if speaker_channels > 0 else None
 
@@ -1077,16 +1089,19 @@ class Aligner(nn.Module):
 
         # Apply monotonic alignment search (MAS)
         # MAS works with (batch, text, mel) ; CTC loss works with (batch, mel, text)
-        with torch.no_grad():                       # Cython demands a contiguous tensor
-            attn_hard = monotonic_align.maximum_path(attn_logprob.squeeze(1).transpose(1,2).contiguous(), attn_mask.squeeze(1))
+        with torch.no_grad():  # Cython demands a contiguous tensor
+            attn_hard = monotonic_align.maximum_path(attn_logprob.squeeze(1).transpose(1, 2).contiguous(),
+                                                     attn_mask.squeeze(1))
 
         attn_hard_dur = attn_hard.sum(2)
 
         return average_attention_weights, attn_logprob, attn_hard, attn_hard_dur, attended
 
+
 # taken from glow-tts
 class Prenet(nn.Module):
-    def __init__(self, in_channels, hidden_channels, out_channels, kernel_size, n_layers, p_dropout, act="relu", conv_att=False):
+    def __init__(self, in_channels, hidden_channels, out_channels, kernel_size, n_layers, p_dropout, act="relu",
+                 conv_att=False):
         super(Prenet, self).__init__()
         self.in_channels = in_channels
         self.hidden_channels = hidden_channels

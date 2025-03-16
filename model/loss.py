@@ -582,60 +582,46 @@ class SturmLoss(nn.Module):
 
     def forward(self, batch, model_out):
         """
-        Args:
-            model_out (tuple): Contains:
-                mel_pred: Predicted mel spectrogram, shape (B, T, mel_dim)
-                gate_pred: Predicted gate logits, shape (B, T, 1)
-                text_mask: Mask for text (unused in loss computation)
-                mel_mask: Bool Tensor of shape (B, T), where True indicates padded positions.
-            batch (tuple): Contains:
-                ids,
-                raw_texts,
-                speakers,
-                texts,
-                src_lens,
-                - mels: Ground truth mel spectrogram, shape (B, T, mel_dim)
-                - mel_lens: Tensor of shape (B,) containing the actual mel lengths.
-                emotion_hiddens
-        Returns:
-            total_loss: Sum of mel loss and gate loss.
-            mel_loss: Scalar MAE loss for the mel spectrogram.
-            gate_loss: Scalar BCE loss for the gate prediction.
+        model_out = (mel_pred, gate_pred, attn_logprob, x_mask_in)
+        batch = (ids, raw_texts, speakers, texts, src_lens, mels, mel_lens, em_hidden)
         """
-        mel_pred, gate_pred, text_mask, mel_mask, attn_logprob = model_out
-        mels_target = batch[5]  # (B, T, mel_dim)
-        mel_lens = batch[6]  # (B,)
+        mel_pred, gate_pred, text_mask, mel_mask, attn_logprob, x_mask_in = model_out
+
+        mels_target = batch[5]  # (B, L, mel_channels)
+        mel_lens = batch[6]     # (B,)
         input_lengths = batch[4]
 
-        # Create a valid mask for mel loss: invert mel_mask (assumed to be True for padded)
-        valid_mel_mask = (~mel_mask).unsqueeze(-1).float()  # (B, T, 1)
-        mel_loss = self.masked_mae(mel_pred, mels_target, valid_mel_mask)
+        # Shift ground truth by 1 frame for the next-frame objective
+        mel_target_shifted = mels_target[:, 1:, :]    # (B, L-1, mel_channels)
 
-        # Build the gate target vectorized:
-        B, T, _ = gate_pred.size()
-        # Create a time index tensor: shape (B, T)
-        time_idx = torch.arange(T, device=gate_pred.device).unsqueeze(0).expand(B, T)
-        # For each sample, mark the last valid time step (mel_lens - 1) as the stop token (1), others 0.
-        gate_target = (time_idx == (mel_lens - 1).unsqueeze(1)).float()  # (B, T)
+        # Create a valid mask for the predicted region (B, L-1, 1)
+        # Because x_mask_in is True=padded, we invert it for the loss
+        valid_mask = (~x_mask_in).unsqueeze(-1).float()  # (B, L-1, 1)
 
-        # Squeeze gate_pred from (B, T, 1) to (B, T)
-        gate_pred = gate_pred.squeeze(-1)
-        # Create a valid mask for gate loss: same as mel, but shape (B, T)
-        valid_gate_mask = (~mel_mask).float()
+        # 1) Mel Loss
+        mel_loss = self.masked_mae(mel_pred, mel_target_shifted, valid_mask)
+
+        # 2) Gate Loss
+        # gate_pred shape: (B, L-1)
+        B, pred_len, _ = gate_pred.size()
+        gate_pred = gate_pred.squeeze(-1)  # (B, L-1)
+
+        # The last predicted frame index is (mel_lens - 2)
+        # e.g. if mel_lens[i] = 50, final predicted index is 48 => stop token at gate_pred[:, 48].
+        time_idx = torch.arange(pred_len, device=gate_pred.device).unsqueeze(0).expand(B, pred_len)
+        gate_target = (time_idx == (mel_lens - 2).unsqueeze(1)).float()  # (B, L-1)
+
+        valid_gate_mask = (~x_mask_in).float()  # (B, L-1)
         gate_loss = self.masked_bce(gate_pred, gate_target, valid_gate_mask)
 
-        # sometimes (almost always for some reason), output_lengths.max() == attn_logprob.size(2) + 1
-        output_lengths = torch.clamp_max(mel_lens, attn_logprob.size(2))
-       # print(output_lengths, input_lengths, attn_logprob.size())
-        al_forward_sum = self.forward_sum(attn_logprob=attn_logprob, in_lens=input_lengths, out_lens=output_lengths)
-
-        total_loss = mel_loss + gate_loss + al_forward_sum
-
-        ret = (
-            total_loss,
-            mel_loss,
-            gate_loss,
-            al_forward_sum,
+        # 3) Forward Sum Loss (if you’re using your alignment constraint)
+        # Make sure to clamp the output length to pred_len
+        output_lengths = torch.clamp_max(mel_lens - 1, pred_len)
+        al_forward_sum = self.forward_sum(
+            attn_logprob=attn_logprob,
+            in_lens=input_lengths,
+            out_lens=output_lengths
         )
 
-        return list(ret)
+        total_loss = mel_loss + gate_loss + al_forward_sum
+        return [total_loss, mel_loss, gate_loss, al_forward_sum]

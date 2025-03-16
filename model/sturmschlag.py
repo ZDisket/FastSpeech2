@@ -88,7 +88,7 @@ class Sturmschlag(nn.Module):
 
         encoded_text = self.encoder(texts, text_mask, encoded_emotion, spk_emb)
 
-        mel, gate, attn_logprob = self.decoder(mels, mel_mask, encoded_text, text_mask)
+        mel, gate, attn_logprob, x_mask_in = self.decoder(mels, mel_mask, encoded_text, text_mask)
         self.last_logprobs = attn_logprob
 
         return (
@@ -96,7 +96,8 @@ class Sturmschlag(nn.Module):
             gate,
             text_mask,
             mel_mask,
-            attn_logprob
+            attn_logprob,
+            x_mask_in
         )
 
     def infer(self, speakers, texts, src_lens, em_hidden=None, max_length=1000, gate_threshold=0.5):
