@@ -182,11 +182,13 @@ class TextEncoder(nn.Module):
         # Embed token_ids
         x = self.embed(token_ids)  # Shape: (batch, max_seq_len, embed_size)
 
+        x_mask_conv = x_mask.unsqueeze(1)
+
         if self.speaker_channels > 0:
             x = x + self.spk_cond(spk_emb)
 
         if self.use_prenet:
-            x = self.pre(x, x_mask.unsqueeze(1))
+            x = self.pre(x, x_mask_conv)
 
         if self.emotion_channels > 0:
             x[:, :, :self.emotion_channels] = encoded_em.unsqueeze(1)
@@ -194,7 +196,7 @@ class TextEncoder(nn.Module):
         sa_mask = expand_self_attention_mask(x_mask)
 
         # Pass through the transformer encoder
-        x = self.encoder(x, sa_mask)
+        x = self.encoder(x, sa_mask, x_mask_conv)
 
         return x
 
