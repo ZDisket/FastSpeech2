@@ -102,12 +102,18 @@ def main(args, configs):
         last_epoch = epoch - 1
 
     # Prepare model
-    model, optimizer = get_model(args, configs, device, train=True, model="st")
-    print("applying weights")
-    model.apply(init_weights)
+    model, optimizer = get_model(args, configs, device, train=True, model="st", opt="adamw")
+
+    warmup_steps = 5 if not len(args.pretrained) else 1
+    if args.restore_step:
+        warmup_steps = 0
+    else:
+        print("applying weights")
+        model.apply(init_weights)
+
     scheduler = WarmupExponentialLR(optimizer, gamma=train_config["optimizer"]["gamma"],
                                     last_epoch=last_epoch,
-                                    warmup_steps=5 if not len(args.pretrained) else 1)
+                                    warmup_steps=warmup_steps)
 
     if len(args.pretrained):
         load_pretrained_weights(model, args.pretrained)
@@ -262,7 +268,7 @@ def main(args, configs):
 
                     log_attention_maps_mh(train_logger, attn_weights.transpose(2, 3),
                                           batch[6].detach().cpu().numpy(), batch[4].detach().cpu().numpy(),
-                                          step, tag_prefix="Training", chart_title="Dec First CA Heads")
+                                          step, tag_prefix="Training", chart_title="Dec Last CA Heads")
 
                     attn_soft = attn_weights.mean(dim=1)
 

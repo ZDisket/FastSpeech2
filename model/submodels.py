@@ -9,7 +9,7 @@ from .attblocks import CBAM2d, MaskedSEBlock1D, CBAM1D
 from .subatts import init_weights_he
 import monotonic_align, math
 from torchbnn import BayesLinear
-
+from .subatts import RMSNorm
 
 # Applying LayerNorm + Dropout on embeddings increases performance, probably due to the regularizing effect
 # Thanks dathudeptrai from TensorFlowTTS for discovering this.
@@ -958,15 +958,17 @@ from rotary_embedding_torch import RotaryEmbedding
 
 
 class SimpleAttention(nn.Module):
-    def __init__(self, input_dim, attention_dim, use_positional_encoding=False):
+    def __init__(self, input_dim, attention_dim, use_positional_encoding=True):
         super(SimpleAttention, self).__init__()
-        self.query_layer = nn.Linear(input_dim, attention_dim)
-        self.key_layer = nn.Linear(input_dim, attention_dim)
-        self.value_layer = nn.Linear(input_dim, attention_dim)
+        self.query_layer = nn.Linear(input_dim, attention_dim, bias=False)
+        self.key_layer = nn.Linear(input_dim, attention_dim, bias=False)
+        self.value_layer = nn.Linear(input_dim, attention_dim, bias=False)
         self.attention_dim = attention_dim
         self.use_positional_encoding = use_positional_encoding
-        self.rotary_emb = RotaryEmbedding(dim=attention_dim // 2)
-        # self.positional_encoding = PositionalEncoding(attention_dim)
+
+        self.query_norm = RMSNorm(attention_dim)
+        self.key_norm = RMSNorm(attention_dim)
+        self.positional_encoding = PositionalEncoding(attention_dim)
 
     def forward(self, query, key, value, mask=None):
         # Compute the query, key, and value
@@ -974,13 +976,14 @@ class SimpleAttention(nn.Module):
         key = self.key_layer(key)
         value = self.value_layer(value)
 
+        query = self.query_norm(query)
+        key = self.key_norm(key)
+
         if self.use_positional_encoding:
             query_seq_length = query.size(1)
             key_seq_length = key.size(1)
-            query = self.rotary_emb.rotate_queries_or_keys(query.unsqueeze(1)).squeeze(1)
-            key = self.rotary_emb.rotate_queries_or_keys(key.unsqueeze(1)).squeeze(1)
-        #   query += self.positional_encoding(query_seq_length)
-        #  key += self.positional_encoding(key_seq_length)
+            query += self.positional_encoding(query_seq_length)
+            key += self.positional_encoding(key_seq_length)
 
         # Compute attention scores
         attention_scores = torch.matmul(query, key.transpose(-2, -1)) / (self.attention_dim ** 0.5)

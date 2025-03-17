@@ -35,7 +35,7 @@ def load_pretrained_weights(model, pretrained_path):
     model.load_state_dict(model_dict, strict=False)
 
 
-def get_model(args, configs, device, train=False, model="fs"):
+def get_model(args, configs, device, train=False, model="fs", opt="adam"):
     (preprocess_config, model_config, train_config) = configs
 
     if model == "fs":
@@ -52,11 +52,20 @@ def get_model(args, configs, device, train=False, model="fs"):
         model.load_state_dict(ckpt["model"])
 
     if train:
-        scheduled_optim = AdEMAMix(model.parameters(),
-                                            lr=train_config["optimizer"]["init_lr"],
-                                            eps=train_config["optimizer"]["eps"],
-                                            weight_decay=train_config["optimizer"]["weight_decay"],
-                                            )
+        if opt == "adam":
+            scheduled_optim = torch.optim.Adam(model.parameters(),
+                                                lr=train_config["optimizer"]["init_lr"],
+                                                eps=train_config["optimizer"]["eps"],
+                                                weight_decay=train_config["optimizer"]["weight_decay"],
+                                                )
+        elif opt == "adamw":
+            scheduled_optim = torch.optim.AdamW(model.parameters(),
+                                               lr=train_config["optimizer"]["init_lr"],
+                                               eps=train_config["optimizer"]["eps"],
+                                               weight_decay=train_config["optimizer"]["weight_decay"],
+                                               )
+            print("AdamW")
+
         if args.restore_step:
             scheduled_optim.load_state_dict(ckpt["optimizer"])
         model.train()

@@ -372,6 +372,8 @@ class SwiGLUConvFFN(nn.Module):
         return out
 
 
+
+
 class MultiHeadAttention(nn.Module):
     """
     Modern Multi Head Attention. Contains:
@@ -390,13 +392,14 @@ class MultiHeadAttention(nn.Module):
     """
 
     def __init__(self, embed_size, heads, alibi_alpha=1.0, start_i_increment=0, use_alibi=True, use_talking_heads=True,
-                 num_persistent=0, rma_inp_dim=None, weighted_heads=False, dynamic_alibi=False):
+                 num_persistent=0, rma_inp_dim=None, weighted_heads=False, dynamic_alibi=False, qk_rmsnorm=True):
         super(MultiHeadAttention, self).__init__()
         self.embed_size = embed_size
         self.heads = heads
         self.head_dim = embed_size // heads
         self.use_alibi = use_alibi
         self.dynamic_alibi = dynamic_alibi
+        self.qk_rmsnorm = qk_rmsnorm
 
         assert (
                 self.head_dim * heads == embed_size
@@ -408,10 +411,14 @@ class MultiHeadAttention(nn.Module):
         self.fc_out = nn.Linear(heads * self.head_dim, embed_size)
 
         self.alibi_alpha = alibi_alpha
-        self.use_talking_heads = use_talking_heads
+        self.use_talking_heads = False
         self.start_i_increment = start_i_increment
         self.num_persistent = num_persistent
         self.weighted_heads = weighted_heads
+
+        if self.qk_rmsnorm:
+            self.q_norm = RMSNorm(self.head_dim, bias=False)
+            self.k_norm = RMSNorm(self.head_dim, bias=False)
 
         if self.use_alibi:
             # Precompute ALiBi slopes
@@ -464,6 +471,10 @@ class MultiHeadAttention(nn.Module):
         values = self.values(values)
         keys = self.keys(keys)
         queries = self.queries(queries)
+
+        if self.qk_rmsnorm:
+            keys = self.k_norm(keys)
+            queries = self.q_norm(queries)
 
         current_persistent = self.num_persistent
 
@@ -526,10 +537,12 @@ class MultiHeadAttention(nn.Module):
                 # -1e4 for numerical stability with fp16
             energy = energy.masked_fill(mask == 0, float("-1e4"))
 
-        attention = F.softmax(energy / (self.embed_size ** (1 / 2)), dim=3)
+        attention_weights = F.softmax(energy / (self.embed_size ** (1 / 2)), dim=3)
 
         if self.use_talking_heads:
-            attention = self.post_softmax_talking_heads(attention)
+            attention = self.post_softmax_talking_heads(attention_weights)
+        else:
+            attention = attention_weights
 
         out = torch.einsum("nhql,nlhd->nqhd", [attention, values])
 
@@ -543,7 +556,7 @@ class MultiHeadAttention(nn.Module):
         if not return_weights:
             return out
         else:
-            return out, attention
+            return out, attention_weights
 
 
 def expand_masks(x_mask, y_mask):
