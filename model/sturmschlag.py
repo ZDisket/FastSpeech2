@@ -5,7 +5,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from .submodels import TextEncoder, SpectrogramDecoderAR, EmotionEncoder, NormalizedEmbedding, Aligner
+from .submodels import TextEncoder, SpectrogramDecoderAR, EmotionEncoder, NormalizedEmbedding, Aligner, PreEncoder
 from text.symbols import symbols
 from .submodels import sequence_mask as seq_mask2
 
@@ -35,6 +35,8 @@ class Sturmschlag(nn.Module):
             speaker_channels=self.speaker_channels,
         )
         self.emotion_encoder = EmotionEncoder(model_config["em_enc_sizes"], 0.5)
+        self.pre_encoder = PreEncoder(preprocess_config["preprocessing"]["mel"]["n_mel_channels"],
+                                      [1024, 1024], [7, 5])
 
         self.decoder = SpectrogramDecoderAR(model_config["transformer"]["encoder_hidden"],
                                             preprocess_config["preprocessing"]["mel"]["n_mel_channels"],
@@ -88,7 +90,10 @@ class Sturmschlag(nn.Module):
 
         encoded_text = self.encoder(texts, text_mask, encoded_emotion, spk_emb)
 
-        mel, gate, attn_logprob, x_mask_in = self.decoder(mels, mel_mask, encoded_text, text_mask)
+        # (batch, mel_len, mel_channels), (batch, mel_len)
+        mel, indices_gt = self.pre_encoder(mels, mel_mask)
+
+        logits, gate, attn_logprob, x_mask_in = self.decoder(indices_gt, mel_mask, encoded_text, text_mask)
         self.last_logprobs = attn_logprob
 
         return (
@@ -97,7 +102,9 @@ class Sturmschlag(nn.Module):
             text_mask,
             mel_mask,
             attn_logprob,
-            x_mask_in
+            x_mask_in,
+            logits,
+            indices_gt,
         )
 
     def infer(self, speakers, texts, src_lens, em_hidden=None, max_length=1000, gate_threshold=0.5):

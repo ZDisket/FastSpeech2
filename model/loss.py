@@ -585,21 +585,15 @@ class SturmLoss(nn.Module):
         model_out = (mel_pred, gate_pred, attn_logprob, x_mask_in)
         batch = (ids, raw_texts, speakers, texts, src_lens, mels, mel_lens, em_hidden)
         """
-        mel_pred, gate_pred, text_mask, mel_mask, attn_logprob, x_mask_in = model_out
+        mel_pred, gate_pred, text_mask, mel_mask, attn_logprob, x_mask_in, logits, indices_gt, = model_out
 
         mels_target = batch[5]  # (B, L, mel_channels)
         mel_lens = batch[6]     # (B,)
         input_lengths = batch[4]
+        token_target = indices_gt[:, 1:]  # Shape: (B, L-1)
 
-        # Shift ground truth by 1 frame for the next-frame objective
-        mel_target_shifted = mels_target[:, 1:, :]    # (B, L-1, mel_channels)
-
-        # Create a valid mask for the predicted region (B, L-1, 1)
-        # Because x_mask_in is True=padded, we invert it for the loss
-        valid_mask = (~x_mask_in).unsqueeze(-1).float()  # (B, L-1, 1)
-
-        # 1) Mel Loss
-        mel_loss = self.masked_mae(mel_pred, mel_target_shifted, valid_mask)
+        # 1) Mel Loss. This is simple reconstruction now
+        mel_loss = self.masked_mae(mel_pred, mels_target, (~mel_mask).float())
 
         # 2) Gate Loss
         # gate_pred shape: (B, L-1)
@@ -623,5 +617,20 @@ class SturmLoss(nn.Module):
             out_lens=output_lengths
         )
 
-        total_loss = mel_loss + gate_loss + al_forward_sum
-        return [total_loss, mel_loss, gate_loss, al_forward_sum]
+        # Assuming:
+        # - token_target has shape (B, L-1) (i.e. ground-truth tokens shifted by one).
+        # - logits has shape (B, L-1, vocab_size).
+        B, pred_len, V = logits.size()
+
+        # Shift the mel_mask to match token_target: use mel_mask[:, 1:]
+        valid_token_mask = (~x_mask_in).float()  # (B, L-1), True for valid tokens
+
+        # Compute per-token loss without reduction:
+        token_loss_all = F.cross_entropy(logits.view(-1, V), token_target.view(-1), reduction='none')
+        token_loss_all = token_loss_all.view(B, pred_len)
+
+        # Multiply by the valid mask and average over only valid tokens:
+        token_loss = (token_loss_all * valid_token_mask).sum() / valid_token_mask.sum()
+
+        total_loss = mel_loss + gate_loss + al_forward_sum + token_loss
+        return [total_loss, mel_loss, gate_loss, al_forward_sum, token_loss]

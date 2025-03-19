@@ -2,7 +2,7 @@ import torch
 import torch.nn as nn
 from .attentions import TransformerEncoder, TemporalConvNet, MultiHeadAttention, \
     mask_to_causal_attention_mask, TransposeLayerNorm, AttentionPooling, APTxS1, APTx, SwiGLUConvFFN, NeoTCNAttention, \
-    ConvReluNorm, TransformerDecoder, expand_self_attention_mask
+    ConvReluNorm, TransformerDecoder, expand_self_attention_mask, ResidualBlock1D
 from torch.nn.utils.rnn import pack_padded_sequence, pad_packed_sequence
 import torch.nn.functional as F
 from .attblocks import CBAM2d, MaskedSEBlock1D, CBAM1D
@@ -10,6 +10,7 @@ from .subatts import init_weights_he
 import monotonic_align, math
 from torchbnn import BayesLinear
 from .subatts import RMSNorm
+from finite_scalar_quantization import FSQ
 
 # Applying LayerNorm + Dropout on embeddings increases performance, probably due to the regularizing effect
 # Thanks dathudeptrai from TensorFlowTTS for discovering this.
@@ -159,6 +160,147 @@ class SimpleEmProj(nn.Module):
 
         return x
 
+
+class PreEncoder(nn.Module):
+    def __init__(self, mel_channels, channels, kernel_sizes, fsq_levels=[8, 5, 5, 5], dropout=0.5):
+        """
+        Spectrogram Pre-Encoder.
+        ResNet-based autoencoder with configurable encoder and decoder blocks.
+
+        Parameters:
+          - mel_channels (int): number of channels in the input spectrogram.
+          - channels (list of ints): list of channel dimensions for encoder blocks.
+            * The first element is the projected input dimension.
+            * The last element is the latent dimension.
+          - kernel_sizes (list of ints): list of kernel sizes for each ResidualBlock1D.
+            Length should be len(channels) - 1. The decoder will use these lists in reverse.
+        """
+        super(PreEncoder, self).__init__()
+        # Project input from mel_channels to channels[0]
+        self.proj = nn.Linear(mel_channels, channels[0])
+        self.quantizer_dim = len(fsq_levels)
+        # Encoder: build a sequence of ResidualBlock1D modules
+        self.encoder_blocks = nn.ModuleList([
+            ResidualBlock1D(channels[i], channels[i + 1], kernel_size=kernel_sizes[i], dropout=dropout)
+            for i in range(len(channels) - 1)
+        ])
+
+        # Quantization stage: here we use the latent dimension as the last element of channels.
+        latent_dim = channels[-1]
+
+        self.q_in_proj = nn.Linear(latent_dim, self.quantizer_dim)
+        self.quantizer = FSQ(levels=fsq_levels)
+        self.q_out_proj = nn.Linear(self.quantizer_dim, latent_dim)
+        self.codebook_size = 1024 # TODO: dyn calculate this
+
+        # Decoder: use the reversed lists so that the decoder mirrors the encoder.
+        rev_channels = list(reversed(channels))
+        rev_kernel_sizes = list(reversed(kernel_sizes))
+        self.decoder_blocks = nn.ModuleList([
+            ResidualBlock1D(rev_channels[i], rev_channels[i + 1], kernel_size=rev_kernel_sizes[i], dropout=dropout)
+            for i in range(len(rev_channels) - 1)
+        ])
+
+        # Output projection: map from the decoder’s final channel (channels[0]) back to mel_channels.
+        self.out_proj = nn.Linear(channels[0], mel_channels)
+
+    def forward(self, x, x_mask):
+        """
+        Forward pass.
+
+        Parameters:
+          - x: Tensor of shape (batch, mel_len, mel_channels)
+          - x_mask: Tensor of shape (batch, mel_len), bool where padded positions are True.
+                   (This mask will be passed to each ResidualBlock1D, which is assumed to apply
+                   .masked_fill(x_mask, 0) before its activation calls.)
+        Returns:
+          - Reconstructed tensor of shape (batch, mel_len, mel_channels)
+        """
+        # Project input to channel dimension channels[0]
+        x = self.proj(x)  # (batch, mel_len, channels[0])
+        # Permute to (batch, channels[0], mel_len) for 1D convolutions.
+        x = x.permute(0, 2, 1)
+        x_mask = x_mask.unsqueeze(1)
+
+        # Pass through the encoder blocks
+        for block in self.encoder_blocks:
+            x = block(x, x_mask=x_mask)
+
+        # Permute back to (batch, mel_len, latent_dim)
+        x = x.permute(0, 2, 1)
+        x = self.q_in_proj(x)
+        xhat, indices = self.quantizer(x)
+        x = self.q_out_proj(xhat)
+        # Permute for the decoder
+        x = x.permute(0, 2, 1)
+
+        # Pass through the decoder blocks
+        for block in self.decoder_blocks:
+            x = block(x, x_mask=x_mask)
+
+        # Permute back to (batch, mel_len, channels[0])
+        x = x.permute(0, 2, 1)
+        # Final projection back to mel_channels
+        x = self.out_proj(x)
+        return x, indices
+
+    def encode(self, x, x_mask):
+        """
+        Encodes the input spectrogram into discrete latent indices.
+
+        Args:
+            x (torch.Tensor): Input tensor of shape (batch, mel_len, mel_channels).
+          - x_mask: Tensor of shape (batch, mel_len), bool where padded positions are True.
+                   (This mask will be passed to each ResidualBlock1D, which is assumed to apply
+                   .masked_fill(x_mask, 0) before its activation calls.)
+        Returns:
+            indices (torch.Tensor): Discrete token indices from the vector quantizer.
+        """
+        # Project input to latent_dim
+        x = self.proj(x)
+        # Permute to (batch, latent_dim, mel_len) for convolutional operations
+        x = x.permute(0, 2, 1)
+        # Pass through the encoder blocks
+        for block in self.encoder_blocks:
+            x = block(x, x_mask=x_mask)
+        # Permute back to (batch, mel_len, latent_dim)
+        x = x.permute(0, 2, 1)
+        # Project to quantizer input dimension (e.g. 4)
+        x = self.q_in_proj(x)
+        # Quantize and obtain indices
+        _, indices = self.quantizer(x)
+        return indices
+
+    def decode(self, indices, x_mask=None):
+        """
+        Decodes discrete latent indices into a reconstructed spectrogram.
+
+        Args:
+            indices (torch.Tensor): Discrete token indices from the vector quantizer.
+
+        Returns:
+            x (torch.Tensor): Reconstructed spectrogram of shape (batch, mel_len, mel_channels).
+        """
+        # Convert indices to quantized latent codes (shape: (batch, mel_len, 4))
+        xhat = self.quantizer.indices_to_codes(indices)
+        # Project quantized representation back to latent_dim
+        x = self.q_out_proj(xhat)
+        # Permute to (batch, latent_dim, mel_len) for convolutional operations
+
+        x = x.permute(0, 2, 1)
+
+        if x_mask is None:
+            x_mask = torch.zeros(x.size(), device=x.device).bool()
+
+        # Pass through the decoder blocks
+        for block in self.decoder_blocks:
+            x = block(x, x_mask=x_mask)
+
+        # Permute back to (batch, mel_len, latent_dim)
+        x = x.permute(0, 2, 1)
+        # Project back to the original mel_channels
+        x = self.out_proj(x)
+        return x
 
 class TextEncoder(nn.Module):
     def __init__(self, vocab_size, embed_size, num_heads, num_layers, forward_expansion, dropout, kernel_sizes,
@@ -568,9 +710,8 @@ class SpectrogramDecoderAR(nn.Module):
         super().__init__()
 
         self.filter_channels = filter_channels
-        self.mel_channels = mel_channels
 
-        self.x_proj = DecoderPrenet(mel_channels, [256, filter_channels], 0.1)
+        self.x_proj = nn.Embedding(1024, filter_channels)
         self.y_proj = nn.Identity()
 
         self.dec = TransformerDecoder(filter_channels, heads=heads, num_layers=depth,
@@ -578,19 +719,19 @@ class SpectrogramDecoderAR(nn.Module):
                                       alibi_alpha=alibi_alpha, start_i=0, act="relugt", talking_heads=True,
                                       dynamic_alibi=True)
 
-        self.mel_proj = nn.Linear(filter_channels, mel_channels)
+        self.out_proj = nn.Linear(filter_channels, 1024)
         self.gate_proj = nn.Linear(filter_channels, 1)  # no sigmoid, we use BCEWithLogitsLoss
         self.pre_aligner = SimpleAttention(filter_channels, filter_channels)
 
     def forward(self, x, x_mask, y, y_mask):
         """
         Autoregressive next-frame prediction:
-          - x is the full ground-truth mel (B, L, mel_channels),
+          - x is the indices
             but we only feed frames [0..L-2] into the network.
           - We produce L-1 outputs that correspond to predicting the *next* frame.
 
         Args:
-            x: FloatTensor of shape (B, L, mel_channels), ground-truth mel
+            x: IntTensor of shape (B, L), indices
             x_mask: BoolTensor of shape (B, L) with True indicating padding
             y: FloatTensor of shape (B, text_len, text_channels), encoder outputs
             y_mask: BoolTensor of shape (B, text_len), True=padded
@@ -602,7 +743,7 @@ class SpectrogramDecoderAR(nn.Module):
             x_mask_in: The shifted mask (B, L-1) so you can pass it to the loss if needed
         """
         # 1) Shift the input by dropping the last frame, so the model predicts the next frame.
-        x_in = x[:, :-1, :]  # (B, L-1, mel_channels)
+        x_in = x[:, :-1]  # (B, L-1)
         x_mask_in = x_mask[:, :-1]  # (B, L-1), same shift
 
         # Create masks
@@ -612,7 +753,7 @@ class SpectrogramDecoderAR(nn.Module):
         conv_x_mask = x_mask_in.unsqueeze(1)  # (B, 1, L-1)
 
         # 2) Project the input mel frames and text
-        x_proj = self.x_proj(x_in, lin_x_mask)
+        x_proj = self.x_proj(x_in).unsqueeze(-1)
         y_proj = self.y_proj(y)
 
         # 3) Pre-aligner: helps with alignment signals
@@ -624,10 +765,10 @@ class SpectrogramDecoderAR(nn.Module):
         dec_out = self.dec(x_in_aligned, y_proj, sa_mask, ca_mask, conv_x_mask)
 
         # 5) Final projections to mel frames + gate
-        mel_pred = self.mel_proj(dec_out)  # (B, L-1, mel_channels)
+        indices_pred = self.out_proj(dec_out)  # (B, L-1, 1024)
         gate_pred = self.gate_proj(dec_out)  # (B, L-1, 1)
 
-        return mel_pred, gate_pred, attn_logprob, x_mask_in
+        return indices_pred, gate_pred, attn_logprob, x_mask_in
 
     def infer(self, y, y_mask, max_length=1000, gate_threshold=0.5):
         """
@@ -964,7 +1105,8 @@ class SimpleAttention(nn.Module):
         self.key_layer = nn.Linear(input_dim, attention_dim, bias=False)
         self.value_layer = nn.Linear(input_dim, attention_dim, bias=False)
         self.attention_dim = attention_dim
-        self.use_positional_encoding = use_positional_encoding
+        self.use_positional_encoding = False
+        self.proj = nn.Linear(attention_dim, attention_dim)
 
         self.query_norm = RMSNorm(attention_dim)
         self.key_norm = RMSNorm(attention_dim)
@@ -997,7 +1139,9 @@ class SimpleAttention(nn.Module):
         # Compute the context vector as the weighted sum of values
         context_vector = torch.matmul(attention_weights, value)
 
-        return context_vector, attention_weights
+        out = self.proj(context_vector)
+
+        return out, attention_weights
 
 
 class PositionalEncoding(nn.Module):

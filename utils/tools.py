@@ -214,11 +214,12 @@ def log(
     logger, step=None, losses=None, fig=None, audio=None, sampling_rate=22050, tag=""
 ):
     if losses is not None:
-        if len(losses) == 4: #Sturmschlag
+        if len(losses) == 5: #Sturmschlag
             logger.add_scalar("Loss/total_loss", losses[0], step)
             logger.add_scalar("Loss/mel_loss", losses[1], step)
             logger.add_scalar("Loss/gate_loss", losses[2], step)
             logger.add_scalar("Loss/forward_sum_loss", losses[3], step)
+            logger.add_scalar("Loss/decoder_token_loss", losses[4], step)
         else: #FastSpeech2
             logger.add_scalar("Loss/total_loss", losses[0], step)
             logger.add_scalar("Loss/mel_loss", losses[1], step)

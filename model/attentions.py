@@ -372,6 +372,25 @@ class SwiGLUConvFFN(nn.Module):
         return out
 
 
+class DynamicALiBi(nn.Module):
+    def __init__(self, num_heads, min_val=0.8, max_val=1.2):
+        super().__init__()
+        self.min_val = min_val
+        self.max_val = max_val
+        self.heads = num_heads
+
+        # Initialize with values near 1.0, ensuring a stable start
+        self.alibi_betas = nn.Parameter(torch.ones(num_heads) * 1.0)
+
+        # Register a hook to enforce constraints after every optimization step
+        self.alibi_betas.register_hook(
+            lambda grad: grad * ((self.alibi_betas >= self.min_val) & (self.alibi_betas <= self.max_val)).float())
+
+    def forward(self):
+        # Ensure alibi_betas stays within the valid range
+        with torch.no_grad():
+            self.alibi_betas.clamp_(self.min_val, self.max_val)
+        return self.alibi_betas.view(1, self.heads, 1, 1)
 
 
 class MultiHeadAttention(nn.Module):
@@ -427,7 +446,9 @@ class MultiHeadAttention(nn.Module):
                 dtype=torch.float32).view(1, self.heads, 1, 1)
 
             if self.dynamic_alibi:
-                self.alibi_betas = nn.Parameter(torch.ones(self.heads).view(1, self.heads, 1, 1))
+                # if we just make it a naive parameter it can learn extreme/nonsense values
+                # and break the attention (i learned the hard way)
+                self.alibi_adapter = DynamicALiBi(self.heads, 0.8, 1.25)
 
         if self.use_talking_heads:  # Talking heads: x-transformers version (using Conv2d instead of Linear)
             self.pre_softmax_talking_heads = nn.Conv2d(heads, heads, 1, bias=False)
@@ -504,6 +525,9 @@ class MultiHeadAttention(nn.Module):
         # Compute energy using einsum, simplifying matrix multiplication across batches and heads
         energy = torch.einsum("nqhd,nkhd->nhqk", [queries, keys])
 
+        if self.use_talking_heads:
+            energy = self.pre_softmax_talking_heads(energy)
+
         # Apply ALiBi positional encodings if enabled
         if self.use_alibi:
             self.slopes = self.slopes.to(energy.device)
@@ -513,7 +537,8 @@ class MultiHeadAttention(nn.Module):
             alibi_bias = (t_q.view(1, 1, -1, 1) - t_k.view(1, 1, 1, -1)).abs()
 
             if self.dynamic_alibi:
-                alibi_bias = -alibi_bias * (self.slopes * self.alibi_betas)
+                alibi_betas = self.alibi_adapter()
+                alibi_bias = -alibi_bias * (self.slopes * alibi_betas)
             else:
                 alibi_bias = -alibi_bias * self.slopes
 
@@ -524,9 +549,6 @@ class MultiHeadAttention(nn.Module):
                 alibi_bias = extended_alibi_bias
 
             energy += alibi_bias
-
-        if self.use_talking_heads:
-            energy = self.pre_softmax_talking_heads(energy)
 
         if mask is not None:
             if current_persistent > 0:
@@ -731,7 +753,7 @@ class TransformerDecoder(nn.Module):
         super().__init__()
         self.use_conv_att = False
         if alibi_scaling_fac is None:
-            alibi_scaling_fac = heads // 2
+            alibi_scaling_fac = 1
 
         self.decoder_layers = nn.ModuleList([  # Layer-Scaled ALiBi
             TransformerDecoderLayer(embed_size, heads, forward_expansion, dropout, alibi_alpha=alibi_alpha,
@@ -772,7 +794,7 @@ class TransformerEncoder(nn.Module):
         self.use_conv_att = conv_att
         self.coarse_fine = coarse_fine
         if alibi_scaling_fac is None:
-            alibi_scaling_fac = heads // 2
+            alibi_scaling_fac = 1
 
         # Our design is coarse fine attention for all layers except the first.
         coarse_fine_vec = [self.coarse_fine] * num_layers
@@ -1033,7 +1055,10 @@ def mask_to_causal_attention_mask(mask):
 
 class ResidualBlock1D(nn.Module):
     """
-    Conv1D+Squeeze-Excite+RMSNorm residual block for sequence modeling
+    Conv1D+Squeeze-Excite+RMSNorm residual block for sequence modeling with optional masking.
+
+    Accepts an optional x_mask (batch, 1, len) bool Tensor where padded elements are True.
+    If provided, the mask is applied with .masked_fill() before each activation.
     """
 
     def __init__(self, in_channels, out_channels, kernel_size=3, dilation=1, dropout=0.3, act="relu"):
@@ -1049,16 +1074,24 @@ class ResidualBlock1D(nn.Module):
         self.residual = nn.Conv1d(in_channels, out_channels,
                                   kernel_size=1) if in_channels != out_channels else nn.Identity()
 
-    def forward(self, x):
+    def forward(self, x, x_mask=None):
         residual = self.residual(x)
         out = self.conv1(x)
         out = self.norm1(out)
+        # Apply mask before the first activation if provided
+        if x_mask is not None:
+            out = out.masked_fill(x_mask, 0)
         out = self.relu(out)
+
         out = self.conv2(out)
         out = self.norm2(out)
         out = self.se(out)
         out += residual
+        # Apply mask before the second activation if provided
+        if x_mask is not None:
+            out = out.masked_fill(x_mask, 0)
         out = self.relu(out)
+
         out = self.dropout(out)
         return out
 

@@ -205,7 +205,7 @@ def main(args, configs):
                     losses = [l.item() for l in losses]
                     message1 = "Step {}/{}, ".format(step, total_step)
                     message2 = (
-                        "Total Loss: {:.4f}, Mel Loss: {:.4f}, Gate Loss: {:.4f}, Forward Sum Loss: {:.4f}"
+                        "Total Loss: {:.4f}, Mel Loss: {:.4f}, Gate Loss: {:.4f}, Forward Sum Loss: {:.4f}, Decoder Token Loss: {:.4f}"
                     ).format(
                         *losses
                     )
