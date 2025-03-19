@@ -10,7 +10,7 @@ from .subatts import init_weights_he
 import monotonic_align, math
 from torchbnn import BayesLinear
 from .subatts import RMSNorm
-from finite_scalar_quantization import FSQ
+from .finite_scalar_quantization import FSQ
 
 # Applying LayerNorm + Dropout on embeddings increases performance, probably due to the regularizing effect
 # Thanks dathudeptrai from TensorFlowTTS for discovering this.
