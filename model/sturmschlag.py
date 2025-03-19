@@ -36,7 +36,7 @@ class Sturmschlag(nn.Module):
         )
         self.emotion_encoder = EmotionEncoder(model_config["em_enc_sizes"], 0.5)
         self.pre_encoder = PreEncoder(preprocess_config["preprocessing"]["mel"]["n_mel_channels"],
-                                      [1024, 1024], [7, 5])
+                                      [1024, 1024], [5, 3], dropout=0.2)
 
         self.decoder = SpectrogramDecoderAR(model_config["transformer"]["encoder_hidden"],
                                             preprocess_config["preprocessing"]["mel"]["n_mel_channels"],

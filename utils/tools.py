@@ -157,7 +157,7 @@ def log_attention_maps_mh(logger, attention_tensor, widths, heights, step, tag_p
 
             # Crop the attention map for this head.
             attn_map = attention_tensor[i, j, :valid_height, :valid_width].detach().cpu().numpy()
-            im = ax.imshow(attn_map, cmap='viridis', interpolation='nearest', aspect='auto', vmin=0, vmax=1)
+            im = ax.imshow(attn_map, cmap='viridis', interpolation='nearest', aspect='auto')
             ax.set_title(f'Head {j + 1}', fontsize='small')
             ax.set_xlabel('Encoder Timesteps', fontsize='x-small')
             ax.set_ylabel('Decoder Timesteps', fontsize='x-small')
@@ -198,7 +198,7 @@ def log_attention_maps(logger, attention_tensor, widths, heights, step, tag_pref
         fig, ax = plt.subplots(figsize=(fig_width, fig_height))  # Create a matplotlib figure and axes.
         # Slice the attention tensor to the specified width and height
         attention_map = attention_tensor[i, :heights[i], :widths[i]].cpu().numpy()
-        im = ax.imshow(attention_map, cmap='viridis', interpolation='nearest', vmin=0, vmax=1)
+        im = ax.imshow(attention_map, cmap='viridis', interpolation='nearest')
         # Adjust colorbar size by changing fraction and pad
         plt.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
         plt.title(f'')

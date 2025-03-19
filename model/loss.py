@@ -593,7 +593,7 @@ class SturmLoss(nn.Module):
         token_target = indices_gt[:, 1:]  # Shape: (B, L-1)
 
         # 1) Mel Loss. This is simple reconstruction now
-        mel_loss = self.masked_mae(mel_pred, mels_target, (~mel_mask).float())
+        mel_loss = self.masked_mae(mel_pred, mels_target, (~mel_mask.unsqueeze(-1)).float())
 
         # 2) Gate Loss
         # gate_pred shape: (B, L-1)
@@ -626,7 +626,7 @@ class SturmLoss(nn.Module):
         valid_token_mask = (~x_mask_in).float()  # (B, L-1), True for valid tokens
 
         # Compute per-token loss without reduction:
-        token_loss_all = F.cross_entropy(logits.view(-1, V), token_target.view(-1), reduction='none')
+        token_loss_all = F.cross_entropy(logits.view(-1, V), token_target.reshape(-1), reduction='none')
         token_loss_all = token_loss_all.view(B, pred_len)
 
         # Multiply by the valid mask and average over only valid tokens:

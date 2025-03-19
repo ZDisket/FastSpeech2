@@ -181,7 +181,7 @@ class PreEncoder(nn.Module):
         self.quantizer_dim = len(fsq_levels)
         # Encoder: build a sequence of ResidualBlock1D modules
         self.encoder_blocks = nn.ModuleList([
-            ResidualBlock1D(channels[i], channels[i + 1], kernel_size=kernel_sizes[i], dropout=dropout)
+            ResidualBlock1D(channels[i], channels[i + 1], kernel_size=kernel_sizes[i], dropout=dropout, act="aptx")
             for i in range(len(channels) - 1)
         ])
 
@@ -197,7 +197,7 @@ class PreEncoder(nn.Module):
         rev_channels = list(reversed(channels))
         rev_kernel_sizes = list(reversed(kernel_sizes))
         self.decoder_blocks = nn.ModuleList([
-            ResidualBlock1D(rev_channels[i], rev_channels[i + 1], kernel_size=rev_kernel_sizes[i], dropout=dropout)
+            ResidualBlock1D(rev_channels[i], rev_channels[i + 1], kernel_size=rev_kernel_sizes[i], dropout=dropout, act="aptx")
             for i in range(len(rev_channels) - 1)
         ])
 
@@ -242,7 +242,7 @@ class PreEncoder(nn.Module):
         x = x.permute(0, 2, 1)
         # Final projection back to mel_channels
         x = self.out_proj(x)
-        return x, indices
+        return x, indices.long() # otherwise crossentropyloss bitches later on
 
     def encode(self, x, x_mask):
         """
@@ -269,7 +269,7 @@ class PreEncoder(nn.Module):
         x = self.q_in_proj(x)
         # Quantize and obtain indices
         _, indices = self.quantizer(x)
-        return indices
+        return indices.long()
 
     def decode(self, indices, x_mask=None):
         """
@@ -753,7 +753,7 @@ class SpectrogramDecoderAR(nn.Module):
         conv_x_mask = x_mask_in.unsqueeze(1)  # (B, 1, L-1)
 
         # 2) Project the input mel frames and text
-        x_proj = self.x_proj(x_in).unsqueeze(-1)
+        x_proj = self.x_proj(x_in)
         y_proj = self.y_proj(y)
 
         # 3) Pre-aligner: helps with alignment signals

@@ -1067,7 +1067,7 @@ class ResidualBlock1D(nn.Module):
         self.conv2 = nn.Conv1d(out_channels, out_channels, kernel_size, dilation=dilation, padding="same")
         self.norm1 = TransposeRMSNorm(out_channels)
         self.norm2 = TransposeRMSNorm(out_channels)
-        self.se = SEBlock1D(out_channels)
+        self.cbam = CBAM1D(out_channels)
         self.relu = APTx() if act == "aptx" else nn.ReLU()
         self.dropout = nn.Dropout(dropout)
 
@@ -1082,10 +1082,11 @@ class ResidualBlock1D(nn.Module):
         if x_mask is not None:
             out = out.masked_fill(x_mask, 0)
         out = self.relu(out)
+        out = self.dropout(out)
 
         out = self.conv2(out)
         out = self.norm2(out)
-        out = self.se(out)
+        out = self.cbam(out, x_mask)
         out += residual
         # Apply mask before the second activation if provided
         if x_mask is not None:
