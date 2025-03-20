@@ -142,11 +142,12 @@ class Sturmschlag(nn.Module):
         # Encode the text using the text encoder.
         encoded_text = self.encoder(texts, text_mask, encoded_emotion, spk_emb)
 
-
         # Now hand off the encoded text to the decoder's inference method.
         # The decoder autoregressively generates mel spectrogram frames.
-        mel, gate = self.decoder.infer(encoded_text, text_mask, max_length=max_length,
-                                           gate_threshold=gate_threshold)
+        token_outputs, gate = self.decoder.infer(encoded_text, text_mask, max_length=max_length,
+                                                 gate_threshold=gate_threshold)
+
+        mel = self.pre_encoder.decode(token_outputs)
 
         return mel, gate
 

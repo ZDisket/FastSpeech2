@@ -13,6 +13,14 @@ from torchbnn import BayesConv1d
 from .attblocks import *
 from .subatts import *
 
+flex_attention_available = False
+try:
+    from torch.nn.attention.flex_attention import flex_attention, create_block_mask
+    flex_attention_available = True
+except ImportError:
+    print("FlexAttention not available.")
+
+
 
 class PartialConv1d(torch.nn.Conv1d):
     """
@@ -411,7 +419,7 @@ class MultiHeadAttention(nn.Module):
     """
 
     def __init__(self, embed_size, heads, alibi_alpha=1.0, start_i_increment=0, use_alibi=True, use_talking_heads=True,
-                 num_persistent=0, rma_inp_dim=None, weighted_heads=False, dynamic_alibi=False, qk_rmsnorm=True):
+                 num_persistent=0, rma_inp_dim=None, weighted_heads=False, dynamic_alibi=False, qk_rmsnorm=True, use_flex_attention=False):
         super(MultiHeadAttention, self).__init__()
         self.embed_size = embed_size
         self.heads = heads
@@ -419,6 +427,14 @@ class MultiHeadAttention(nn.Module):
         self.use_alibi = use_alibi
         self.dynamic_alibi = dynamic_alibi
         self.qk_rmsnorm = qk_rmsnorm
+        if use_flex_attention:
+            if not flex_attention_available:
+                print("Warning! Tried to turn on FlexAttention, but it's not available. Falling back...")
+                use_flex_attention = False
+
+        self.use_flex_attention = use_flex_attention
+
+
 
         assert (
                 self.head_dim * heads == embed_size
@@ -434,6 +450,12 @@ class MultiHeadAttention(nn.Module):
         self.start_i_increment = start_i_increment
         self.num_persistent = num_persistent
         self.weighted_heads = weighted_heads
+
+        if self.use_flex_attention:
+            self.use_talking_heads = False
+            self.num_persistent = 0
+            self.rma_inp_dim = None
+            self.weighted_heads = False
 
         if self.qk_rmsnorm:
             self.q_norm = RMSNorm(self.head_dim, bias=False)
@@ -471,13 +493,79 @@ class MultiHeadAttention(nn.Module):
         if self.weighted_heads:
             self.head_weights = nn.Parameter(torch.ones(self.heads))
 
+    def calculate_alibi_bias(self, device, query_len, key_len, current_persistent):
+        self.slopes = self.slopes.to(device)
+        t_q = torch.arange(query_len, device=device)
+        t_k = torch.arange(key_len, device=device)
+        alibi_bias = (t_q.view(1, 1, -1, 1) - t_k.view(1, 1, 1, -1)).abs()
+        if self.dynamic_alibi:
+            alibi_betas = self.alibi_adapter()
+            alibi_bias = -alibi_bias * (self.slopes * alibi_betas)
+        else:
+            alibi_bias = -alibi_bias * self.slopes
+        if current_persistent > 0:
+            alibi_bias = F.pad(alibi_bias, (0, current_persistent), "constant", 0).to(device)
+        return alibi_bias
+
+    def attention_forward(self, queries, keys, values, mask, alibi_bias, current_persistent, N, query_len, key_len):
+        # Compute energy using einsum, simplifying matrix multiplication across batches and heads
+        energy = torch.einsum("nqhd,nkhd->nhqk", [queries, keys])
+
+        if self.use_talking_heads:
+            energy = self.pre_softmax_talking_heads(energy)
+
+        energy += alibi_bias
+
+        if mask is not None:
+            if current_persistent > 0:
+                # Extend mask to include persistent vectors (always unmasked)
+                extended_mask = F.pad(mask, (0, current_persistent), value=1)
+                extended_mask = extended_mask.expand(N, self.heads, query_len, key_len + current_persistent)
+                mask = extended_mask
+            energy = energy.masked_fill(mask == 0, float("-1e4"))
+
+        attention_weights = F.softmax(energy / (self.embed_size ** (1 / 2)), dim=3)
+
+        if self.use_talking_heads:
+            attention = self.post_softmax_talking_heads(attention_weights)
+        else:
+            attention = attention_weights
+
+        out = torch.einsum("nhql,nlhd->nqhd", [attention, values])
+
+        if self.weighted_heads:  # (batch, len, n_heads, head_dim)
+            out = out * self.head_weights.view(1, 1, -1, 1)
+
+        return out, attention_weights
+
+    def flex_attention_forward(self, queries, keys, values, mask, alibi_bias, N, query_len, key_len):
+        # Define score_mod function that applies ALiBi bias.
+        def score_mod(score, b, h, q_idx, kv_idx):
+            return score - alibi_bias
+
+        # Define mask_mod based on the provided mask tensor.
+        if mask is not None:
+            # The provided mask has shape (N, 1, query_len, original_key_len)
+            def mask_mod(b, h, q_idx, kv_idx):
+                return mask[b, 0, q_idx, kv_idx].item()
+
+            block_mask = create_block_mask(mask_mod, B=N, H=self.heads, Q_LEN=query_len, KV_LEN=key_len,
+                                           device=queries.device)
+        else:
+            block_mask = None
+
+        # Compute attention via FlexAttention.
+        out = flex_attention(queries, keys, values, score_mod=score_mod, block_mask=block_mask)
+        attention_weights = None
+        return out, attention_weights
+
     def forward(self, values, keys, queries, mask=None, recurr_persistent=None, return_weights=False):
         """
         Do attention
         :param values: Values
         :param keys: Keys
         :param queries: Queries
-        :param mask: Attention mask
+        :param mask: Attention mask size (batch, 1, query_len, key_len), bool mask where True is valid
         :param recurr_persistent: Packed tuple (keys, values) of recurrent persistent memory
         :return: Attentioned tensor
         """
@@ -522,54 +610,15 @@ class MultiHeadAttention(nn.Module):
             keys = torch.cat([keys, expanded_persistent_keys], dim=1)
             values = torch.cat([values, expanded_persistent_values], dim=1)
 
-        # Compute energy using einsum, simplifying matrix multiplication across batches and heads
-        energy = torch.einsum("nqhd,nkhd->nhqk", [queries, keys])
+        alibi_bias = self.calculate_alibi_bias(keys.device, query_len, key_len, current_persistent)
 
-        if self.use_talking_heads:
-            energy = self.pre_softmax_talking_heads(energy)
-
-        # Apply ALiBi positional encodings if enabled
-        if self.use_alibi:
-            self.slopes = self.slopes.to(energy.device)
-
-            t_q = torch.arange(query_len, device=energy.device)
-            t_k = torch.arange(key_len, device=energy.device)
-            alibi_bias = (t_q.view(1, 1, -1, 1) - t_k.view(1, 1, 1, -1)).abs()
-
-            if self.dynamic_alibi:
-                alibi_betas = self.alibi_adapter()
-                alibi_bias = -alibi_bias * (self.slopes * alibi_betas)
-            else:
-                alibi_bias = -alibi_bias * self.slopes
-
-            if current_persistent > 0:
-                # Extend ALiBi bias for persistent vectors with zero bias (so that it is allowed to attend to everything)
-                extended_alibi_bias = F.pad(alibi_bias, (0, current_persistent), "constant", 0)
-                extended_alibi_bias = extended_alibi_bias.to(energy.device)
-                alibi_bias = extended_alibi_bias
-
-            energy += alibi_bias
-
-        if mask is not None:
-            if current_persistent > 0:
-                # Extend mask to include persistent vectors (always unmasked)
-                extended_mask = F.pad(mask, (0, current_persistent), value=1)
-                extended_mask = extended_mask.expand(N, self.heads, query_len, key_len + current_persistent)
-                mask = extended_mask
-                # -1e4 for numerical stability with fp16
-            energy = energy.masked_fill(mask == 0, float("-1e4"))
-
-        attention_weights = F.softmax(energy / (self.embed_size ** (1 / 2)), dim=3)
-
-        if self.use_talking_heads:
-            attention = self.post_softmax_talking_heads(attention_weights)
+        if self.use_flex_attention:
+            out, attention_weights = self.flex_attention_forward(queries, keys, values, mask, alibi_bias, N, query_len,
+                                                                 key_len)
         else:
-            attention = attention_weights
-
-        out = torch.einsum("nhql,nlhd->nqhd", [attention, values])
-
-        if self.weighted_heads:  # (batch, len, n_heads, head_dim)
-            out = out * self.head_weights.view(1, 1, -1, 1)
+            out, attention_weights = self.attention_forward(queries, keys, values, mask, alibi_bias, current_persistent,
+                                                            N,
+                                                            query_len, key_len)
 
         out = out.reshape(N, query_len, self.heads * self.head_dim)
 
@@ -622,7 +671,7 @@ class TransformerEncoderLayer(nn.Module):
                                             start_i_increment=start_i_increment, num_persistent=rma_mem_dim,
                                             rma_inp_dim=embed_size // heads if self.use_rma else 0,
                                             use_talking_heads=talking_heads,
-                                            dynamic_alibi=dynamic_alibi)
+                                            dynamic_alibi=dynamic_alibi, use_flex_attention=True)
 
         if self.coarse_fine:
             self.coarse_attention = MultiHeadAttention(embed_size, 1, alibi_alpha=alibi_alpha,
@@ -671,7 +720,7 @@ class TransformerEncoderLayer(nn.Module):
 
 class TransformerDecoderLayer(nn.Module):
     def __init__(self, embed_size, heads, forward_expansion, dropout, alibi_alpha=1.0, start_i_increment=0,
-                 kernel_size=1, act="swiglu", conv_att=False, talking_heads=True, dynamic_alibi=False):
+                 kernel_size=1, act="swiglu", conv_att=False, talking_heads=True, dynamic_alibi=False, flex_attention=True):
         super(TransformerDecoderLayer, self).__init__()
         self.norm1 = nn.LayerNorm(embed_size)
         self.norm2 = nn.LayerNorm(embed_size)
@@ -680,12 +729,12 @@ class TransformerDecoderLayer(nn.Module):
         self.attention = MultiHeadAttention(embed_size, heads, alibi_alpha=alibi_alpha,
                                             start_i_increment=start_i_increment, num_persistent=0,
                                             rma_inp_dim=0, use_talking_heads=talking_heads,
-                                            dynamic_alibi=dynamic_alibi)
+                                            dynamic_alibi=dynamic_alibi, use_flex_attention=True)
 
         self.cross_attention = MultiHeadAttention(embed_size, heads, alibi_alpha=alibi_alpha,
                                                   start_i_increment=start_i_increment, num_persistent=0,
                                                   rma_inp_dim=0, use_talking_heads=talking_heads,
-                                                  dynamic_alibi=dynamic_alibi)
+                                                  dynamic_alibi=dynamic_alibi, use_flex_attention=flex_attention)
 
         self.feed_forward = SwiGLUConvFFN(
             in_features=embed_size,
@@ -755,12 +804,15 @@ class TransformerDecoder(nn.Module):
         if alibi_scaling_fac is None:
             alibi_scaling_fac = 1
 
+        use_flexattn_on_ca = [True] * num_layers
+        use_flexattn_on_ca[0] = False
+        use_flexattn_on_ca[-1] = False
         self.decoder_layers = nn.ModuleList([  # Layer-Scaled ALiBi
             TransformerDecoderLayer(embed_size, heads, forward_expansion, dropout, alibi_alpha=alibi_alpha,
                                     start_i_increment=start_i + ((i * heads) // alibi_scaling_fac), kernel_size=1,
                                     act=act
                                     , talking_heads=talking_heads,
-                                    dynamic_alibi=dynamic_alibi)
+                                    dynamic_alibi=dynamic_alibi, flex_attention=use_flexattn_on_ca)
             for i in range(num_layers)
         ])
 

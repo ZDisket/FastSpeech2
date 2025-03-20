@@ -290,7 +290,7 @@ class PreEncoder(nn.Module):
         x = x.permute(0, 2, 1)
 
         if x_mask is None:
-            x_mask = torch.zeros(x.size(), device=x.device).bool()
+            x_mask = torch.zeros((x.size(0), 1, x.size(2)), device=x.device).bool()
 
         # Pass through the decoder blocks
         for block in self.decoder_blocks:
@@ -710,8 +710,12 @@ class SpectrogramDecoderAR(nn.Module):
         super().__init__()
 
         self.filter_channels = filter_channels
+        self.embed_channels = 256
+        self.embed = nn.Embedding(1024, self.embed_channels)
 
-        self.x_proj = nn.Embedding(1024, filter_channels)
+        self.x_proj = nn.Linear(self.embed_channels, filter_channels)
+        self.proj_y_proj = nn.Linear(filter_channels, self.embed_channels)
+
         self.y_proj = nn.Identity()
 
         self.dec = TransformerDecoder(filter_channels, heads=heads, num_layers=depth,
@@ -721,9 +725,9 @@ class SpectrogramDecoderAR(nn.Module):
 
         self.out_proj = nn.Linear(filter_channels, 1024)
         self.gate_proj = nn.Linear(filter_channels, 1)  # no sigmoid, we use BCEWithLogitsLoss
-        self.pre_aligner = SimpleAttention(filter_channels, filter_channels)
+        self.pre_aligner = SimpleAttention(self.embed_channels, self.embed_channels)
 
-    def forward(self, x, x_mask, y, y_mask):
+    def forward(self, x, x_mask, y, y_mask, shift_tokens=True):
         """
         Autoregressive next-frame prediction:
           - x is the indices
@@ -743,59 +747,63 @@ class SpectrogramDecoderAR(nn.Module):
             x_mask_in: The shifted mask (B, L-1) so you can pass it to the loss if needed
         """
         # 1) Shift the input by dropping the last frame, so the model predicts the next frame.
-        x_in = x[:, :-1]  # (B, L-1)
-        x_mask_in = x_mask[:, :-1]  # (B, L-1), same shift
+        if shift_tokens:  # only shift if we are in training
+            x = x[:, :-1]  # (B, L-1)
+            x_mask = x_mask[:, :-1]  # (B, L-1), same shift
 
         # Create masks
-        sa_mask = expand_self_attention_mask(x_mask_in)  # self-attention
-        ca_mask = expand_masks2(x_mask_in, y_mask.bool())  # cross-attention
-        lin_x_mask = x_mask_in.unsqueeze(-1)  # (B, L-1, 1)
-        conv_x_mask = x_mask_in.unsqueeze(1)  # (B, 1, L-1)
+        sa_mask = expand_self_attention_mask(x_mask)  # self-attention
+        ca_mask = expand_masks2(x_mask, y_mask.bool())  # cross-attention
+        lin_x_mask = x_mask.unsqueeze(-1)  # (B, L-1, 1)
+        conv_x_mask = x_mask.unsqueeze(1)  # (B, 1, L-1)
 
-        # 2) Project the input mel frames and text
-        x_proj = self.x_proj(x_in)
-        y_proj = self.y_proj(y)
+        x = self.embed(x)
+
+        y_proj = self.proj_y_proj(y)
 
         # 3) Pre-aligner: helps with alignment signals
-        x_pre, x_pre_weights = self.pre_aligner(x_proj, y_proj, y_proj, mask=ca_mask.squeeze(1))
-        attn_logprob = safe_log(x_pre_weights.unsqueeze(1))
+        x_pre, x_pre_weights, attn_logprob = self.pre_aligner(x, y_proj, y_proj, mask=ca_mask.squeeze(1))
+        attn_logprob = attn_logprob.unsqueeze(1)
 
         # 4) Residual + Transformer Decoder
-        x_in_aligned = x_proj + x_pre
-        dec_out = self.dec(x_in_aligned, y_proj, sa_mask, ca_mask, conv_x_mask)
+        x = x + x_pre
+
+        x = self.x_proj(x)
+
+        dec_out = self.dec(x, y, sa_mask, ca_mask, conv_x_mask)
 
         # 5) Final projections to mel frames + gate
         indices_pred = self.out_proj(dec_out)  # (B, L-1, 1024)
         gate_pred = self.gate_proj(dec_out)  # (B, L-1, 1)
 
-        return indices_pred, gate_pred, attn_logprob, x_mask_in
+        return indices_pred, gate_pred, attn_logprob, x_mask
 
-    def infer(self, y, y_mask, max_length=1000, gate_threshold=0.5):
+    def infer(self, y, y_mask, max_length=1000, temperature=1.0, top_k=None, top_p=None, gate_threshold=0.5):
         """
-        Autoregressive inference function.
+        Autoregressive inference for discrete token generation.
 
         Args:
             y (torch.Tensor): Encoded text features of shape (B, text_len, text_channels).
             y_mask (torch.Tensor): Boolean mask of shape (B, text_len) where True indicates padded.
             max_length (int): Maximum number of decoder steps.
-            gate_threshold (float): Threshold on gate prediction to stop decoding.
+            temperature (float): Temperature for sampling (default=1.0).
+            top_k (int, optional): If set (>0), only sample from the top k tokens.
+            top_p (float, optional): If set (>0.0), only sample from the smallest set of tokens
+                                     whose cumulative probability exceeds top_p.
+            gate_threshold (float): Gate prediction threshold for stopping generation.
 
         Returns:
-            mel_outputs (torch.Tensor): Generated mel spectrogram of shape (B, mel_len, mel_channels).
-            gate_outputs (torch.Tensor): Gate predictions for each frame (B, mel_len, 1).
+            token_outputs (torch.Tensor): Generated sequence of tokens of shape (B, seq_len).
+            gate_outputs (torch.Tensor): Gate predictions for each token (B, seq_len, 1).
         """
         B = y.size(0)
         device = y.device
 
-        # Initialize mel spectrogram with a single "go" frame: zeros.
-        # Shape: (B, 1, mel_channels)
-        decoder_input = torch.zeros(B, 1, self.mel_channels, device=device)
+        # Initialize with a "go" token; we assume token index 0 is the start token.
+        decoder_input = torch.zeros(B, 1, dtype=torch.long, device=device)
 
-        # To store all predictions
-        mel_outputs = []
-        gate_outputs = []
-
-        # A flag to indicate which examples have finished decoding.
+        token_outputs = []  # To store generated tokens.
+        gate_outputs = []  # To store corresponding gate predictions.
         finished = torch.zeros(B, dtype=torch.bool, device=device)
 
         for t in range(max_length):
@@ -803,35 +811,56 @@ class SpectrogramDecoderAR(nn.Module):
                 print("Warning! Reached max decoder steps.")
 
             current_length = decoder_input.size(1)
-            # In autoregressive inference, no positions are padded so x_mask is all False.
+            # In inference mode, no positions are padded.
             x_mask = torch.zeros(B, current_length, dtype=torch.bool, device=device)
 
-            # Run forward pass to get predictions for the current sequence.
-            mel_pred, gate_pred = self.forward(decoder_input, x_mask, y, y_mask)
-            # mel_pred: (B, current_length, mel_channels)
-            # gate_pred: (B, current_length, 1)
+            # Run forward pass. In inference mode, the forward function returns predictions
+            # for each input token (i.e. no shifting is applied).
+            indices_pred, gate_pred, attn_logprob, _ = self.forward(decoder_input, x_mask, y, y_mask,
+                                                                    shift_tokens=False)
+            # Get the logits and gate prediction for the last token.
+            logits = indices_pred[:, -1, :]  # (B, vocab_size)
+            last_gate = gate_pred[:, -1, :]  # (B, 1)
 
-            # Get the last time-step's predictions.
-            last_mel = mel_pred[:, -1:, :]  # shape: (B, 1, mel_channels)
-            last_gate = gate_pred[:, -1, :]  # shape: (B, 1)
+            # Temperature scaling.
+            logits = logits / temperature
 
-            mel_outputs.append(last_mel)
+            # Optional top-k filtering.
+            if top_k is not None and top_k > 0:
+                topk_values, _ = torch.topk(logits, top_k)
+                min_values = topk_values[:, -1].unsqueeze(1)
+                logits = torch.where(logits < min_values, torch.tensor(-float('Inf'), device=device), logits)
+
+            # Optional top-p (nucleus) filtering.
+            if top_p is not None and top_p > 0.0:
+                sorted_logits, sorted_indices = torch.sort(logits, descending=True)
+                cumulative_probs = torch.cumsum(torch.softmax(sorted_logits, dim=-1), dim=-1)
+                sorted_indices_to_remove = cumulative_probs > top_p
+                # Shift the indices to the right to ensure at least one token is kept.
+                sorted_indices_to_remove[..., 1:] = sorted_indices_to_remove[..., :-1].clone()
+                sorted_indices_to_remove[..., 0] = 0
+                indices_to_remove = sorted_indices_to_remove.scatter(1, sorted_indices, sorted_indices_to_remove)
+                logits = logits.masked_fill(indices_to_remove, -float('Inf'))
+
+            probs = torch.softmax(logits, dim=-1)
+            # Sample the next token.
+            next_token = torch.multinomial(probs, num_samples=1)  # (B, 1)
+
+            token_outputs.append(next_token)
             gate_outputs.append(last_gate)
 
-            # Append the last mel frame to the decoder input for the next step.
-            decoder_input = torch.cat([decoder_input, last_mel], dim=1)
+            # Append the sampled token to the decoder input.
+            decoder_input = torch.cat([decoder_input, next_token], dim=1)
 
-            # Check which examples have predicted a gate value exceeding the threshold.
+            # Check termination: if the gate prediction exceeds the threshold, mark as finished.
             finished = finished | (last_gate.squeeze(1) > gate_threshold)
-            # If all sequences are finished, stop inference.
             if finished.all():
                 break
 
-        # Concatenate all predicted mel frames along time.
-        # Note that the first frame (initial zero "go" frame) is removed.
-        mel_outputs = torch.cat(mel_outputs, dim=1)  # shape: (B, mel_len, mel_channels)
-        gate_outputs = torch.cat(gate_outputs, dim=1)  # shape: (B, mel_len, 1)
-        return mel_outputs, gate_outputs
+        # Concatenate predictions along the time dimension.
+        token_outputs = torch.cat(token_outputs, dim=1)  # (B, seq_len)
+        gate_outputs = torch.cat(gate_outputs, dim=1)  # (B, seq_len, 1)
+        return token_outputs, gate_outputs
 
 
 class SpectrogramDecoder(nn.Module):
@@ -1130,6 +1159,9 @@ class SimpleAttention(nn.Module):
         # Compute attention scores
         attention_scores = torch.matmul(query, key.transpose(-2, -1)) / (self.attention_dim ** 0.5)
 
+        # clone this. CTC loss takes in attention log-probabilites BEFORE masking
+        attn_1 = attention_scores.clone()
+
         if mask is not None:
             attention_scores = attention_scores.masked_fill(mask == 0, float('-1e-9'))
 
@@ -1141,7 +1173,10 @@ class SimpleAttention(nn.Module):
 
         out = self.proj(context_vector)
 
-        return out, attention_weights
+        # create logprobs out of the earlier attn
+        attn_logprob = F.log_softmax(attn_1, -1)
+
+        return out, attention_weights, attn_logprob
 
 
 class PositionalEncoding(nn.Module):
@@ -1205,7 +1240,7 @@ class Aligner(nn.Module):
         # Run through MultiHeadAttention
         if self.attn_type == "simple":
             # query, key, value
-            attended, attention_weights = self.attn(mel_proj, text_proj, text_proj, mask=mha_mask.squeeze(1))
+            attended, attention_weights, attn_logprob = self.attn(mel_proj, text_proj, text_proj, mask=mha_mask.squeeze(1))
             attention_weights = attention_weights.unsqueeze(1)
         else:
             # values, keys, queries
@@ -1221,9 +1256,6 @@ class Aligner(nn.Module):
                 average_attention_weights = torch.mean(attention_weights, 1, keepdim=True)
         else:
             average_attention_weights = attention_weights
-
-        # Compute log probabilities for MAS and CTC loss
-        attn_logprob = safe_log(average_attention_weights)
 
         # prepare for MAS
         x_mask = ~x_mask

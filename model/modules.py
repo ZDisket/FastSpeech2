@@ -172,6 +172,7 @@ class AlignmentEncoder(torch.nn.Module):
         self.softmax = SafeSoftmax(dim=3)
         self.log_softmax = SafeLogSoftmax(dim=3)
 
+
         self.rotary_emb = RotaryEmbedding(n_att_channels // 2)
 
         self.key_proj = nn.Sequential(
