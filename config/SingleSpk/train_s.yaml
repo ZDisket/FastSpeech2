@@ -5,7 +5,7 @@ path:
 optimizer:
   batch_size: 128
   betas: [0.9, 0.999]
-  init_lr: 0.00001
+  init_lr: 0.0001
   gamma: 0.9999
   eps: 0.000000001
   weight_decay: 0.01
@@ -37,4 +37,4 @@ test_sentences:
   - "Now I see. Black human beings dislike the sound of rubbing glass probably the sound wave of the whistle"
 
 
-mel_regression: "mse" # for sturmschlag, can use mse, mae, or charbonnier
+mel_regression: "charbonnier" # for sturmschlag, can use mse, mae, or charbonnier

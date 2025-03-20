@@ -427,14 +427,13 @@ class MultiHeadAttention(nn.Module):
         self.use_alibi = use_alibi
         self.dynamic_alibi = dynamic_alibi
         self.qk_rmsnorm = qk_rmsnorm
+        use_flex_attention = False # FA not working, tries to allocate ~121GB of VRAM
         if use_flex_attention:
             if not flex_attention_available:
                 print("Warning! Tried to turn on FlexAttention, but it's not available. Falling back...")
                 use_flex_attention = False
 
         self.use_flex_attention = use_flex_attention
-
-
 
         assert (
                 self.head_dim * heads == embed_size

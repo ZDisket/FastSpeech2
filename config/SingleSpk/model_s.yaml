@@ -1,10 +1,10 @@
 transformer:
   encoder_layer: 6
   encoder_head: 8
-  encoder_hidden: 512
-  decoder_layer: 3
+  encoder_hidden: 768
+  decoder_layer: 6
   decoder_head: 8
-  decoder_hidden: 512
+  decoder_hidden: 768
   encoder_dropout: 0.1
   decoder_dropout: 0.1
   encoder_kernel_sizes: [3, 1, 3, 1, 3, 3]

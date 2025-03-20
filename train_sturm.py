@@ -104,7 +104,7 @@ def main(args, configs):
     # Prepare model
     model, optimizer = get_model(args, configs, device, train=True, model="st", opt="adamw")
 
-    warmup_steps = 5 if not len(args.pretrained) else 1
+    warmup_steps = 30 if not len(args.pretrained) else 1
     if args.restore_step:
         warmup_steps = 0
     else:
