@@ -7,6 +7,7 @@ import torch.nn.functional as F
 from torch import Tensor
 from torch.nn.utils import weight_norm
 from rotary_embedding_torch import RotaryEmbedding
+from torch.nn.utils.rnn import pack_padded_sequence, pad_packed_sequence
 
 import torchbnn
 from torchbnn import BayesConv1d
@@ -493,6 +494,9 @@ class MultiHeadAttention(nn.Module):
             self.head_weights = nn.Parameter(torch.ones(self.heads))
 
     def calculate_alibi_bias(self, device, query_len, key_len, current_persistent):
+        if not self.use_alibi:
+            return torch.zeros(1, device=device)
+
         self.slopes = self.slopes.to(device)
         t_q = torch.arange(query_len, device=device)
         t_k = torch.arange(key_len, device=device)
@@ -513,7 +517,8 @@ class MultiHeadAttention(nn.Module):
         if self.use_talking_heads:
             energy = self.pre_softmax_talking_heads(energy)
 
-        energy += alibi_bias
+        if self.use_alibi:
+            energy += alibi_bias
 
         if mask is not None:
             if current_persistent > 0:
@@ -523,7 +528,7 @@ class MultiHeadAttention(nn.Module):
                 mask = extended_mask
             energy = energy.masked_fill(mask == 0, float("-1e4"))
 
-        attention_weights = F.softmax(energy / (self.embed_size ** (1 / 2)), dim=3)
+        attention_weights = F.softmax(energy / (self.head_dim ** (1 / 2)), dim=3)
 
         if self.use_talking_heads:
             attention = self.post_softmax_talking_heads(attention_weights)
@@ -647,7 +652,9 @@ def expand_masks(x_mask, y_mask):
 
 def expand_self_attention_mask(mask):
     """
-    Correct implementation for Transformer self-attention mask.
+    Turn a bool mask into a Self attention mask
+    :param mask: Bool sequence mask, True=padding size (batch, max_length)
+    :return: Self attention mask size (batch, 1, seq_len, seq_len), True=valid
     """
     valid = ~mask
     attn_mask = valid.unsqueeze(1) & valid.unsqueeze(2)
@@ -733,7 +740,8 @@ class TransformerDecoderLayer(nn.Module):
         self.cross_attention = MultiHeadAttention(embed_size, heads, alibi_alpha=alibi_alpha,
                                                   start_i_increment=start_i_increment, num_persistent=0,
                                                   rma_inp_dim=0, use_talking_heads=talking_heads,
-                                                  dynamic_alibi=dynamic_alibi, use_flex_attention=flex_attention)
+                                                  dynamic_alibi=dynamic_alibi, use_flex_attention=flex_attention,
+                                                  use_alibi=False,)
 
         self.feed_forward = SwiGLUConvFFN(
             in_features=embed_size,
@@ -762,6 +770,86 @@ class TransformerDecoderLayer(nn.Module):
         norm_x_ff = self.norm3(x)
         ff_output = self.feed_forward(norm_x_ff, mask if conv_mask is None else conv_mask)
         x = x + self.dropout(ff_output)
+
+        # cache last attn weights
+        self.last_weights = cross_attn_weights
+
+        return x
+
+
+class RNNFormerLayer(nn.Module): # redundant arguments kept for easy interface with TransformerDecoder class
+    def __init__(self, embed_size, heads, forward_expansion, dropout, alibi_alpha=1.0, start_i_increment=0,
+                 kernel_size=1, act="swiglu", conv_att=False, talking_heads=True, dynamic_alibi=False, flex_attention=True):
+        super(RNNFormerLayer, self).__init__()
+        # Layer norms for stability
+        self.norm1 = nn.LayerNorm(embed_size)
+        self.norm2 = nn.LayerNorm(embed_size)
+        self.dropout = nn.Dropout(dropout)
+        self.last_weights = None
+
+        # Transformer-style cross-attention
+        self.cross_attention = MultiHeadAttention(
+            embed_size, heads,
+            alibi_alpha=alibi_alpha,
+            start_i_increment=start_i_increment,
+            num_persistent=0, rma_inp_dim=0,
+            use_talking_heads=talking_heads,
+            dynamic_alibi=dynamic_alibi,
+            use_flex_attention=flex_attention,
+            use_alibi=False,
+        )
+        rnn_type = "GRU"
+        # RNN block: choose between GRU or LSTM
+        if rnn_type.upper() == 'GRU':
+            self.rnn = nn.GRU(embed_size, embed_size, batch_first=True)
+        else:
+            self.rnn = nn.LSTM(embed_size, embed_size, batch_first=True)
+
+    def run_rnn(self, x, conv_mask):
+        # Pack padded sequence
+        # max(x_lengths) is less than the seq_len dimension in x, often by 5 or 10
+        # and the LSTM outputs a tensor of max(x_lengths) in its seq_len dimension
+        # therefore, we save the original seq_len dimension for padding back later
+        x_seq_len_orig = x.size(1)
+
+        # conv_mask: shape (batch, 1, seq_length), where True = padded, False = valid
+        # Step 1: Squeeze to shape (batch, seq_length)
+        mask = conv_mask.squeeze(1)
+        # Step 2: Invert the mask: valid tokens are now True
+        valid_mask = ~mask
+        # Step 3: Count valid tokens along the sequence dimension
+        x_lengths = valid_mask.sum(dim=1)
+
+
+        x = pack_padded_sequence(x, x_lengths.detach().cpu(),
+                                 # pack_padded_sequence demands that the lengths tensor be on the CPU
+                                 batch_first=True, enforce_sorted=False)
+        # LSTM pass
+        x, _ = self.rnn(x)
+        # Unpack the sequence
+        x, lens_unpacked = pad_packed_sequence(x, batch_first=True,
+                                               total_length=x_seq_len_orig)  # x_lstm:  (batch, seq_len, lstm_channels)
+
+        return x
+
+    def forward(self, x, y, mask, cross_attn_mask, conv_mask=None):
+        """
+        x: Decoder input of shape (batch, seq_len, embed_size)
+        encoder_out: Encoder output of shape (batch, src_seq_len, embed_size)
+        cross_attn_mask: Optional mask for cross-attention
+        """
+        # Transformer-style cross-attention:
+        norm_x = self.norm1(x)
+        cross_attn_output, cross_attn_weights = self.cross_attention(
+            y, y, norm_x, mask=cross_attn_mask, return_weights=True
+        )
+        x = x + self.dropout(cross_attn_output)
+
+        # RNN update:
+        norm_x = self.norm2(x)
+        # By default, the initial hidden state is zero
+        rnn_output = self.run_rnn(norm_x, conv_mask)
+        x = x + self.dropout(rnn_output)
 
         # cache last attn weights
         self.last_weights = cross_attn_weights
@@ -809,8 +897,7 @@ class TransformerDecoder(nn.Module):
         self.decoder_layers = nn.ModuleList([  # Layer-Scaled ALiBi
             TransformerDecoderLayer(embed_size, heads, forward_expansion, dropout, alibi_alpha=alibi_alpha,
                                     start_i_increment=start_i + ((i * heads) // alibi_scaling_fac), kernel_size=1,
-                                    act=act
-                                    , talking_heads=talking_heads,
+                                    act=act, talking_heads=talking_heads,
                                     dynamic_alibi=dynamic_alibi, flex_attention=use_flexattn_on_ca)
             for i in range(num_layers)
         ])
