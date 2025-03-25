@@ -1191,18 +1191,46 @@ def mask_to_causal_attention_mask(mask):
     return attention_mask
 
 
+class CausalConv1d(nn.Conv1d):
+    """
+    A 1D convolution layer that applies causal padding on the left side.
+    For a kernel size k and dilation d, it pads the input with d*(k-1) zeros on the left.
+    """
+    def __init__(self, in_channels, out_channels, kernel_size, dilation=1, **kwargs):
+        # Compute the required left-padding for causal convolution
+        self.causal_padding = dilation * (kernel_size - 1)
+        # Remove any padding passed in kwargs and use padding=0 (we handle it manually)
+        kwargs.pop('padding', None)
+        super().__init__(in_channels, out_channels, kernel_size, dilation=dilation, padding=0, **kwargs)
+
+    def forward(self, x):
+        # Pad only on the left: (left, right)
+        if self.causal_padding > 0:
+            x = F.pad(x, (self.causal_padding, 0))
+        return super().forward(x)
+
+
 class ResidualBlock1D(nn.Module):
     """
-    Conv1D+Squeeze-Excite+RMSNorm residual block for sequence modeling with optional masking.
+    Conv1D+Squeeze-Excite+LayerNorm residual block for sequence modeling with optional masking.
 
     Accepts an optional x_mask (batch, 1, len) bool Tensor where padded elements are True.
     If provided, the mask is applied with .masked_fill() before each activation.
     """
 
-    def __init__(self, in_channels, out_channels, kernel_size=3, dilation=1, dropout=0.3, act="relu"):
+    def __init__(self, in_channels, out_channels, kernel_size=3, dilation=1, dropout=0.3, act="relu", causal=False):
         super(ResidualBlock1D, self).__init__()
-        self.conv1 = nn.Conv1d(in_channels, out_channels, kernel_size, dilation=dilation, padding="same")
-        self.conv2 = nn.Conv1d(out_channels, out_channels, kernel_size, dilation=dilation, padding="same")
+
+        if causal:
+            self.conv1 = CausalConv1d(in_channels, out_channels, kernel_size, dilation=dilation)
+            self.conv2 = CausalConv1d(out_channels, out_channels, kernel_size, dilation=dilation)
+            # Disable CBAM by using an identity module
+            self.cbam = nn.Identity()
+        else:
+            self.conv1 = nn.Conv1d(in_channels, out_channels, kernel_size, dilation=dilation, padding="same")
+            self.conv2 = nn.Conv1d(out_channels, out_channels, kernel_size, dilation=dilation, padding="same")
+            self.cbam = CBAM1D(out_channels)
+
         self.norm1 = TransposeLayerNorm(out_channels)
         self.norm2 = TransposeLayerNorm(out_channels)
         self.cbam = CBAM1D(out_channels)

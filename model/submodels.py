@@ -197,22 +197,20 @@ class PreEncoder(nn.Module):
         rev_channels = list(reversed(channels))
         rev_kernel_sizes = list(reversed(kernel_sizes))
         self.decoder_blocks = nn.ModuleList([
-            ResidualBlock1D(rev_channels[i], rev_channels[i + 1], kernel_size=rev_kernel_sizes[i], dropout=dropout, act="aptx")
+            ResidualBlock1D(rev_channels[i], rev_channels[i + 1], kernel_size=rev_kernel_sizes[i], dropout=dropout, act="aptx", causal=True)
             for i in range(len(rev_channels) - 1)
         ])
 
         # Output projection: map from the decoder’s final channel (channels[0]) back to mel_channels.
         self.out_proj = nn.Linear(channels[0], mel_channels)
 
-    def forward(self, x, x_mask):
+    def forward(self, x, x_lengths):
         """
         Forward pass.
 
         Parameters:
           - x: Tensor of shape (batch, mel_len, mel_channels)
-          - x_mask: Tensor of shape (batch, mel_len), bool where padded positions are True.
-                   (This mask will be passed to each ResidualBlock1D, which is assumed to apply
-                   .masked_fill(x_mask, 0) before its activation calls.)
+          - x_lengths: (batch,), int lengths of each thing
         Returns:
           - Reconstructed tensor of shape (batch, mel_len, mel_channels)
         """
@@ -220,6 +218,8 @@ class PreEncoder(nn.Module):
         x = self.proj(x)  # (batch, mel_len, channels[0])
         # Permute to (batch, channels[0], mel_len) for 1D convolutions.
         x = x.permute(0, 2, 1)
+
+        x_mask = sequence_mask(x.size(2), x_lengths)
         x_mask = x_mask.unsqueeze(1)
 
         # Pass through the encoder blocks
