@@ -91,7 +91,12 @@ class Sturmschlag(nn.Module):
         encoded_text = self.encoder(texts, text_mask, encoded_emotion, spk_emb)
 
         # (batch, mel_len, mel_channels), (batch, mel_len)
-        mel, indices_gt = self.pre_encoder(mels, mel_mask)
+        mel, _ = self.pre_encoder(mels, mel_mask)
+
+        self.pre_encoder.eval()
+        with torch.no_grad():
+            indices_gt = self.pre_encoder.encode(mels, mel_mask.unsqueeze(1))
+        self.pre_encoder.train()
 
         logits, gate, attn_logprob, x_mask_in = self.decoder(indices_gt, mel_mask, encoded_text, text_mask)
         self.last_logprobs = attn_logprob

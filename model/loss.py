@@ -3,7 +3,6 @@ import torch.nn as nn
 from numba import jit
 import numpy as np
 from torch.nn import functional as F
-import torchbnn as bnn
 from .modules import SafeLogSoftmax
 from utils.tools import compute_phoneme_level_features_optimized
 
@@ -621,16 +620,10 @@ class SturmLoss(nn.Module):
         # - token_target has shape (B, L-1) (i.e. ground-truth tokens shifted by one).
         # - logits has shape (B, L-1, vocab_size).
         B, pred_len, V = logits.size()
+        token_target.masked_fill(x_mask_in, -100)
 
-        # Shift the mel_mask to match token_target: use mel_mask[:, 1:]
-        valid_token_mask = (~x_mask_in).float()  # (B, L-1), True for valid tokens
-
-        # Compute per-token loss without reduction:
-        token_loss_all = F.cross_entropy(logits.view(-1, V), token_target.reshape(-1), reduction='none')
-        token_loss_all = token_loss_all.view(B, pred_len)
-
-        # Multiply by the valid mask and average over only valid tokens:
-        token_loss = (token_loss_all * valid_token_mask).sum() / valid_token_mask.sum()
+        # Compute per-token loss
+        token_loss = F.cross_entropy(logits.view(-1, V), token_target.reshape(-1), reduction='mean')
 
         total_loss = mel_loss + gate_loss + al_forward_sum + token_loss
         return [total_loss, mel_loss, gate_loss, al_forward_sum, token_loss]

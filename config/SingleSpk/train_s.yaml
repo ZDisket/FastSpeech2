@@ -3,14 +3,14 @@ path:
   log_path: "./output/log/LJSpeech"
   result_path: "./output/result/LJSpeech"
 optimizer:
-  batch_size: 72
+  batch_size: 64
   betas: [0.9, 0.999]
-  init_lr: 0.0003
+  init_lr: 0.00065
   gamma: 0.9999
   eps: 0.000000001
-  weight_decay: 0.01
+  weight_decay: 0.0
   grad_clip_thresh: 1.0
-  grad_acc_step: 16 # THE MODEL DEMANDS A HUGE BATCH SIZE!!!
+  grad_acc_step: 2
   warm_up_step: 4000
   anneal_steps: [300000, 400000, 500000]
   anneal_rate: 0.3

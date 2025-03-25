@@ -768,6 +768,8 @@ class SpectrogramDecoderAR(nn.Module):
         # 4) Residual + Transformer Decoder
         x = x + x_pre
 
+
+
         x = self.x_proj(x)
 
         dec_out = self.dec(x, y, sa_mask, ca_mask, conv_x_mask)
