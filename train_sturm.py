@@ -11,7 +11,7 @@ from torch.utils.data import DataLoader
 from torch.utils.tensorboard import SummaryWriter
 from tqdm import tqdm
 import itertools
-from utils.model import get_model, get_vocoder, get_param_num, load_pretrained_weights
+from utils.model import get_model, get_vocoder, get_param_num, load_pretrained_weights, get_pre_encoder
 from utils.tools import to_device, log, synth_one_sample_st, test_one_fs2, log_attention_maps, log_attention_maps_mh
 from model import SturmLoss
 from model.loss import LSGANLoss
@@ -103,13 +103,13 @@ def main(args, configs):
 
     # Prepare model
     model, optimizer = get_model(args, configs, device, train=True, model="st", opt="adamw")
+    pre_enc = get_pre_encoder("pre_encoder.pth", model.device)
 
-    warmup_steps = 30 if not len(args.pretrained) else 1
+    model.pre_encoder = pre_enc
+
+    warmup_steps = 10 if not len(args.pretrained) else 1
     if args.restore_step:
         warmup_steps = 0
-    else:
-        print("applying weights")
-        model.apply(init_weights)
 
     scheduler = WarmupExponentialLR(optimizer, gamma=train_config["optimizer"]["gamma"],
                                     last_epoch=last_epoch,

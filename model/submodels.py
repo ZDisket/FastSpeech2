@@ -242,9 +242,9 @@ class PreEncoder(nn.Module):
         x = x.permute(0, 2, 1)
         # Final projection back to mel_channels
         x = self.out_proj(x)
-        return x, indices.long() # otherwise crossentropyloss bitches later on
+        return x
 
-    def encode(self, x, x_mask):
+    def encode(self, x, x_mask=None):
         """
         Encodes the input spectrogram into discrete latent indices.
 
@@ -260,6 +260,10 @@ class PreEncoder(nn.Module):
         x = self.proj(x)
         # Permute to (batch, latent_dim, mel_len) for convolutional operations
         x = x.permute(0, 2, 1)
+
+        if x_mask is None:
+            x_mask = torch.zeros((x.size(0), 1, x.size(2)), device=x.device).bool()
+
         # Pass through the encoder blocks
         for block in self.encoder_blocks:
             x = block(x, x_mask=x_mask)
@@ -269,7 +273,7 @@ class PreEncoder(nn.Module):
         x = self.q_in_proj(x)
         # Quantize and obtain indices
         _, indices = self.quantizer(x)
-        return indices.long()
+        return indices.long() # otherwise cross entropy loss bitches later
 
     def decode(self, indices, x_mask=None):
         """
@@ -714,9 +718,6 @@ class SpectrogramDecoderAR(nn.Module):
         self.embed = nn.Embedding(1024, self.embed_channels)
 
         self.x_proj = nn.Linear(self.embed_channels, filter_channels)
-        self.proj_y_proj = nn.Linear(filter_channels, self.embed_channels)
-
-        self.y_proj = nn.Identity()
 
         self.dec = TransformerDecoder(filter_channels, heads=heads, num_layers=depth,
                                       forward_expansion=forward_expansion, dropout=dropout,
@@ -759,19 +760,15 @@ class SpectrogramDecoderAR(nn.Module):
 
         x = self.embed(x)
 
-        y_proj = self.proj_y_proj(y)
+        x = self.x_proj(x)
+
 
         # 3) Pre-aligner: helps with alignment signals
-        x_pre, x_pre_weights, attn_logprob = self.pre_aligner(x, y_proj, y_proj, mask=ca_mask.squeeze(1))
+        x_pre, x_pre_weights, attn_logprob = self.pre_aligner(x, y, y, mask=ca_mask.squeeze(1))
         attn_logprob = attn_logprob.unsqueeze(1)
 
         # 4) Residual + Transformer Decoder
         x = x + x_pre
-
-
-
-        x = self.x_proj(x)
-
         dec_out = self.dec(x, y, sa_mask, ca_mask, conv_x_mask)
 
         # 5) Final projections to mel frames + gate

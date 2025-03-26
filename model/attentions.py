@@ -1224,8 +1224,7 @@ class ResidualBlock1D(nn.Module):
         if causal:
             self.conv1 = CausalConv1d(in_channels, out_channels, kernel_size, dilation=dilation)
             self.conv2 = CausalConv1d(out_channels, out_channels, kernel_size, dilation=dilation)
-            # Disable CBAM by using an identity module
-            self.cbam = nn.Identity()
+            self.cbam = None
         else:
             self.conv1 = nn.Conv1d(in_channels, out_channels, kernel_size, dilation=dilation, padding="same")
             self.conv2 = nn.Conv1d(out_channels, out_channels, kernel_size, dilation=dilation, padding="same")
@@ -1233,7 +1232,6 @@ class ResidualBlock1D(nn.Module):
 
         self.norm1 = TransposeLayerNorm(out_channels)
         self.norm2 = TransposeLayerNorm(out_channels)
-        self.cbam = CBAM1D(out_channels)
         self.relu = APTx() if act == "aptx" else nn.ReLU()
         self.dropout = nn.Dropout(dropout)
 
@@ -1252,7 +1250,8 @@ class ResidualBlock1D(nn.Module):
 
         out = self.conv2(out)
         out = self.norm2(out)
-        out = self.cbam(out, x_mask)
+        if self.cbam is not None:
+            out = self.cbam(out, x_mask)
         out += residual
         # Apply mask before the second activation if provided
         if x_mask is not None:

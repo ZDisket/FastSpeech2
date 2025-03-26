@@ -35,8 +35,7 @@ class Sturmschlag(nn.Module):
             speaker_channels=self.speaker_channels,
         )
         self.emotion_encoder = EmotionEncoder(model_config["em_enc_sizes"], 0.5)
-        self.pre_encoder = PreEncoder(preprocess_config["preprocessing"]["mel"]["n_mel_channels"],
-                                      [1024, 1024], [5, 3], dropout=0.2)
+        self.pre_encoder = None
 
         self.decoder = SpectrogramDecoderAR(model_config["transformer"]["encoder_hidden"],
                                             preprocess_config["preprocessing"]["mel"]["n_mel_channels"],
@@ -90,19 +89,17 @@ class Sturmschlag(nn.Module):
 
         encoded_text = self.encoder(texts, text_mask, encoded_emotion, spk_emb)
 
-        # (batch, mel_len, mel_channels), (batch, mel_len)
-        mel, _ = self.pre_encoder(mels, mel_mask)
-
-        self.pre_encoder.eval()
         with torch.no_grad():
             indices_gt = self.pre_encoder.encode(mels, mel_mask.unsqueeze(1))
-        self.pre_encoder.train()
 
         logits, gate, attn_logprob, x_mask_in = self.decoder(indices_gt, mel_mask, encoded_text, text_mask)
         self.last_logprobs = attn_logprob
 
+        with torch.no_grad():
+            mels = self.pre_encoder.decode(logits, mel_mask)
+
         return (
-            mel,
+            mels,
             gate,
             text_mask,
             mel_mask,

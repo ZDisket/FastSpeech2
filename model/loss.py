@@ -592,7 +592,7 @@ class SturmLoss(nn.Module):
         token_target = indices_gt[:, 1:]  # Shape: (B, L-1)
 
         # 1) Mel Loss. This is simple reconstruction now
-        mel_loss = self.masked_mae(mel_pred, mels_target, (~mel_mask.unsqueeze(-1)).float())
+        mel_loss = torch.Tensor([0.0], device=mel_pred.device)
 
         # 2) Gate Loss
         # gate_pred shape: (B, L-1)
