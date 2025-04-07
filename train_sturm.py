@@ -103,11 +103,11 @@ def main(args, configs):
 
     # Prepare model
     model, optimizer = get_model(args, configs, device, train=True, model="st", opt="adamw")
-    pre_enc = get_pre_encoder("pre_encoder.pth", model.device)
+    pre_enc = get_pre_encoder("pre_encoder.pth", device)
 
     model.pre_encoder = pre_enc
 
-    warmup_steps = 10 if not len(args.pretrained) else 1
+    warmup_steps = 5 if not len(args.pretrained) else 3
     if args.restore_step:
         warmup_steps = 0
 

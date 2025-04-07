@@ -726,7 +726,10 @@ class SpectrogramDecoderAR(nn.Module):
 
         self.out_proj = nn.Linear(filter_channels, 1024)
         self.gate_proj = nn.Linear(filter_channels, 1)  # no sigmoid, we use BCEWithLogitsLoss
-        self.pre_aligner = SimpleAttention(self.embed_channels, self.embed_channels)
+        # smaller dim for the pre-attn. prevent overfitting.
+        # this is just for an aux signal; our transformer does the heavy lifting.
+        self.pre_aligner = SimpleAttention(filter_channels, self.embed_channels // 2, filter_channels)
+        self.pa_drop = nn.Dropout(0.1)
 
     def forward(self, x, x_mask, y, y_mask, shift_tokens=True):
         """
@@ -768,7 +771,7 @@ class SpectrogramDecoderAR(nn.Module):
         attn_logprob = attn_logprob.unsqueeze(1)
 
         # 4) Residual + Transformer Decoder
-        x = x + x_pre
+        x = x + self.pa_drop(x_pre)
         dec_out = self.dec(x, y, sa_mask, ca_mask, conv_x_mask)
 
         # 5) Final projections to mel frames + gate
@@ -1127,17 +1130,17 @@ from rotary_embedding_torch import RotaryEmbedding
 
 
 class SimpleAttention(nn.Module):
-    def __init__(self, input_dim, attention_dim, use_positional_encoding=True):
+    def __init__(self, input_dim, attention_dim, out_dim=None, use_positional_encoding=True):
         super(SimpleAttention, self).__init__()
         self.query_layer = nn.Linear(input_dim, attention_dim, bias=False)
         self.key_layer = nn.Linear(input_dim, attention_dim, bias=False)
         self.value_layer = nn.Linear(input_dim, attention_dim, bias=False)
         self.attention_dim = attention_dim
-        self.use_positional_encoding = False
-        self.proj = nn.Linear(attention_dim, attention_dim)
+        if out_dim is None:
+            out_dim = attention_dim
 
-        self.query_norm = RMSNorm(attention_dim)
-        self.key_norm = RMSNorm(attention_dim)
+        self.use_positional_encoding = False
+        self.proj = nn.Linear(attention_dim, out_dim)
         self.positional_encoding = PositionalEncoding(attention_dim)
 
     def forward(self, query, key, value, mask=None):
@@ -1145,9 +1148,6 @@ class SimpleAttention(nn.Module):
         query = self.query_layer(query)
         key = self.key_layer(key)
         value = self.value_layer(value)
-
-        query = self.query_norm(query)
-        key = self.key_norm(key)
 
         if self.use_positional_encoding:
             query_seq_length = query.size(1)

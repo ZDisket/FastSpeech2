@@ -13,15 +13,36 @@ import torchbnn
 from torchbnn import BayesConv1d
 from .attblocks import *
 from .subatts import *
+import os
 
 flex_attention_available = False
+
 try:
     from torch.nn.attention.flex_attention import flex_attention, create_block_mask
     flex_attention_available = True
 except ImportError:
     print("FlexAttention not available.")
 
+flash_attention_available = False
 
+def is_rocm():
+    if not torch.cuda.is_available():
+        return False
+    device_name = torch.cuda.get_device_name(0).lower()
+    return "amd" in device_name or "gfx" in device_name  # ROCm GPUs often have 'gfx' codes
+
+if is_rocm():
+    os.environ["FLASH_ATTENTION_TRITON_AMD_ENABLE"] = "TRUE"
+    print("ROCm detected. FlashAttention will use Triton backend.")
+
+try:
+    from flash_attn import flash_attn_qkvpacked_func, flash_attn_func, flash_attn_varlen_func
+    flash_attention_available = True
+except ImportError:
+    print("Flash Attention not available.")
+
+if not flash_attention_available and not flex_attention_available:
+    print("Warning: No efficient attention variants found. You should probably get one if you're operating at any serious scale.")
 
 class PartialConv1d(torch.nn.Conv1d):
     """
@@ -414,13 +435,17 @@ class MultiHeadAttention(nn.Module):
     before the final projection, in order to allow the model to dynamically prioritize heads (Decreases performance, don't use)
     dynamic_alibi: Dynamic ALiBi. Keep per-head trainable multipliers to dynamically adjust the slopes as it trains.
 
+    Supports three backends:
+    manual: Naive PyTorch impl; flex: FlexAttention (broken); flash: FlashAttention. Default is auto, will pick best.
 
     If num_persistent > 0, we call this an AllAttention layer.
 
     """
 
     def __init__(self, embed_size, heads, alibi_alpha=1.0, start_i_increment=0, use_alibi=True, use_talking_heads=True,
-                 num_persistent=0, rma_inp_dim=None, weighted_heads=False, dynamic_alibi=False, qk_rmsnorm=True, use_flex_attention=False):
+                 num_persistent=0, rma_inp_dim=None, weighted_heads=False, dynamic_alibi=False, qk_rmsnorm=True,
+                 backend="auto",
+                 gqa_groups="auto", causal=False):
         super(MultiHeadAttention, self).__init__()
         self.embed_size = embed_size
         self.heads = heads
@@ -428,21 +453,45 @@ class MultiHeadAttention(nn.Module):
         self.use_alibi = use_alibi
         self.dynamic_alibi = dynamic_alibi
         self.qk_rmsnorm = qk_rmsnorm
-        use_flex_attention = False # FA not working, tries to allocate ~121GB of VRAM
-        if use_flex_attention:
-            if not flex_attention_available:
-                print("Warning! Tried to turn on FlexAttention, but it's not available. Falling back...")
-                use_flex_attention = False
+        self.backend = "manual"
+        self.causal = causal
 
-        self.use_flex_attention = use_flex_attention
+        if backend == "auto":
+            if flex_attention_available:
+                self.backend = "flex"
+
+            if flash_attention_available:
+                self.backend = "flash"
+
+        if self.backend == "flash":
+            self.dynamic_alibi = False
+        # self.backend = "manual"
+
+        if gqa_groups == "auto":
+            if 8 > heads:
+                gqa_groups = 1
+            else:
+                gqa_groups = 2
+
+        self.gqa_groups = gqa_groups
+        # --- GQA setup ---
+        if gqa_groups > 1:
+            if heads % gqa_groups != 0:
+                raise ValueError(f"Number of heads ({heads}) must be divisible by gqa_groups ({gqa_groups})")
+            self.num_kv_heads = heads // gqa_groups
+            self.num_queries_per_kv = gqa_groups
+        else:
+            self.num_kv_heads = heads
+            self.num_queries_per_kv = 1
+            self.gqa_groups = 0
 
         assert (
                 self.head_dim * heads == embed_size
         ), "Embedding size needs to be divisible by heads"
 
-        self.values = nn.Linear(self.head_dim, self.head_dim, bias=False)
-        self.keys = nn.Linear(self.head_dim, self.head_dim, bias=False)
-        self.queries = nn.Linear(self.head_dim, self.head_dim, bias=False)
+        self.queries = nn.Linear(embed_size, heads * self.head_dim, bias=False)
+        self.keys = nn.Linear(embed_size, self.num_kv_heads * self.head_dim, bias=False)
+        self.values = nn.Linear(embed_size, self.num_kv_heads * self.head_dim, bias=False)
         self.fc_out = nn.Linear(heads * self.head_dim, embed_size)
 
         self.alibi_alpha = alibi_alpha
@@ -451,7 +500,7 @@ class MultiHeadAttention(nn.Module):
         self.num_persistent = num_persistent
         self.weighted_heads = weighted_heads
 
-        if self.use_flex_attention:
+        if self.backend != "manual":
             self.use_talking_heads = False
             self.num_persistent = 0
             self.rma_inp_dim = None
@@ -497,20 +546,37 @@ class MultiHeadAttention(nn.Module):
         if not self.use_alibi:
             return torch.zeros(1, device=device)
 
-        self.slopes = self.slopes.to(device)
+        current_slopes = self.slopes.to(device)
+
+        if self.dynamic_alibi:
+            alibi_betas = self.alibi_adapter()
+            current_slopes *= alibi_betas
+
+        if self.backend == "flash":
+            return current_slopes.view(self.heads)  # FA only takes slopes
+
         t_q = torch.arange(query_len, device=device)
         t_k = torch.arange(key_len, device=device)
         alibi_bias = (t_q.view(1, 1, -1, 1) - t_k.view(1, 1, 1, -1)).abs()
-        if self.dynamic_alibi:
-            alibi_betas = self.alibi_adapter()
-            alibi_bias = -alibi_bias * (self.slopes * alibi_betas)
-        else:
-            alibi_bias = -alibi_bias * self.slopes
+
+        alibi_bias = -alibi_bias * current_slopes
         if current_persistent > 0:
             alibi_bias = F.pad(alibi_bias, (0, current_persistent), "constant", 0).to(device)
         return alibi_bias
 
+    # --- GQA Helper---
+    def _repeat_kv_heads(self, x: torch.Tensor) -> torch.Tensor:
+        # Input: (N, S, H_kv, Dk)
+        # Output: (N, S, H_q, Dk)
+        if self.num_queries_per_kv == 1:
+            return x
+        # Directly repeat each key/value head self.num_queries_per_kv times along the head dimension.
+        x = x.repeat_interleave(self.num_queries_per_kv, dim=2)
+        return x
+
     def attention_forward(self, queries, keys, values, mask, alibi_bias, current_persistent, N, query_len, key_len):
+        keys, values = self._repeat_kv_heads(keys), self._repeat_kv_heads(values)
+
         # Compute energy using einsum, simplifying matrix multiplication across batches and heads
         energy = torch.einsum("nqhd,nkhd->nhqk", [queries, keys])
 
@@ -526,7 +592,7 @@ class MultiHeadAttention(nn.Module):
                 extended_mask = F.pad(mask, (0, current_persistent), value=1)
                 extended_mask = extended_mask.expand(N, self.heads, query_len, key_len + current_persistent)
                 mask = extended_mask
-            energy = energy.masked_fill(mask == 0, float("-1e4"))
+            energy = energy.masked_fill(mask == 0, float("-1e6"))
 
         attention_weights = F.softmax(energy / (self.head_dim ** (1 / 2)), dim=3)
 
@@ -563,6 +629,187 @@ class MultiHeadAttention(nn.Module):
         attention_weights = None
         return out, attention_weights
 
+    def sdpa_forward(self, queries, keys, values, mask, alibi_bias, current_persistent, N, query_len, key_len):
+
+        queries = queries.permute(0, 2, 1, 3)  # (N, heads, query_len, head_dim)
+        keys = keys.permute(0, 2, 1, 3)  # (N, num_kv_heads, key_len, head_dim)
+        values = values.permute(0, 2, 1, 3)  # (N, num_kv_heads, value_len, head_dim)
+
+        if current_persistent > 0:
+            # Extend mask to include persistent vectors (always unmasked)
+            extended_mask = F.pad(mask, (0, current_persistent), value=1)
+            extended_mask = extended_mask.expand(N, self.heads, query_len, key_len + current_persistent)
+            mask = extended_mask
+
+        # sdpa takes in a single float mask. we will combine alibi bias with it.
+        sdpa_mask = alibi_bias
+        sdpa_mask = sdpa_mask.masked_fill(mask == 0, float("-1e6"))
+
+        attn_result = F.scaled_dot_product_attention(queries, keys, values,
+                                                     attn_mask=sdpa_mask,
+                                                     enable_gqa=self.gqa_groups > 1)
+
+        return attn_result, None
+
+
+
+    def flash_attention_forward(self, queries, keys, values, mask, N, query_len, key_len):
+        """
+        Computes attention using flash_attn_varlen_func.
+
+        Args:
+            queries: (N, query_len, self.heads, self.head_dim)
+            keys: (N, key_len_total, self.num_kv_heads, self.head_dim)
+            values: (N, key_len_total, self.num_kv_heads, self.head_dim)
+            mask: Optional (N, 1, query_len, key_len_total), boolean mask. True is valid.
+                  Used to derive sequence lengths. Assumed extended for persistent mem if used.
+            N: Batch size.
+            query_len: Padded query sequence length.
+            key_len: Padded key sequence length (including persistent memory if applicable).
+
+        Returns:
+            out: (N, query_len, self.heads, self.head_dim) - Attention output.
+            attention_weights: None (Flash Attention does not return weights by default).
+        """
+        if not flash_attention_available:
+            raise RuntimeError("Flash Attention backend selected but flash_attn is not available.")
+
+        queries = queries.to(values.dtype)
+        keys = keys.to(values.dtype)
+
+        # --- Prepare inputs for flash_attn_varlen_func ---
+
+        # 1. Derive sequence lengths and cumulative sequence lengths (cu_seqlens) from the mask
+        if mask is not None:
+            # Ensure mask is boolean
+            mask = mask.bool()
+            # Derive query lengths: A query position is valid if it's part of the original sequence (before padding).
+            # We assume the mask correctly identifies valid Q positions along the Q dimension.
+            # Check if any key is valid for a given query position.
+            # Mask shape: (N, 1, Q, K_total)
+            q_padding_mask = mask.any(dim=-1).squeeze(1)  # Shape: (N, Q) True for valid tokens
+            q_seqlens = q_padding_mask.sum(dim=-1, dtype=torch.int32)  # Shape: (N,) Actual lengths
+
+            # Derive key lengths: A key position is valid if it's part of the original sequence.
+            # Check if the key position is valid along the K dimension.
+            # Since the mask is (N, 1, Q, K), we need to know valid K positions independent of Q.
+            # A simple way is to assume a K position is valid if *any* Q attends to it.
+            # However, it's more robust to get valid K positions directly if possible.
+            # If the original unpadded key length is known, use that. Here, we infer from the mask.
+            # We check if a key position is attended by *any* valid query position.
+            k_padding_mask = mask.any(dim=-2).squeeze(1)  # Shape: (N, K_total) True for valid tokens
+            k_seqlens = k_padding_mask.sum(dim=-1, dtype=torch.int32)  # Shape: (N,) Actual lengths
+
+            # Handle cases where a sequence might be fully masked (length 0)
+            q_seqlens = torch.clamp(q_seqlens, min=0)
+            k_seqlens = torch.clamp(k_seqlens, min=0)
+
+            max_seqlen_q = query_len  # Use padded length as max_seqlen for flash_attn
+            max_seqlen_k = key_len  # Use padded length as max_seqlen for flash_attn
+            # If q_seqlens.max() > 0 else query_len # Get max actual length if needed, but flash needs padded max
+            # k_seqlens.max().item() if k_seqlens.max() > 0 else key_len
+
+        else:
+            # No mask provided: Assume all sequences in the batch have the full padded length.
+            q_seqlens = torch.full((N,), query_len, dtype=torch.int32, device=queries.device)
+            k_seqlens = torch.full((N,), key_len, dtype=torch.int32, device=queries.device)
+
+            max_seqlen_q = query_len
+            max_seqlen_k = key_len
+            # Create boolean masks indicating all tokens are valid
+            q_padding_mask = torch.ones(N, query_len, dtype=torch.bool, device=queries.device)
+            k_padding_mask = torch.ones(N, key_len, dtype=torch.bool, device=queries.device)
+
+        # Calculate cumulative sequence lengths (required by flash_attn_varlen_func)
+        # Shape: (batch_size + 1,)
+        cu_seqlens_q = F.pad(torch.cumsum(q_seqlens, dim=0, dtype=torch.int32), (1, 0))
+        cu_seqlens_k = F.pad(torch.cumsum(k_seqlens, dim=0, dtype=torch.int32), (1, 0))
+        #   print(q_seqlens, k_seqlens, max_seqlen_q, max_seqlen_k)
+
+        # 2. Reshape Q, K, V from (N, SeqLen, NumHeads, HeadDim) to (TotalTokens, NumHeads, HeadDim)
+        # Need to handle padding: select only the non-padded tokens.
+
+        # Reshape N, S, H, D -> (N*S), H, D first
+        q_reshaped = queries.reshape(-1, self.heads, self.head_dim)
+        k_reshaped = keys.reshape(-1, self.num_kv_heads, self.head_dim)
+        v_reshaped = values.reshape(-1, self.num_kv_heads, self.head_dim)
+
+        # Create flat boolean masks for selecting valid tokens from reshaped tensors
+        # These masks have shape (N * query_len,) and (N * key_len,) respectively
+        indices_q = q_padding_mask.flatten()  # True where token is valid
+        indices_k = k_padding_mask.flatten()  # True where token is valid
+
+        # Select non-padded tokens using the boolean masks
+        # q_unpadded shape: (total_actual_q_tokens, H, D)
+        q_unpadded = q_reshaped[indices_q]
+        # k_unpadded shape: (total_actual_k_tokens, Hkv, D)
+        k_unpadded = k_reshaped[indices_k]
+        # v_unpadded shape: (total_actual_k_tokens, Hkv, D)
+        v_unpadded = v_reshaped[indices_k]  # Use same indices for K and V
+
+        # 3. Prepare ALiBi slopes
+        alibi_slopes_param = None
+        if self.use_alibi:
+            alibi_slopes_param = self.calculate_alibi_bias(q_reshaped.device, query_len, key_len, 0).unsqueeze(
+                0).repeat(N, 1)
+
+        # --- Call flash_attn_varlen_func ---
+        # dropout_p=0.0 as dropout is usually applied elsewhere / inference
+        # softmax_scale=None lets flash attention use the default 1/sqrt(head_dim)
+        # Note: flash_attn expects total number of tokens to match cu_seqlens_q/k[-1]
+        if q_unpadded.shape[0] != cu_seqlens_q[-1].item():
+            raise ValueError(
+                f"Mismatch in query token count: q_unpadded has {q_unpadded.shape[0]}, expected {cu_seqlens_q[-1]}")
+        if k_unpadded.shape[0] != cu_seqlens_k[-1].item():
+            raise ValueError(
+                f"Mismatch in key token count: k_unpadded has {k_unpadded.shape[0]}, expected {cu_seqlens_k[-1]}")
+
+        # Handle case with zero-length sequences if any seqlen is 0
+        if q_seqlens.min() == 0 or k_seqlens.min() == 0:
+            # Flash attention might error with zero lengths. Need to handle manually.
+            # If all sequences have length 0, return zeros.
+            # If only some have length 0, need careful handling.
+            # For simplicity, if any sequence has 0 length, we might need to skip flash attn or handle carefully.
+            # A practical approach: if total tokens is 0, return zeros. Otherwise, proceed but be wary.
+            if q_unpadded.shape[0] == 0:
+                # No query tokens, output should be zeros matching query shape
+                out = torch.zeros_like(queries)  # Zeros with shape (N, query_len, H, D)
+                return out, None
+
+            # If k/v tokens are zero, but q tokens exist, output should also be zero
+            if k_unpadded.shape[0] == 0:
+                out = torch.zeros_like(queries)
+                return out, None
+            # If some sequences have 0 length but not all, flash attention *should* handle this via cu_seqlens.
+
+        flash_out, _, attn_weights = flash_attn_varlen_func(
+            q=q_unpadded,
+            k=k_unpadded,
+            v=v_unpadded,
+            cu_seqlens_q=cu_seqlens_q,
+            cu_seqlens_k=cu_seqlens_k,
+            max_seqlen_q=max_seqlen_q,  # Use padded length
+            max_seqlen_k=max_seqlen_k,  # Use padded length
+            dropout_p=0.0,  # Set actual dropout rate if needed during training
+            softmax_scale=None,
+            causal=self.causal,
+            alibi_slopes=alibi_slopes_param,
+            return_attn_probs=True  # We don't need attention weights
+        )
+        # flash_out shape: (total_actual_q_tokens, self.heads, self.head_dim)
+
+        # --- Reshape output back to (N, query_len, self.heads, self.head_dim) ---
+        # Need to scatter the unpadded output back into a padded tensor using the boolean mask.
+        # Create a zero tensor with the shape of the padded, reshaped queries before token selection
+        out_padded = torch.zeros_like(q_reshaped)  # Shape (N*query_len, H, D)
+        # Use the boolean mask `indices_q` to place the results
+        out_padded[indices_q] = flash_out
+        # Reshape back to (N, query_len, H, D)
+        out = out_padded.reshape(N, query_len, self.heads, self.head_dim)
+
+        # Return output in the expected format and None for weights
+        return out, attn_weights  # (N, query_len, heads, head_dim), None
+
     def forward(self, values, keys, queries, mask=None, recurr_persistent=None, return_weights=False):
         """
         Do attention
@@ -576,14 +823,15 @@ class MultiHeadAttention(nn.Module):
         N = queries.shape[0]
         value_len, key_len, query_len = values.shape[1], keys.shape[1], queries.shape[1]
 
-        # Split the embedding into self.heads different pieces
-        values = values.reshape(N, value_len, self.heads, self.head_dim)
-        keys = keys.reshape(N, key_len, self.heads, self.head_dim)
-        queries = queries.reshape(N, query_len, self.heads, self.head_dim)
-
+        # 1. Project queries, keys, values
         values = self.values(values)
         keys = self.keys(keys)
         queries = self.queries(queries)
+
+        # 2. Reshape Q, K, V
+        queries = queries.reshape(N, query_len, self.heads, self.head_dim)
+        keys = keys.reshape(N, key_len, self.num_kv_heads, self.head_dim)
+        values = values.reshape(N, value_len, self.num_kv_heads, self.head_dim)
 
         if self.qk_rmsnorm:
             keys = self.k_norm(keys)
@@ -615,14 +863,21 @@ class MultiHeadAttention(nn.Module):
             values = torch.cat([values, expanded_persistent_values], dim=1)
 
         alibi_bias = self.calculate_alibi_bias(keys.device, query_len, key_len, current_persistent)
+        backend = self.backend
 
-        if self.use_flex_attention:
+        if backend == "flex":
             out, attention_weights = self.flex_attention_forward(queries, keys, values, mask, alibi_bias, N, query_len,
                                                                  key_len)
-        else:
+        elif backend == "manual":
             out, attention_weights = self.attention_forward(queries, keys, values, mask, alibi_bias, current_persistent,
                                                             N,
                                                             query_len, key_len)
+        elif backend == "flash":
+            out, attention_weights = self.flash_attention_forward(queries, keys, values, mask,
+                                                                  N, query_len, key_len)
+        elif backend == "sdpa":
+            out, attention_weights = self.sdpa_forward(queries, keys, values, mask, alibi_bias, current_persistent,
+                                                       N, query_len, key_len)
 
         out = out.reshape(N, query_len, self.heads * self.head_dim)
 
@@ -666,7 +921,7 @@ def expand_self_attention_mask(mask):
 class TransformerEncoderLayer(nn.Module):
     def __init__(self, embed_size, heads, forward_expansion, dropout, alibi_alpha=1.0, start_i_increment=0,
                  kernel_size=3, act="swiglu", rma_mem_dim=0, conv_att=False, talking_heads=True,
-                 coarse_fine=False, dynamic_alibi=False):
+                 coarse_fine=False, dynamic_alibi=False, gqa_groups=1):
         super(TransformerEncoderLayer, self).__init__()
         self.norm1 = nn.LayerNorm(embed_size)
         self.norm2 = nn.LayerNorm(embed_size)
@@ -677,7 +932,7 @@ class TransformerEncoderLayer(nn.Module):
                                             start_i_increment=start_i_increment, num_persistent=rma_mem_dim,
                                             rma_inp_dim=embed_size // heads if self.use_rma else 0,
                                             use_talking_heads=talking_heads,
-                                            dynamic_alibi=dynamic_alibi, use_flex_attention=True)
+                                            dynamic_alibi=dynamic_alibi, gqa_groups=1)
 
         if self.coarse_fine:
             self.coarse_attention = MultiHeadAttention(embed_size, 1, alibi_alpha=alibi_alpha,
@@ -726,7 +981,8 @@ class TransformerEncoderLayer(nn.Module):
 
 class TransformerDecoderLayer(nn.Module):
     def __init__(self, embed_size, heads, forward_expansion, dropout, alibi_alpha=1.0, start_i_increment=0,
-                 kernel_size=1, act="swiglu", conv_att=False, talking_heads=True, dynamic_alibi=False, flex_attention=True):
+                 kernel_size=1, act="swiglu", conv_att=False, talking_heads=True, dynamic_alibi=False, flex_attention=True,
+                 gqa_groups=1):
         super(TransformerDecoderLayer, self).__init__()
         self.norm1 = nn.LayerNorm(embed_size)
         self.norm2 = nn.LayerNorm(embed_size)
@@ -735,12 +991,12 @@ class TransformerDecoderLayer(nn.Module):
         self.attention = MultiHeadAttention(embed_size, heads, alibi_alpha=alibi_alpha,
                                             start_i_increment=start_i_increment, num_persistent=0,
                                             rma_inp_dim=0, use_talking_heads=talking_heads,
-                                            dynamic_alibi=dynamic_alibi, use_flex_attention=True)
+                                            dynamic_alibi=dynamic_alibi, gqa_groups="auto")
 
         self.cross_attention = MultiHeadAttention(embed_size, heads, alibi_alpha=alibi_alpha,
                                                   start_i_increment=start_i_increment, num_persistent=0,
                                                   rma_inp_dim=0, use_talking_heads=talking_heads,
-                                                  dynamic_alibi=dynamic_alibi, use_flex_attention=flex_attention,
+                                                  dynamic_alibi=dynamic_alibi, gqa_groups="auto",
                                                   use_alibi=False,)
 
         self.feed_forward = SwiGLUConvFFN(
@@ -795,10 +1051,9 @@ class RNNFormerLayer(nn.Module): # redundant arguments kept for easy interface w
             num_persistent=0, rma_inp_dim=0,
             use_talking_heads=talking_heads,
             dynamic_alibi=dynamic_alibi,
-            use_flex_attention=flex_attention,
             use_alibi=False,
         )
-        rnn_type = "GRU"
+        rnn_type = "LSTM"
         # RNN block: choose between GRU or LSTM
         if rnn_type.upper() == 'GRU':
             self.rnn = nn.GRU(embed_size, embed_size, batch_first=True)
