@@ -477,11 +477,11 @@ def main():
     print("Initializing model...")
     # Instantiate the ResNet autoencoder and move to device.
     autoencoder = PreEncoder(mel_channels=args.mel_channels, channels=[512, 512, 384], kernel_sizes=[11, 5, 3],
-                             dropout=0.1).to(device)
+                             dropout=0.1, fsq_levels=[8, 6, 5]).to(device)
 
     ae_params = get_param_num(autoencoder)
 
-    discriminator = MelSpectrogramPatchDiscriminator(args.mel_channels).to(device)
+    discriminator = MelSpectrogramPatchDiscriminator(args.mel_channels,  hidden_channels = [1024, 1024, 1024, 2048]).to(device)
     disc_params = get_param_num(discriminator)
 
 

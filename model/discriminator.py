@@ -84,15 +84,14 @@ class ConvBlock1D(nn.Module):
 
 class MelSpectrogramPatchDiscriminator(nn.Module):
     """
-    PatchGAN-style discriminator for mel-spectrogram inputs using strided convolutions.
+    PatchGAN-style discriminator for mel-spectrogram inputs with strided convolutions.
 
     Args:
         mel_channels (int): number of mel frequency bins.
-        hidden_channels (List[int]): list of output channels for each conv layer (feature extractors).
-        kernel_sizes (List[int]): list of kernel sizes for each conv layer (length = len(hidden_channels) + 1 for final layer).
-        spectral_norm (bool): whether to apply spectral normalization on convs.
+        hidden_channels (List[int]): channels for each conv layer.
+        kernel_sizes (List[int]): kernel sizes (len = len(hidden_channels)+1).
 
-    The default kernel sizes decrease over layers for finer detail at later stages.
+    Forward returns a patch mask where True indicates padded patches.
     """
     def __init__(
         self,
@@ -102,37 +101,22 @@ class MelSpectrogramPatchDiscriminator(nn.Module):
     ):
         super().__init__()
         assert len(kernel_sizes) == len(hidden_channels) + 1, \
-            "kernel_sizes length must be hidden_channels length + 1"
-
-        self.mel_channels = mel_channels
-        self.hidden_channels = hidden_channels
-        self.kernel_sizes = kernel_sizes
+            "kernel_sizes must be hidden_channels len + 1"
 
         self.convs = nn.ModuleList()
-        in_ch = mel_channels
-        # feature extraction convs with stride=2
+        self.proj = nn.Linear(mel_channels, hidden_channels[0])
+        in_ch = hidden_channels[0]
+        # feature layers
         for out_ch, k in zip(hidden_channels, kernel_sizes[:-1]):
-            conv = nn.Conv1d(
-                in_ch,
-                out_ch,
-                kernel_size=k,
-                stride=2,
-                padding=(k - 1) // 2,
+            conv = spectral_norm(
+                nn.Conv1d(in_ch, out_ch, kernel_size=k, stride=2, padding=(k-1)//2)
             )
-            conv = spectral_norm(conv)
             self.convs.append(conv)
             in_ch = out_ch
-
-        # final 1-channel conv, stride=1
-        final_k = kernel_sizes[-1]
-        final_conv = nn.Conv1d(
-            in_ch,
-            1,
-            kernel_size=final_k,
-            stride=1,
-            padding=(final_k - 1) // 2,
+        # final layer
+        final_conv = spectral_norm(
+            nn.Conv1d(in_ch, 1, kernel_size=kernel_sizes[-1], stride=1, padding=(kernel_sizes[-1]-1)//2)
         )
-        final_conv = spectral_norm(final_conv)
         self.convs.append(final_conv)
 
         self.activation = nn.LeakyReLU(0.2, inplace=True)
@@ -145,42 +129,41 @@ class MelSpectrogramPatchDiscriminator(nn.Module):
                 if m.bias is not None:
                     nn.init.zeros_(m.bias)
 
-    def forward(self, x: torch.Tensor, x_lengths: torch.Tensor) -> (torch.Tensor, torch.Tensor):
+    def forward(self, x: torch.Tensor, x_lengths: torch.Tensor):
         """
         Args:
-            x (Tensor): shape (batch, mel_len, mel_channels)
-            x_mask (Tensor): shape (batch,) Lengths of x
-
+            x: (batch, time, mel_channels)
+            x_lengths: (batch,) lengths of each sequence
         Returns:
-            out (Tensor): shape (batch, 1, L_out), patch-level logits.
-            patch_mask (Tensor): shape (batch, 1, L_out), bool mask where True indicates valid (non-padded) patches.
+            out: (batch, 1, L_out) patch logits
+            patch_mask: (batch, 1, L_out) bool mask where True indicates padded patches
         """
-        x_mask = sequence_mask(x.size(1), x_lengths)
-        # zero out padded time steps
-        x = x.masked_fill(x_mask.unsqueeze(-1), 0.0)
+        B, T, C = x.size()
+        # build padded mask (True indicates padding)
+        padded_mask = sequence_mask(T, x_lengths)  # (B, T)
+        x = self.proj(x)
+        # zero out padded input
+        x = x.masked_fill(padded_mask.unsqueeze(-1), 0.0)
+        out = x.transpose(1, 2)  # (B, C, T)
 
-        # reshape to (batch, channels, time)
-        out = x.transpose(1, 2)
-
-        # initial valid mask (1.0 for valid, 0.0 for padding)
-        valid_mask = (~x_mask).float()  # (batch, mel_len)
-
+        # propagate through convs, downsampling padded_mask
         for conv in self.convs:
-            out = conv(out)
-            out = self.activation(out)
-
-            # update mask for downsampling
+            out = self.activation(conv(out))
             stride = conv.stride[0]
             if stride > 1:
-                valid_mask = F.max_pool1d(
-                    valid_mask.unsqueeze(1), kernel_size=stride, stride=stride
-                ).squeeze(1)
-
+                # downsample padded_mask to align with out
+                padded_mask = F.max_pool1d(
+                    padded_mask.float().unsqueeze(1),
+                    kernel_size=stride,
+                    stride=stride,
+                    ceil_mode=True
+                ).squeeze(1).bool()
             # mask out fully-padded patches
-            out = out.masked_fill(valid_mask.unsqueeze(1) == 0, 0.0)
+            out = out.masked_fill(padded_mask.unsqueeze(1), 0.0)
 
-        # final patch mask: True for valid patches
-        patch_mask = valid_mask.unsqueeze(1).bool()  # (batch, 1, L_out)
+        # final patch mask: True=padded
+        patch_mask = padded_mask.unsqueeze(1)
+        patch_mask = ~patch_mask # True=valid, loss uses that
         return out, patch_mask
 
 
