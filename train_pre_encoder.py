@@ -18,7 +18,8 @@ import matplotlib.pyplot as plt
 import random
 from model.submodels import PreEncoder
 from utils.model import get_param_num
-
+from model.discriminator import MelSpectrogramPatchDiscriminator
+from model.loss import LSGANLoss, CharbonnierMel
 
 # =============================================================================
 # Dataset & DataLoader for Real Spectrograms
@@ -188,6 +189,11 @@ def train(model, train_dataloader, eval_dataset, criterion_recon, optimizer, sca
     os.makedirs(plot_dir, exist_ok=True)
     print(f"Plots will be saved to: {plot_dir}")
 
+    model, discriminator = model
+    optimizer, optimizer_d = optimizer
+    gan_loss = LSGANLoss()
+    crit_recon = CharbonnierMel()
+
     if train_dataloader is None:
         print("Training dataloader is None. Skipping training.")
         return
@@ -195,6 +201,7 @@ def train(model, train_dataloader, eval_dataset, criterion_recon, optimizer, sca
     n_steps = 0
     for epoch in range(args.num_epochs):
         model.train()
+        discriminator.train()
         epoch_loss = 0.0
         num_batches = len(train_dataloader)
         loop = tqdm(train_dataloader, leave=True, desc=f"Epoch [{epoch + 1}/{args.num_epochs}]")
@@ -217,10 +224,22 @@ def train(model, train_dataloader, eval_dataset, criterion_recon, optimizer, sca
                 continue
 
             optimizer.zero_grad()
+            optimizer_d.zero_grad()
+
             # Enable autocast context manager for mixed precision
             with autocast(enabled=True):  # Use enabled=True for clarity, default is True if torch.cuda.is_available()
+                # 1) D on real
+                real_logits, real_mask = discriminator(real_spectrograms, mel_lens)
+
                 # Forward pass: reconstruct the input spectrograms
                 recon_spectrograms = model(real_spectrograms, mel_lens)  # Expects (batch, seq_len, features)
+
+                # 2) D on fake (detach generator)
+                fake_logits, fake_mask = discriminator(recon_spectrograms.detach(), mel_lens)
+                loss_D = gan_loss.discriminator_loss(real_logits, fake_logits, real_mask, fake_mask)
+                scaler.scale(loss_D).backward()
+                scaler.step(optimizer_d)
+                scaler.update()
 
                 # Ensure output shape matches input shape
                 if recon_spectrograms.shape != real_spectrograms.shape:
@@ -237,12 +256,11 @@ def train(model, train_dataloader, eval_dataset, criterion_recon, optimizer, sca
                 mask = mask_time.unsqueeze(2).expand(-1, -1, real_spectrograms.size(2)).float()
 
                 # Compute reconstruction loss only on valid (non-padded) elements.
-                loss = criterion_recon(recon_spectrograms * mask, real_spectrograms * mask)
-                num_valid_elements = mask.sum()
-                if num_valid_elements > 0:
-                    loss = loss / num_valid_elements  # Normalize by the number of non-padded elements
-                else:
-                    loss = torch.tensor(0.0, device=device)  # Avoid division by zero if mask is all zeros
+                loss_recon = crit_recon(recon_spectrograms, real_spectrograms, mel_lens)
+
+                gen_logits, gen_mask = discriminator(recon_spectrograms, mel_lens)
+                loss_gan = gan_loss.generator_loss(gen_logits, gen_mask)
+                loss = loss_recon + loss_gan
 
             # Backward pass and optimization step using GradScaler
             scaler.scale(loss).backward()
@@ -253,10 +271,13 @@ def train(model, train_dataloader, eval_dataset, criterion_recon, optimizer, sca
 
             current_loss = loss.item()
             epoch_loss += current_loss
-            loop.set_postfix(loss=current_loss)
+            loop.set_postfix(D=loss_D.item(),
+                             G_recon=loss_recon.item(),
+                             G_gan=loss_gan.item(),
+                             total_loss=loss.item(),)
 
         avg_loss = epoch_loss / num_batches if num_batches > 0 else 0
-        print(f"Epoch [{epoch + 1}/{args.num_epochs}], Average Reconstruction Loss: {avg_loss:.6f}")
+        print(f"Epoch [{epoch + 1}/{args.num_epochs}], Average Loss: {avg_loss:.6f}")
 
         # --- Plotting training examples ---
         if real_spectrograms is not None and real_spectrograms.size(0) > 0 and recon_spectrograms is not None:
@@ -460,7 +481,12 @@ def main():
 
     ae_params = get_param_num(autoencoder)
 
+    discriminator = MelSpectrogramPatchDiscriminator(args.mel_channels).to(device)
+    disc_params = get_param_num(discriminator)
+
+
     print("Number of Pre-Encoder Parameters: {:.2f}M".format(ae_params / 1e6))
+    print("Number of discriminator parameters: {:.2f}M".format(disc_params / 1e6))
 
     if args.pretrained:
         if os.path.isfile(args.pretrained):
@@ -557,6 +583,7 @@ def main():
 
     # Use an optimizer for the autoencoder parameters
     optimizer = optim.Adam(autoencoder.parameters(), lr=args.lr, betas=(args.beta1, args.beta2))
+    optimizer_d = optim.Adam(discriminator.parameters(), lr=args.lr, betas=(args.beta1, args.beta2))
 
     # Initialize GradScaler for mixed precision training
     # enabled=use_cuda means scaler is only active when using GPU
@@ -565,11 +592,11 @@ def main():
     # --- Start Training ---
     print("Starting training...")
     train(
-        model=autoencoder,
+        model=(autoencoder, discriminator),
         train_dataloader=train_dataloader,
         eval_dataset=eval_dataset_subset,  # Pass the Subset for eval plotting
         criterion_recon=criterion_recon,
-        optimizer=optimizer,
+        optimizer=(optimizer, optimizer_d),
         scaler=scaler,
         device=device,
         args=args

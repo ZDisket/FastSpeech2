@@ -9,71 +9,116 @@ from utils.tools import compute_phoneme_level_features_optimized
 
 class LSGANLoss(nn.Module):
     def __init__(self, real_label=1.0, fake_label=0.0, decay=0.99, use_lecam=True):
-        super(LSGANLoss, self).__init__()
+        super().__init__()
         self.real_label = real_label
         self.fake_label = fake_label
         self.decay = decay
         self.use_lecam = use_lecam
-        self.criterion = nn.MSELoss()
 
-        # Initialize EMA variables for discriminator predictions
+        # we'll compute per‑element MSE and reduce manually
+        self.criterion = nn.MSELoss(reduction='none')
+
+        # EMA buffers
         self.register_buffer("ema_real", torch.tensor(0.0))
         self.register_buffer("ema_fake", torch.tensor(0.0))
-        self.ema_initialized = False  # Flag to check initialization
+        self.ema_initialized = False
 
-    def update_ema(self, current_real, current_fake):
-        """Update EMA values for real and fake scores."""
-        # Ensure EMA tensors are on the same device as the inputs
-        device = current_real.device
-        self.ema_real = self.ema_real.to(device)
-        self.ema_fake = self.ema_fake.to(device)
+    def _masked_mse(self, pred: torch.Tensor, target: torch.Tensor, mask: torch.Tensor=None):
+        # pred/target: (..., N) same shape. mask: same shape, bool or float, or None.
+        err = self.criterion(pred, target)
+        if mask is not None:
+            # ensure float mask
+            m = mask.float()
+            err = err * m
+            valid = m.sum()
+            if valid.item() > 0:
+                return err.sum() / valid
+            else:
+                return torch.tensor(0., device=pred.device)
+        else:
+            # default mean over all elements
+            return err.mean()
+
+    def update_ema(self, real_out: torch.Tensor, fake_out: torch.Tensor,
+                   real_mask: torch.Tensor=None, fake_mask: torch.Tensor=None):
+        # compute means
+        if real_mask is not None:
+            m = real_mask.float()
+            real_mean = (real_out * m).sum() / m.sum().clamp(min=1)
+        else:
+            real_mean = real_out.mean()
+
+        if fake_mask is not None:
+            m = fake_mask.float()
+            fake_mean = (fake_out * m).sum() / m.sum().clamp(min=1)
+        else:
+            fake_mean = fake_out.mean()
 
         if not self.ema_initialized:
-            # Initialize EMA values with the mean of current inputs (detached from graph)
-            self.ema_real.copy_(current_real.mean().detach())
-            self.ema_fake.copy_(current_fake.mean().detach())
+            self.ema_real.copy_(real_mean.detach())
+            self.ema_fake.copy_(fake_mean.detach())
             self.ema_initialized = True
         else:
-            # Update EMA values using exponential moving average formula
-            self.ema_real.mul_(self.decay).add_(1 - self.decay, current_real.mean().detach())
-            self.ema_fake.mul_(self.decay).add_(1 - self.decay, current_fake.mean().detach())
+            self.ema_real.mul_(self.decay).add_((1 - self.decay) * real_mean.detach())
+            self.ema_fake.mul_(self.decay).add_((1 - self.decay) * fake_mean.detach())
 
-    def lecam_loss(self, real_output, fake_output):
-        """Compute the LeCam regularization loss."""
+    def lecam_loss(self, real_out: torch.Tensor, fake_out: torch.Tensor,
+                   real_mask: torch.Tensor=None, fake_mask: torch.Tensor=None):
+
         # Ensure EMA tensors are on the same device as the outputs
-        device = real_output.device
+        device = real_out.device
         self.ema_real = self.ema_real.to(device)
         self.ema_fake = self.ema_fake.to(device)
 
-        # Detach EMA values to ensure no gradients flow through them
-        ema_real = self.ema_real.detach()
-        ema_fake = self.ema_fake.detach()
-
-        # Relu to ensure non-negative loss components
-        lecam_real = torch.mean((real_output - ema_fake).clamp(min=0) ** 2)
-        lecam_fake = torch.mean((ema_real - fake_output).clamp(min=0) ** 2)
-        return lecam_real + lecam_fake
-
-    def discriminator_loss(self, real_output, fake_output):
-        """Discriminator loss with optional LeCam regularization."""
-        # Standard LSGAN loss
-        real_loss = self.criterion(real_output, torch.full_like(real_output, self.real_label))
-        fake_loss = self.criterion(fake_output, torch.full_like(fake_output, self.fake_label))
-        lsgan_loss = 0.5 * (real_loss + fake_loss)
-
-        # Compute and optionally add LeCam regularization
-        if self.use_lecam:
-            # Update EMA values
-            self.update_ema(real_output, fake_output)
-            # Compute LeCam loss
-            lecam_reg = self.lecam_loss(real_output, fake_output)
-            return lsgan_loss + lecam_reg
+        ema_r = self.ema_real.detach()
+        ema_f = self.ema_fake.detach()
+        # LeCam on real
+        if real_mask is not None:
+            diff_r = (real_out - ema_f).clamp(min=0) * real_mask.float()
+            term_r = diff_r.pow(2).sum() / real_mask.float().sum().clamp(min=1)
         else:
-            return lsgan_loss
+            term_r = ((real_out - ema_f).clamp(min=0) ** 2).mean()
+        # LeCam on fake
+        if fake_mask is not None:
+            diff_f = (ema_r - fake_out).clamp(min=0) * fake_mask.float()
+            term_f = diff_f.pow(2).sum() / fake_mask.float().sum().clamp(min=1)
+        else:
+            term_f = ((ema_r - fake_out).clamp(min=0) ** 2).mean()
+        return term_r + term_f
 
-    def generator_loss(self, fake_output):
-        """Generator loss remains the same."""
-        return self.criterion(fake_output, torch.full_like(fake_output, self.real_label))
+    def discriminator_loss(
+        self,
+        real_output: torch.Tensor,
+        fake_output: torch.Tensor,
+        real_mask: torch.Tensor=None,
+        fake_mask: torch.Tensor=None
+    ):
+        """
+        real_output, fake_output: (B, 1, L)
+        real_mask, fake_mask: same shape bool mask, or None.
+        """
+        # prepare targets
+        real_tgt = torch.full_like(real_output, self.real_label)
+        fake_tgt = torch.full_like(fake_output, self.fake_label)
+
+        # LSGAN losses
+        real_loss = self._masked_mse(real_output, real_tgt, real_mask)
+        fake_loss = self._masked_mse(fake_output, fake_tgt, fake_mask)
+        loss = 0.5 * (real_loss + fake_loss)
+
+        if self.use_lecam:
+            self.update_ema(real_output, fake_output, real_mask, fake_mask)
+            loss = loss + self.lecam_loss(real_output, fake_output, real_mask, fake_mask)
+
+        return loss
+
+    def generator_loss(
+        self,
+        fake_output: torch.Tensor,
+        fake_mask: torch.Tensor=None
+    ):
+        real_tgt = torch.full_like(fake_output, self.real_label)
+        return self._masked_mse(fake_output, real_tgt, fake_mask)
 
 
 class CharbonnierLoss(nn.Module):
@@ -96,6 +141,51 @@ class CharbonnierLoss(nn.Module):
         loss = torch.sqrt(diff.pow(2) + self.eps ** 2).mean()  # Mean across all dimensions except batch
         return loss
 
+class CharbonnierMel(nn.Module):
+    """
+    Charbonnier Loss for 1D sequences / mel‑spectrograms.
+
+    Accepts inputs of shape (batch, mel_len, channels) and a 1D `lengths` tensor
+    specifying the valid length for each example in the batch.
+    """
+    def __init__(self, eps: float = 1e-6):
+        super(CharbonnierMel, self).__init__()
+        self.eps = eps
+
+    def forward(self,
+                x: torch.Tensor,
+                y: torch.Tensor,
+                lengths: torch.LongTensor) -> torch.Tensor:
+        """
+        Compute masked Charbonnier loss.
+
+        Args:
+            x:        Predicted mel‑spectrograms, shape (B, T, C)
+            y:        Ground‑truth mel‑spectrograms, same shape as x
+            lengths:  1D int tensor of shape (B,), each entry ≤ T,
+                      giving the valid length along the time axis.
+
+        Returns:
+            Scalar tensor: the mean Charbonnier loss over all valid (i.e.
+            non‑padded) time‑channel elements.
+        """
+        assert x.shape == y.shape, "x and y must have the same shape"
+        B, T, C = x.shape
+        device = x.device
+
+        # build a mask of shape (B, T) where mask[b, t] = True if t >= lengths[b]
+        idx = torch.arange(T, device=device).unsqueeze(0).expand(B, T)
+        mask_time = idx >= lengths.unsqueeze(1)            # (B, T)
+        mask = mask_time.unsqueeze(2).expand(B, T, C)       # (B, T, C)
+
+        # compute per‑element Charbonnier
+        diff = x - y
+        loss_per_elem = torch.sqrt(diff.pow(2) + self.eps**2)
+
+        # zero‐out padded positions and average only over valid ones
+        valid_loss = loss_per_elem.masked_fill(mask, 0.0)
+        num_valid = (~mask).float().sum()
+        return valid_loss.sum() / (num_valid + 1e-12)
 
 class Charbonnier1D(nn.Module):
     """Charbonnier Loss for 1D sequences (batch_size, seq_len)."""
@@ -578,6 +668,8 @@ class SturmLoss(nn.Module):
         self.masked_mae = MaskedMAE(mel_regression)
         self.masked_bce = MaskedBCE(pos_weight=pos_weight)
         self.forward_sum = ForwardSumLoss()
+        self.fwd_sum_mul = 0.3
+        # self.forward_sum = None
 
     def forward(self, batch, model_out):
         """
@@ -587,34 +679,14 @@ class SturmLoss(nn.Module):
         mel_pred, gate_pred, text_mask, mel_mask, attn_logprob, x_mask_in, logits, indices_gt, = model_out
 
         mels_target = batch[5]  # (B, L, mel_channels)
-        mel_lens = batch[6]     # (B,)
+        mel_lens = batch[6]  # (B,)
         input_lengths = batch[4]
         token_target = indices_gt[:, 1:]  # Shape: (B, L-1)
 
         # 1) Mel Loss. This is simple reconstruction now
-        mel_loss = torch.Tensor([0.0], device=mel_pred.device)
+        mel_loss = torch.FloatTensor([0.0]).to(mel_pred.device)
 
-        # 2) Gate Loss
-        # gate_pred shape: (B, L-1)
-        B, pred_len, _ = gate_pred.size()
-        gate_pred = gate_pred.squeeze(-1)  # (B, L-1)
-
-        # The last predicted frame index is (mel_lens - 2)
-        # e.g. if mel_lens[i] = 50, final predicted index is 48 => stop token at gate_pred[:, 48].
-        time_idx = torch.arange(pred_len, device=gate_pred.device).unsqueeze(0).expand(B, pred_len)
-        gate_target = (time_idx == (mel_lens - 2).unsqueeze(1)).float()  # (B, L-1)
-
-        valid_gate_mask = (~x_mask_in).float()  # (B, L-1)
-        gate_loss = self.masked_bce(gate_pred, gate_target, valid_gate_mask)
-
-        # 3) Forward Sum Loss (if you’re using your alignment constraint)
-        # Make sure to clamp the output length to pred_len
-        output_lengths = torch.clamp_max(mel_lens - 1, pred_len)
-        al_forward_sum = self.forward_sum(
-            attn_logprob=attn_logprob,
-            in_lens=input_lengths,
-            out_lens=output_lengths
-        )
+        gate_loss = torch.FloatTensor([0.0]).to(mel_pred.device)
 
         # Assuming:
         # - token_target has shape (B, L-1) (i.e. ground-truth tokens shifted by one).
@@ -625,5 +697,34 @@ class SturmLoss(nn.Module):
         # Compute per-token loss
         token_loss = F.cross_entropy(logits.view(-1, V), token_target.reshape(-1), reduction='mean')
 
-        total_loss = mel_loss + gate_loss + al_forward_sum + token_loss
+        # 3) Forward‑Sum loss (alignment constraint)
+        if attn_logprob is not None and self.forward_sum is not None:
+            output_lengths = torch.clamp_max(mel_lens - 1, pred_len)
+
+            H = attn_logprob.size(1)  # num heads in dim‑1
+            if H == 1:
+                # original single‑head call
+                al_forward_sum = self.forward_sum(
+                    attn_logprob=attn_logprob,
+                    in_lens=input_lengths,
+                    out_lens=output_lengths
+                )
+            else:
+                # run once per head and average
+                per_head = []
+                for h in range(H):
+                    per_head.append(
+                        self.forward_sum(
+                            attn_logprob=attn_logprob[:, h:h + 1],  # keep (B,1,L1,L2) shape
+                            in_lens=input_lengths,
+                            out_lens=output_lengths
+                        )
+                    )
+                # (optional: stack along a new dim then mean)
+                al_forward_sum = torch.stack(per_head, dim=0).mean(0)
+
+        else:
+            al_forward_sum = torch.tensor(0.0, device=logits.device)
+
+        total_loss = token_loss + al_forward_sum * self.fwd_sum_mul
         return [total_loss, mel_loss, gate_loss, al_forward_sum, token_loss]

@@ -1,5 +1,7 @@
 import torch
 import torch.nn as nn
+from tensorboard.errors import InvalidArgumentError
+
 from .attentions import TransformerEncoder, TemporalConvNet, MultiHeadAttention, \
     mask_to_causal_attention_mask, TransposeLayerNorm, AttentionPooling, APTxS1, APTx, SwiGLUConvFFN, NeoTCNAttention, \
     ConvReluNorm, TransformerDecoder, expand_self_attention_mask, ResidualBlock1D
@@ -708,30 +710,189 @@ def expand_masks2(x_mask, y_mask):
     return attention_mask
 
 
+class LSAttention(nn.Module):
+    def __init__(self, attention_rnn_dim, embedding_dim, attention_dim,
+                 attention_location_n_filters, attention_location_kernel_size):
+        super(LSAttention, self).__init__()
+        """
+            Tacotron 2 Location Sensitive Attention
+        """
+        self.query_layer = nn.Linear(attention_rnn_dim, attention_dim,
+                                      bias=False)
+        self.memory_layer = nn.Linear(embedding_dim, attention_dim, bias=False,)
+        self.v = nn.Linear(attention_dim, 1, bias=False)
+        self.location_layer = LocationLayer(attention_location_n_filters,
+                                            attention_location_kernel_size,
+                                            attention_dim)
+        self.score_mask_value = -float("inf")
+
+    def get_alignment_energies(self, query, processed_memory,
+                               attention_weights_cat):
+        """
+        PARAMS
+        ------
+        query: decoder output (batch, n_mel_channels * n_frames_per_step)
+        processed_memory: processed encoder outputs (B, T_in, attention_dim)
+        attention_weights_cat: cumulative and prev. att weights (B, 2, max_time)
+
+        RETURNS
+        -------
+        alignment (batch, max_time)
+        """
+
+        processed_query = self.query_layer(query.unsqueeze(1))
+        processed_attention_weights = self.location_layer(attention_weights_cat)
+        energies = self.v(torch.tanh(
+            processed_query + processed_attention_weights + processed_memory))
+
+        energies = energies.squeeze(-1)
+        return energies
+
+    def forward(self, attention_hidden_state, memory, processed_memory,
+                attention_weights_cat, mask):
+        """
+        PARAMS
+        ------
+        attention_hidden_state: attention rnn last output
+        memory: encoder outputs
+        processed_memory: processed encoder outputs
+        attention_weights_cat: previous and cummulative attention weights
+        mask: binary mask for padded data
+        """
+        alignment = self.get_alignment_energies(
+            attention_hidden_state, processed_memory, attention_weights_cat)
+
+        if mask is not None:
+            alignment.data.masked_fill_(mask, self.score_mask_value)
+
+        attention_weights = F.softmax(alignment, dim=1)
+        attention_context = torch.bmm(attention_weights.unsqueeze(1), memory)
+        attention_context = attention_context.squeeze(1)
+
+        return attention_context, attention_weights
+
+
 class SpectrogramDecoderAR(nn.Module):
     def __init__(self, encoder_channels, mel_channels, filter_channels, depth, heads, dropout=0.1,
-                 alibi_alpha=1.0, forward_expansion=4):
+                 alibi_alpha=1.0, forward_expansion=4, speaker_channels=0, dec_type = "transformer"):
         super().__init__()
 
+        self.encoder_channels = encoder_channels
         self.filter_channels = filter_channels
         self.embed_channels = 256
-        self.embed = nn.Embedding(1024, self.embed_channels)
+        self.codebook_size = 8010
+        self.speaker_channels = speaker_channels
+        self.bos_token_id = 8001
+        self.eos_token_id = 8002
+        self.pad_token_id = 8003
+        self.use_rnn = False
 
-        self.x_proj = nn.Linear(self.embed_channels, filter_channels)
 
-        self.dec = TransformerDecoder(filter_channels, heads=heads, num_layers=depth,
-                                      forward_expansion=forward_expansion, dropout=dropout,
-                                      alibi_alpha=alibi_alpha, start_i=0, act="relugt", talking_heads=True,
-                                      dynamic_alibi=True)
+        self.dec_type = dec_type.lower()
 
-        self.out_proj = nn.Linear(filter_channels, 1024)
-        self.gate_proj = nn.Linear(filter_channels, 1)  # no sigmoid, we use BCEWithLogitsLoss
-        # smaller dim for the pre-attn. prevent overfitting.
-        # this is just for an aux signal; our transformer does the heavy lifting.
-        self.pre_aligner = SimpleAttention(filter_channels, self.embed_channels // 2, filter_channels)
-        self.pa_drop = nn.Dropout(0.1)
+        self.x_proj = nn.Identity()
 
-    def forward(self, x, x_mask, y, y_mask, shift_tokens=True):
+        self.spk_cond = nn.Linear(speaker_channels, filter_channels) if speaker_channels > 0 else None
+
+
+        if self.dec_type == "transformer":
+            self.embed = nn.Embedding(self.codebook_size, self.filter_channels)
+
+            self.dec = TransformerDecoder(filter_channels, heads=heads, num_layers=depth,
+                                          forward_expansion=forward_expansion, dropout=dropout,
+                                          alibi_alpha=alibi_alpha, start_i=0, act="relu2", talking_heads=True,
+                                          dynamic_alibi=True)
+            self.out_size = filter_channels
+        elif self.dec_type == "lstm":
+            self.embed = nn.Embedding(self.codebook_size, self.embed_channels)
+            self.p_attention_dropout = 0.1
+            self.p_decoder_dropout = 0.1
+
+            self.attention_dim = max(128, filter_channels // 8)
+            self.attention_rnn = nn.LSTMCell(
+                self.embed_channels + self.encoder_channels,  # Input: Token Embedding + Context
+                self.filter_channels)
+
+            self.attention_layer = LSAttention(
+                self.filter_channels, self.encoder_channels,
+                self.attention_dim, 32,
+                31
+            )
+            # Decoder RNN input is Attention RNN output + Context
+            self.decoder_rnn = nn.LSTMCell(
+                self.filter_channels + self.encoder_channels,
+                self.filter_channels)
+
+            self.out_size = filter_channels + self.encoder_channels
+        else:
+            raise RuntimeError(f"Invalid decoder type: {self.dec_type}")
+
+        self.out_proj = nn.Linear(self.out_size, self.codebook_size)
+        self.gate_proj = nn.Identity()  # no sigmoid, we use BCEWithLogitsLoss
+        #  self.pre_aligner = SimpleAttention(filter_channels, self.embed_channels // 2, filter_channels)
+        self.g_drop = nn.Dropout(0.1)
+
+    def _initialize_lstm_states(self, memory, mask):
+        """ Initializes LSTM states for Tacotron-style decoder """
+        B = memory.size(0)
+        MAX_TIME = memory.size(1)
+        device = memory.device
+
+        self.attention_hidden = torch.zeros(B, self.filter_channels, device=device)
+        self.attention_cell = torch.zeros(B, self.filter_channels, device=device)
+
+        self.decoder_hidden = torch.zeros(B, self.filter_channels, device=device)
+        self.decoder_cell = torch.zeros(B, self.filter_channels, device=device)
+
+        self.attention_weights = torch.zeros(B, MAX_TIME, device=device)
+        self.attention_weights_cum = torch.zeros(B, MAX_TIME, device=device)
+        self.attention_context = torch.zeros(B, self.encoder_channels, device=device)
+
+        self.memory = memory # (B, T_enc, enc_dim)
+        self.processed_memory = self.attention_layer.memory_layer(memory) # (B, T_enc, att_dim)
+        self.mask = mask # Boolean mask, True means mask (used by attention)
+
+    def _lstm_decode_step(self, step_input_embedding):
+        """ Single decode step for LSTM decoder (NO PRENET).
+            Input is the token embedding for the current step.
+            Assumes states are initialized/updated externally.
+        """
+        # Attention RNN: Takes token embedding + previous context
+        cell_input = torch.cat((step_input_embedding, self.attention_context), -1)
+        self.attention_hidden, self.attention_cell = self.attention_rnn(
+            cell_input, (self.attention_hidden, self.attention_cell))
+        self.attention_hidden = F.dropout(
+            self.attention_hidden, self.p_attention_dropout, self.training)
+
+        # Attention Layer
+        attention_weights_cat = torch.cat(
+            (self.attention_weights.unsqueeze(1),
+             self.attention_weights_cum.unsqueeze(1)), dim=1)
+        self.attention_context, self.attention_weights = self.attention_layer(
+            self.attention_hidden, self.memory, self.processed_memory,
+            attention_weights_cat, self.mask)
+
+        self.attention_weights_cum += self.attention_weights
+
+        # Decoder RNN: Takes attention RNN output + new context
+        decoder_input = torch.cat(
+            (self.attention_hidden, self.attention_context), -1)
+        self.decoder_hidden, self.decoder_cell = self.decoder_rnn(
+            decoder_input, (self.decoder_hidden, self.decoder_cell))
+        self.decoder_hidden = F.dropout(
+            self.decoder_hidden, self.p_decoder_dropout, self.training)
+
+        # Projections
+        decoder_hidden_attention_context = torch.cat(
+            (self.decoder_hidden, self.attention_context), dim=1)
+
+        # Predict logits for VQVAE codes
+        logits = self.out_proj(decoder_hidden_attention_context) # (B, codebook_size)
+
+        return logits, self.attention_weights # Return current step's weights
+
+
+    def forward(self, x, x_mask, y, y_mask, spk_emb=None, shift_tokens=True, rnn_hidden=None):
         """
         Autoregressive next-frame prediction:
           - x is the indices
@@ -750,10 +911,15 @@ class SpectrogramDecoderAR(nn.Module):
             attn_logprob: Log of pre-aligner attention weights, shape depends on your aligner
             x_mask_in: The shifted mask (B, L-1) so you can pass it to the loss if needed
         """
-        # 1) Shift the input by dropping the last frame, so the model predicts the next frame.
-        if shift_tokens:  # only shift if we are in training
-            x = x[:, :-1]  # (B, L-1)
-            x_mask = x_mask[:, :-1]  # (B, L-1), same shift
+        # 1) Modify x and x_mask in-place if shift_tokens is True for autoregressive input prep
+        B, L, _ = x.size()
+
+        if shift_tokens:
+            # Create the shifted sequence [x_0, ..., x_{L-2}]
+            x = x[:, :-1]  # Shape: (B, L-1)
+            # Create the corresponding mask for the shifted sequence
+            x_mask = x_mask[:, :-1]  # Shape: (B, L-1)
+
 
         # Create masks
         sa_mask = expand_self_attention_mask(x_mask)  # self-attention
@@ -765,22 +931,66 @@ class SpectrogramDecoderAR(nn.Module):
 
         x = self.x_proj(x)
 
+        if self.speaker_channels > 0:
+            x = x + self.spk_cond(spk_emb)
 
         # 3) Pre-aligner: helps with alignment signals
-        x_pre, x_pre_weights, attn_logprob = self.pre_aligner(x, y, y, mask=ca_mask.squeeze(1))
-        attn_logprob = attn_logprob.unsqueeze(1)
+        # x_pre, x_pre_weights, attn_logprob = self.pre_aligner(x, y, y, mask=ca_mask.squeeze(1))
+        attn_logprob = None
 
-        # 4) Residual + Transformer Decoder
-        x = x + self.pa_drop(x_pre)
-        dec_out = self.dec(x, y, sa_mask, ca_mask, conv_x_mask)
+        if self.dec_type == "transformer":
+            dec_out = self.dec(x, y, sa_mask, ca_mask, conv_x_mask)
+            # 5) Final projections to mel frames + gate
+            indices_pred = self.out_proj(dec_out)  # (B, L-1, 1024)
+            gate_pred = torch.zeros(B, indices_pred.size(1), 1, device=x.device)
 
-        # 5) Final projections to mel frames + gate
-        indices_pred = self.out_proj(dec_out)  # (B, L-1, 1024)
-        gate_pred = self.gate_proj(dec_out)  # (B, L-1, 1)
+            rnn_hidden = None
+            return indices_pred, gate_pred, attn_logprob, x_mask, rnn_hidden
 
-        return indices_pred, gate_pred, attn_logprob, x_mask
+        elif self.dec_type == "lstm":
+            if shift_tokens:
 
-    def infer(self, y, y_mask, max_length=1000, temperature=1.0, top_k=None, top_p=None, gate_threshold=0.5):
+                self._initialize_lstm_states(y, y_mask.bool())
+                L_out = L - 1
+
+                all_logits = []
+                all_alignments = []
+                # Loop through each time step of the input sequence
+
+                for t in range(L_out):
+                    # Input for this step: embedding of token x_in[:, t]
+                    current_input_embedded = x[:, t, :] # (B, embed_channels)
+
+                    # Run one decode step using the *embedding* directly
+                    logits, alignment = self._lstm_decode_step(current_input_embedded)
+                    # logits: (B, codebook_size), gate_output: (B, 1), alignment: (B, T_enc)
+
+                    all_logits.append(logits)
+                    all_alignments.append(alignment)
+
+                # Stack outputs: (L_out, B, Dim) -> (B, L_out, Dim)
+                indices_pred = torch.stack(all_logits, dim=1) # (B, L_out, codebook_size)
+                attn_logprob = torch.stack(all_alignments, dim=1) # (B, L_out, T_enc)
+
+
+            else:
+                # Assume states are initialized externally by infer()
+                # x_processed has shape (B, L, lstm_embed_channels), L is current history length
+                # We only need the *last* token's embedding for the step
+                current_input_embedded = x[:, -1, :] # (B, lstm_embed_channels)
+
+                # Perform one step, updates self.* states implicitly
+                logits, alignment = self._lstm_decode_step(current_input_embedded)
+
+                # Output shape needs to be (B, 1, Dim) for consistency
+                indices_pred = logits.unsqueeze(1) # (B, 1, codebook_size)
+                attn_logprob = alignment.unsqueeze(1) # (B, 1, T_enc)
+
+            gate_pred = torch.zeros(B, indices_pred.size(1), 1, device=x.device)
+            return indices_pred, gate_pred, attn_logprob, x_mask, rnn_hidden
+
+    def infer(self, y, y_mask, spk_emb=None, max_length=1000, temperature=0.8, top_k=None, repetition_penalty=None,
+              min_p=None, min_p_tokens_to_keep=3, top_p=0.95, gate_threshold=0.5):
         """
         Autoregressive inference for discrete token generation.
 
@@ -800,17 +1010,26 @@ class SpectrogramDecoderAR(nn.Module):
         """
         B = y.size(0)
         device = y.device
+        filter_value = -float("Inf")
 
-        # Initialize with a "go" token; we assume token index 0 is the start token.
-        decoder_input = torch.zeros(B, 1, dtype=torch.long, device=device)
+        # Initialize with a "go" token
+        decoder_input = torch.full((B, 1),
+                                   fill_value=self.bos_token_id,
+                                   dtype=torch.long,
+                                   device=device)
 
         token_outputs = []  # To store generated tokens.
         gate_outputs = []  # To store corresponding gate predictions.
         finished = torch.zeros(B, dtype=torch.bool, device=device)
+        rnn_hidden = None
+
+        if self.dec_type == 'lstm':
+            self._initialize_lstm_states(y, y_mask.bool())
 
         for t in range(max_length):
             if t == max_length - 1:
                 print("Warning! Reached max decoder steps.")
+
 
             current_length = decoder_input.size(1)
             # In inference mode, no positions are padded.
@@ -818,14 +1037,25 @@ class SpectrogramDecoderAR(nn.Module):
 
             # Run forward pass. In inference mode, the forward function returns predictions
             # for each input token (i.e. no shifting is applied).
-            indices_pred, gate_pred, attn_logprob, _ = self.forward(decoder_input, x_mask, y, y_mask,
-                                                                    shift_tokens=False)
+            indices_pred, gate_pred, attn_logprob, _, hidden_out = self.forward(decoder_input, x_mask, y, y_mask,
+                                                                                spk_emb=spk_emb, shift_tokens=False,
+                                                                                rnn_hidden=rnn_hidden)
             # Get the logits and gate prediction for the last token.
             logits = indices_pred[:, -1, :]  # (B, vocab_size)
             last_gate = gate_pred[:, -1, :]  # (B, 1)
+            rnn_hidden = hidden_out
 
             # Temperature scaling.
             logits = logits / temperature
+
+            # Add repetition penalty:
+            if repetition_penalty is not None:
+                # Count occurrences of each token in the generated sequence for each batch.
+                counts = torch.zeros(B, logits.size(1), device=logits.device)
+                counts.scatter_add_(1, decoder_input, torch.ones_like(decoder_input, dtype=torch.float))
+                # Apply the repetition penalty vectorized over the batch.
+                multiplier = torch.where(logits < 0, repetition_penalty, 1.0 / repetition_penalty)
+                logits = logits * (multiplier ** counts)
 
             # Optional top-k filtering.
             if top_k is not None and top_k > 0:
@@ -844,6 +1074,23 @@ class SpectrogramDecoderAR(nn.Module):
                 indices_to_remove = sorted_indices_to_remove.scatter(1, sorted_indices, sorted_indices_to_remove)
                 logits = logits.masked_fill(indices_to_remove, -float('Inf'))
 
+            # 3. Min-P sampling (Dynamic Threshold based on P_max)
+            if min_p is not None and min_p > 0.0:
+                probs = torch.softmax(logits, dim=-1)
+                p_max, _ = torch.max(probs, dim=-1, keepdim=True)  # (B, 1)
+                scaled_min_p = min_p * p_max  # (B, 1)
+                tokens_to_remove_mask = probs < scaled_min_p  # (B, vocab_size)
+
+                # Ensure min_tokens_to_keep
+                sorted_indices = torch.argsort(logits, descending=True, dim=-1)
+                sorted_mask = torch.gather(tokens_to_remove_mask, dim=-1, index=sorted_indices)
+                sorted_mask[..., :min_p_tokens_to_keep] = False  # Keep at least these top tokens
+                # Scatter mask back to original positions
+                indices_to_remove = torch.scatter(
+                    tokens_to_remove_mask, dim=-1, index=sorted_indices, src=sorted_mask
+                )
+                logits = logits.masked_fill(indices_to_remove, filter_value)
+
             probs = torch.softmax(logits, dim=-1)
             # Sample the next token.
             next_token = torch.multinomial(probs, num_samples=1)  # (B, 1)
@@ -854,8 +1101,7 @@ class SpectrogramDecoderAR(nn.Module):
             # Append the sampled token to the decoder input.
             decoder_input = torch.cat([decoder_input, next_token], dim=1)
 
-            # Check termination: if the gate prediction exceeds the threshold, mark as finished.
-            finished = finished | (last_gate.squeeze(1) > gate_threshold)
+            finished = finished | (next_token.squeeze(-1) == self.eos_token_id)
             if finished.all():
                 break
 

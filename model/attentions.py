@@ -981,8 +981,7 @@ class TransformerEncoderLayer(nn.Module):
 
 class TransformerDecoderLayer(nn.Module):
     def __init__(self, embed_size, heads, forward_expansion, dropout, alibi_alpha=1.0, start_i_increment=0,
-                 kernel_size=1, act="swiglu", conv_att=False, talking_heads=True, dynamic_alibi=False, flex_attention=True,
-                 gqa_groups=1):
+                 kernel_size=1, act="swiglu", conv_att=False, talking_heads=True, dynamic_alibi=False):
         super(TransformerDecoderLayer, self).__init__()
         self.norm1 = nn.LayerNorm(embed_size)
         self.norm2 = nn.LayerNorm(embed_size)
@@ -991,13 +990,13 @@ class TransformerDecoderLayer(nn.Module):
         self.attention = MultiHeadAttention(embed_size, heads, alibi_alpha=alibi_alpha,
                                             start_i_increment=start_i_increment, num_persistent=0,
                                             rma_inp_dim=0, use_talking_heads=talking_heads,
-                                            dynamic_alibi=dynamic_alibi, gqa_groups="auto")
+                                            dynamic_alibi=dynamic_alibi, causal=True)
 
         self.cross_attention = MultiHeadAttention(embed_size, heads, alibi_alpha=alibi_alpha,
                                                   start_i_increment=start_i_increment, num_persistent=0,
                                                   rma_inp_dim=0, use_talking_heads=talking_heads,
-                                                  dynamic_alibi=dynamic_alibi, gqa_groups="auto",
-                                                  use_alibi=False,)
+                                                  dynamic_alibi=dynamic_alibi,
+                                                  use_alibi=False, causal=False)
 
         self.feed_forward = SwiGLUConvFFN(
             in_features=embed_size,
@@ -1007,6 +1006,7 @@ class TransformerDecoderLayer(nn.Module):
             drop=dropout,
             act=act,
             conv_att=conv_att,
+            bias=True,
         )
         self.last_weights = None
         self.dropout = nn.Dropout(dropout)
@@ -1031,6 +1031,111 @@ class TransformerDecoderLayer(nn.Module):
         self.last_weights = cross_attn_weights
 
         return x
+
+
+class RWKVFormerLayer(nn.Module):
+    def __init__(self, embed_size, heads, forward_expansion, dropout, alibi_alpha=1.0, start_i_increment=0,
+                 kernel_size=1, act="swiglu", conv_att=False, talking_heads=True, dynamic_alibi=False, config_map=None):
+        super(RWKVFormerLayer, self).__init__()
+        self.norm1 = nn.LayerNorm(embed_size)
+        self.norm2 = nn.LayerNorm(embed_size)
+        self.norm3 = nn.LayerNorm(embed_size)
+        self.time_mix = RWKV7TimeMix(config_map)
+
+        self.cross_attention = MultiHeadAttention(embed_size, heads, alibi_alpha=alibi_alpha,
+                                                  start_i_increment=start_i_increment, num_persistent=0,
+                                                  rma_inp_dim=0, use_talking_heads=talking_heads,
+                                                  dynamic_alibi=dynamic_alibi,
+                                                  use_alibi=False, causal=False)
+
+        self.feed_forward = SwiGLUConvFFN(
+            in_features=embed_size,
+            hidden_features=forward_expansion * embed_size,
+            out_features=embed_size,
+            kernel_size=kernel_size,
+            drop=dropout,
+            act=act,
+            conv_att=conv_att,
+            bias=True,
+        )
+        self.last_weights = None
+        self.dropout = nn.Dropout(dropout)
+
+    def forward(self, x, y, mask, cross_attn_mask, conv_mask=None, v_first_val=None):
+        # Primary attention
+        norm_x = self.norm1(x)
+
+        attn_output, _, _, v_first_val = self.tmix(norm_x, None, None, v_first_val)
+        attn_output = attn_output.masked_fill(conv_mask.transpose(1,2), 0)
+        x = x + self.dropout(attn_output)
+
+        # Cross-attention
+        norm_x = self.norm2(x)
+        cross_attn_output, cross_attn_weights = self.cross_attention(y, y, norm_x, mask=cross_attn_mask, return_weights=True)
+        x = x + self.dropout(cross_attn_output)
+
+        # Feed-forward
+        norm_x_ff = self.norm3(x)
+        ff_output = self.feed_forward(norm_x_ff, mask if conv_mask is None else conv_mask)
+        x = x + self.dropout(ff_output)
+
+        # cache last attn weights
+        self.last_weights = cross_attn_weights
+
+        return x, v_first_val
+
+
+class RWKVFormerDecoder(nn.Module):
+    def __init__(self, embed_size, heads, num_layers, forward_expansion, dropout, alibi_alpha=1.0, start_i=0
+                 , act="swiglu", talking_heads=True, dynamic_alibi=False, alibi_scaling_fac=None):
+        super().__init__()
+        self.use_conv_att = False
+        if alibi_scaling_fac is None:
+            alibi_scaling_fac = 1
+
+        use_flexattn_on_ca = [True] * num_layers
+        use_flexattn_on_ca[0] = False
+        use_flexattn_on_ca[-1] = False
+        self.decoder_layers = nn.ModuleList()
+
+        rwkv_cfg = RWKV7BlockConfigMap(num_hidden_layers=num_layers, hidden_size=embed_size)
+        rwkv_cfg.dtype = "bfloat16"
+        rwkv_cfg.head_size = 32
+
+        for i in range(num_layers):
+            layer_cfg = rwkv_cfg
+            layer_cfg.layer_id = i
+            self.decoder_layers.append(
+                RWKVFormerLayer(embed_size, heads, forward_expansion, dropout, alibi_alpha=alibi_alpha,
+                                start_i_increment=start_i + ((i * heads) // alibi_scaling_fac), kernel_size=1,
+                                act=act, talking_heads=talking_heads,
+                                dynamic_alibi=dynamic_alibi, config_map=layer_cfg)
+            )
+
+
+    def forward(self, x, y, mask, cross_attn_mask, conv_mask=None):
+        """
+        Args:
+            x: Input tensor of shape (batch_size, seq_length, embed_size).
+            y: Input tensor of shape (batch_size, seq_2_length, embed_size)
+            mask: Mask tensor of shape (batch_size, 1, seq_length, seq_length) or similar.
+            cross_attn_mask: Mask tensor of shape (batch_size, 1, seq_length, seq_2_length)
+            conv_mask: Convolutional mask size (batch, 1, seq_length) where True is padded and False is valid
+
+            Note: mask does not need to be causal, this call automatically does that.
+        Returns:
+            The output of the last encoder layer.
+        """
+        mask = make_mask_causal(mask)
+        v_first_val = None
+
+        for i, layer in enumerate(self.decoder_layers):
+            x, layer_v_first_val = layer(x, y, mask, cross_attn_mask, conv_mask, v_first_val)  # Here x serves as query, key, and value
+            if i == 0:
+                v_first_val = layer_v_first_val
+
+        return x
+
 
 
 class RNNFormerLayer(nn.Module): # redundant arguments kept for easy interface with TransformerDecoder class

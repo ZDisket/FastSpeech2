@@ -8,8 +8,8 @@ from .submodels import sequence_mask, mask_to_attention_mask, Prenet
 from torch.nn.utils.rnn import pack_padded_sequence, pad_packed_sequence
 from .s4 import S4Block as S4 
 from torch.cuda.amp import GradScaler, autocast
+import torch.nn.functional as F
 from torch.nn.utils import spectral_norm
-
 
 class SequenceNormalization(nn.Module):
     """
@@ -80,6 +80,108 @@ class ConvBlock1D(nn.Module):
         out = self.act(out).masked_fill(x_mask, 0)
         out = self.dropout(out)
         return out
+
+
+class MelSpectrogramPatchDiscriminator(nn.Module):
+    """
+    PatchGAN-style discriminator for mel-spectrogram inputs using strided convolutions.
+
+    Args:
+        mel_channels (int): number of mel frequency bins.
+        hidden_channels (List[int]): list of output channels for each conv layer (feature extractors).
+        kernel_sizes (List[int]): list of kernel sizes for each conv layer (length = len(hidden_channels) + 1 for final layer).
+        spectral_norm (bool): whether to apply spectral normalization on convs.
+
+    The default kernel sizes decrease over layers for finer detail at later stages.
+    """
+    def __init__(
+        self,
+        mel_channels: int,
+        hidden_channels: list = [64, 128, 256, 512],
+        kernel_sizes: list = [7, 5, 5, 3, 3],
+    ):
+        super().__init__()
+        assert len(kernel_sizes) == len(hidden_channels) + 1, \
+            "kernel_sizes length must be hidden_channels length + 1"
+
+        self.mel_channels = mel_channels
+        self.hidden_channels = hidden_channels
+        self.kernel_sizes = kernel_sizes
+
+        self.convs = nn.ModuleList()
+        in_ch = mel_channels
+        # feature extraction convs with stride=2
+        for out_ch, k in zip(hidden_channels, kernel_sizes[:-1]):
+            conv = nn.Conv1d(
+                in_ch,
+                out_ch,
+                kernel_size=k,
+                stride=2,
+                padding=(k - 1) // 2,
+            )
+            conv = spectral_norm(conv)
+            self.convs.append(conv)
+            in_ch = out_ch
+
+        # final 1-channel conv, stride=1
+        final_k = kernel_sizes[-1]
+        final_conv = nn.Conv1d(
+            in_ch,
+            1,
+            kernel_size=final_k,
+            stride=1,
+            padding=(final_k - 1) // 2,
+        )
+        final_conv = spectral_norm(final_conv)
+        self.convs.append(final_conv)
+
+        self.activation = nn.LeakyReLU(0.2, inplace=True)
+        self._initialize_weights()
+
+    def _initialize_weights(self):
+        for m in self.modules():
+            if isinstance(m, nn.Conv1d):
+                nn.init.normal_(m.weight, 0.0, 0.02)
+                if m.bias is not None:
+                    nn.init.zeros_(m.bias)
+
+    def forward(self, x: torch.Tensor, x_lengths: torch.Tensor) -> (torch.Tensor, torch.Tensor):
+        """
+        Args:
+            x (Tensor): shape (batch, mel_len, mel_channels)
+            x_mask (Tensor): shape (batch,) Lengths of x
+
+        Returns:
+            out (Tensor): shape (batch, 1, L_out), patch-level logits.
+            patch_mask (Tensor): shape (batch, 1, L_out), bool mask where True indicates valid (non-padded) patches.
+        """
+        x_mask = sequence_mask(x.size(1), x_lengths)
+        # zero out padded time steps
+        x = x.masked_fill(x_mask.unsqueeze(-1), 0.0)
+
+        # reshape to (batch, channels, time)
+        out = x.transpose(1, 2)
+
+        # initial valid mask (1.0 for valid, 0.0 for padding)
+        valid_mask = (~x_mask).float()  # (batch, mel_len)
+
+        for conv in self.convs:
+            out = conv(out)
+            out = self.activation(out)
+
+            # update mask for downsampling
+            stride = conv.stride[0]
+            if stride > 1:
+                valid_mask = F.max_pool1d(
+                    valid_mask.unsqueeze(1), kernel_size=stride, stride=stride
+                ).squeeze(1)
+
+            # mask out fully-padded patches
+            out = out.masked_fill(valid_mask.unsqueeze(1) == 0, 0.0)
+
+        # final patch mask: True for valid patches
+        patch_mask = valid_mask.unsqueeze(1).bool()  # (batch, 1, L_out)
+        return out, patch_mask
 
 
 class S4Block1D(nn.Module):

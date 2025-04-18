@@ -78,20 +78,18 @@ def binarize_attention_parallel(attn, in_lens, out_lens):
 
 class ConvNorm(torch.nn.Module):
     def __init__(
-            self,
-            in_channels,
-            out_channels,
-            kernel_size=1,
-            stride=1,
-            padding=None,
-            dilation=1,
-            bias=True,
-            w_init_gain='linear',
-            use_partial_padding: bool = False,
-            use_weight_norm: bool = False,
-            norm_fn=None,
-            use_cbam=False,
-            drop=None,
+        self,
+        in_channels,
+        out_channels,
+        kernel_size=1,
+        stride=1,
+        padding=None,
+        dilation=1,
+        bias=True,
+        w_init_gain='linear',
+        use_partial_padding: bool = False,
+        use_weight_norm: bool = False,
+        norm_fn=None,
     ):
         super(ConvNorm, self).__init__()
         if padding is None:
@@ -114,18 +112,32 @@ class ConvNorm(torch.nn.Module):
         if norm_fn is not None:
             self.norm = norm_fn(out_channels, affine=True)
         else:
-            self.norm = nn.Identity()
+            self.norm = None
         self.conv = conv
-        self.cbam = CBAM(out_channels) if use_cbam else nn.Identity()
-        self.drop = nn.Dropout(drop) if drop is not None else nn.Identity()
 
     def forward(self, input: torch.Tensor, mask_in: Optional[torch.Tensor] = None) -> torch.Tensor:
         ret = self.conv(input, mask_in)
-        ret = self.cbam(ret)
-        ret = self.norm(ret)
-        ret = self.drop(ret)
+        if self.norm is not None:
+            ret = self.norm(ret)
         return ret
 
+class LocationLayer(nn.Module):
+    def __init__(self, attention_n_filters, attention_kernel_size,
+                 attention_dim):
+        super(LocationLayer, self).__init__()
+        padding = int((attention_kernel_size - 1) / 2)
+        self.location_conv = ConvNorm(2, attention_n_filters,
+                                      kernel_size=attention_kernel_size,
+                                      padding=padding, bias=False, stride=1,
+                                      dilation=1)
+        self.location_dense = nn.Linear(attention_n_filters, attention_dim,
+                                         bias=False)
+
+    def forward(self, attention_weights_cat):
+        processed_attention = self.location_conv(attention_weights_cat)
+        processed_attention = processed_attention.transpose(1, 2)
+        processed_attention = self.location_dense(processed_attention)
+        return processed_attention
 
 class SafeSoftmax(nn.Module):
     def __init__(self, dim=-1):
