@@ -23,6 +23,11 @@ try:
 except ImportError:
     print("FlexAttention not available.")
 
+
+if flex_attention_available:
+    flex_attention = torch.compile(flex_attention, dynamic=True)
+    create_block_mask = torch.compile(create_block_mask, dynamic=True)
+
 flash_attention_available = False
 
 def is_rocm():
@@ -451,9 +456,9 @@ class MultiHeadAttention(nn.Module):
         self.heads = heads
         self.head_dim = embed_size // heads
         self.use_alibi = use_alibi
-        self.dynamic_alibi = dynamic_alibi
-        self.qk_rmsnorm = qk_rmsnorm
-        self.backend = "manual"
+        self.dynamic_alibi = False
+        self.qk_rmsnorm = False
+        self.backend = "auto"
         self.causal = causal
 
         if backend == "auto":
@@ -608,26 +613,87 @@ class MultiHeadAttention(nn.Module):
 
         return out, attention_weights
 
-    def flex_attention_forward(self, queries, keys, values, mask, alibi_bias, N, query_len, key_len):
-        # Define score_mod function that applies ALiBi bias.
-        def score_mod(score, b, h, q_idx, kv_idx):
-            return score - alibi_bias
+    # --- inside MultiHeadAttention ----------------------------------------------
+    def flex_attention_forward(
+            self, queries, keys, values,
+            mask, alibi_bias,
+            N, query_len, key_len  # key_len == original sequence length
+    ):
+        """
+        Flex‑Attention backend, **no persistent memory**.
+        Returns: out (B, Q, H, D), attention_weights=None
+        """
 
-        # Define mask_mod based on the provided mask tensor.
-        if mask is not None:
-            # The provided mask has shape (N, 1, query_len, original_key_len)
-            def mask_mod(b, h, q_idx, kv_idx):
-                return mask[b, 0, q_idx, kv_idx].item()
+        # ------------------------------------------------------------------ #
+        # 1)  Layout:  FlexAttention wants (B, H, S, D)
+        # ------------------------------------------------------------------ #
+        q = queries.permute(0, 2, 1, 3).contiguous()  # (B, H, Q, D)
+        k = keys.permute(0, 2, 1, 3).contiguous()  # (B, Hkv, K, D)
+        v = values.permute(0, 2, 1, 3).contiguous()  # (B, Hkv, K, D)
+        # (Hkv == self.num_kv_heads; FlexAttention handles GQA natively)
 
-            block_mask = create_block_mask(mask_mod, B=N, H=self.heads, Q_LEN=query_len, KV_LEN=key_len,
-                                           device=queries.device)
+        kv_len_total = k.shape[2]  # == key_len (no memory)
+
+        # ------------------------------------------------------------------ #
+        # 2)  ALiBi bias – inject per‑element via score_mod
+        # ------------------------------------------------------------------ #
+        if self.use_alibi:
+            alibi_ = alibi_bias.squeeze(0)  # (H, Q, K)
+
+            def score_mod(score, b, h, q_idx, kv_idx):
+                # `score` is a scalar; add scalar bias.
+                return score + alibi_[h, q_idx, kv_idx]
         else:
-            block_mask = None
+            score_mod = None  # FlexAttention treats None as identity
 
-        # Compute attention via FlexAttention.
-        out = flex_attention(queries, keys, values, score_mod=score_mod, block_mask=block_mask)
-        attention_weights = None
-        return out, attention_weights
+        # ------------------------------------------------------------------ #
+        # 3)  Boolean mask ➜ BlockMask    (shape B×1×Q×K, True = keep)
+        # ------------------------------------------------------------------ #
+        block_mask = None
+        if mask is not None:
+            # mask: (B,1,Q,K) with True=valid
+            # 1) Precompute per‑batch sequence lengths:
+            q_lens = mask.any(dim=-1).squeeze(1).sum(dim=-1)  # (B,)
+            k_lens = mask.any(dim=-2).squeeze(1).sum(dim=-1)  # (B,)
+
+            causal = self.causal  # capture the flag
+
+            # 2) mask_mod purely by tensor comparisons:
+            def mask_mod(b, h, q_idx, kv_idx):
+                # check within real lengths
+                valid_q = q_idx < q_lens[b]  # (…,) bool tensor
+                valid_k = kv_idx < k_lens[b]  # (…,) bool tensor
+
+                base_mask = valid_q & valid_k
+
+                # apply causal: only allow kv positions ≤ q position
+                if causal:
+                    return base_mask & (kv_idx <= q_idx)
+                return base_mask
+
+            block_mask = create_block_mask(
+                mask_mod,
+                B=N, H=self.heads,
+                Q_LEN=query_len, KV_LEN=kv_len_total,
+                device=q.device
+            )
+
+        # ------------------------------------------------------------------ #
+        # 4)  Call FlexAttention
+        # ------------------------------------------------------------------ #
+        out = flex_attention(q, k, v,
+                             score_mod=score_mod,
+                             block_mask=block_mask)  # (B, H, Q, D)
+
+        # ------------------------------------------------------------------ #
+        # 5)  Back to (B, Q, H, D) + optional weighted heads
+        # ------------------------------------------------------------------ #
+        out = out.permute(0, 2, 1, 3)  # (B, Q, H, D)
+
+        if self.weighted_heads:
+            out = out * self.head_weights.view(1, 1, -1, 1)
+
+        return out, None
 
     def sdpa_forward(self, queries, keys, values, mask, alibi_bias, current_persistent, N, query_len, key_len):
 
@@ -1249,7 +1315,7 @@ class TransformerDecoder(nn.Module):
         super().__init__()
         self.use_conv_att = False
         if alibi_scaling_fac is None:
-            alibi_scaling_fac = 1
+            alibi_scaling_fac = round(max(1, ((num_layers - 1) * heads) // (32 - start_i)))
 
         use_flexattn_on_ca = [True] * num_layers
         use_flexattn_on_ca[0] = False
@@ -1292,7 +1358,9 @@ class TransformerEncoder(nn.Module):
         self.use_conv_att = conv_att
         self.coarse_fine = coarse_fine
         if alibi_scaling_fac is None:
-            alibi_scaling_fac = 1
+            # select a scaling factor so that the final layer never sees a start_i greater than 32
+            alibi_scaling_fac = round(max(1, ((num_layers - 1) * heads) // (32 - start_i)))
+
 
         # Our design is coarse fine attention for all layers except the first.
         coarse_fine_vec = [self.coarse_fine] * num_layers
@@ -1551,24 +1619,61 @@ def mask_to_causal_attention_mask(mask):
     return attention_mask
 
 
-class CausalConv1d(nn.Conv1d):
+class CausalConv1da(nn.Conv1d):
     """
-    A 1D convolution layer that applies causal padding on the left side.
-    For a kernel size k and dilation d, it pads the input with d*(k-1) zeros on the left.
-    """
-    def __init__(self, in_channels, out_channels, kernel_size, dilation=1, **kwargs):
-        # Compute the required left-padding for causal convolution
-        self.causal_padding = dilation * (kernel_size - 1)
-        # Remove any padding passed in kwargs and use padding=0 (we handle it manually)
-        kwargs.pop('padding', None)
-        super().__init__(in_channels, out_channels, kernel_size, dilation=dilation, padding=0, **kwargs)
+    1-D *causal* convolution with optional weight-norm already applied.
 
-    def forward(self, x):
-        # Pad only on the left: (left, right)
-        if self.causal_padding > 0:
-            x = F.pad(x, (self.causal_padding, 0))
+    Padding rule
+    ------------
+    For kernel size *k* and dilation *d* the layer pads
+    **d × (k − 1)** zeros on the *left* so that every output sample
+    depends only on current and past inputs.
+
+    Parameters
+    ----------
+    in_channels      : int
+    out_channels     : int
+    kernel_size      : int
+    dilation         : int, default=1
+    bias             : bool, default=True
+    use_weight_norm  : bool, default=True
+    **kwargs         : any extra Conv1d arguments (stride, groups, etc.)
+    """
+    def __init__(
+        self,
+        in_channels:   int,
+        out_channels:  int,
+        kernel_size:   int,
+        dilation:      int  = 1,
+        bias:          bool = True,
+        use_weight_norm: bool = True,
+        **kwargs
+    ):
+        # amount of left-padding to keep the op causal
+        self.causal_padding = dilation * (kernel_size - 1)
+
+        # Conv1d handles **no** padding; we pad manually in forward()
+        kwargs.pop("padding", None)
+        super().__init__(
+            in_channels,
+            out_channels,
+            kernel_size,
+            dilation=dilation,
+            padding=0,
+            bias=bias,
+            **kwargs
+        )
+
+        # register weight-norm on this module's own .weight
+        if use_weight_norm:
+            nn.utils.weight_norm(self, name="weight")
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if self.causal_padding:
+            x = F.pad(x, (self.causal_padding, 0))  # (left, right)
         return super().forward(x)
 
+from torch.nn.utils.parametrizations import weight_norm
 
 class ResidualBlock1D(nn.Module):
     """
@@ -1578,27 +1683,54 @@ class ResidualBlock1D(nn.Module):
     If provided, the mask is applied with .masked_fill() before each activation.
     """
 
-    def __init__(self, in_channels, out_channels, kernel_size=3, dilation=1, dropout=0.3, act="relu", causal=False):
+    def __init__(self, in_channels, out_channels, kernel_size=3, dilation=1, dropout=0.3, act="relu", causal=False, norm="layer"):
         super(ResidualBlock1D, self).__init__()
 
+        assert norm in ["weight", "layer", "instance"], f"Unknown normalization type {norm}, must be 'weight', 'layer', or 'instance'"
+
         if causal:
-            self.conv1 = CausalConv1d(in_channels, out_channels, kernel_size, dilation=dilation)
-            self.conv2 = CausalConv1d(out_channels, out_channels, kernel_size, dilation=dilation)
+            self.conv1 = CausalConv1da(in_channels, out_channels, kernel_size, dilation=dilation, use_weight_norm = norm == "weight")
+            self.conv2 = CausalConv1da(out_channels, out_channels, kernel_size, dilation=dilation,  use_weight_norm = norm == "weight")
             self.cbam = None
         else:
             self.conv1 = nn.Conv1d(in_channels, out_channels, kernel_size, dilation=dilation, padding="same")
             self.conv2 = nn.Conv1d(out_channels, out_channels, kernel_size, dilation=dilation, padding="same")
             self.cbam = CBAM1D(out_channels)
 
-        self.norm1 = TransposeLayerNorm(out_channels)
-        self.norm2 = TransposeLayerNorm(out_channels)
-        self.relu = APTx() if act == "aptx" else nn.ReLU()
+        if norm == "weight":
+            if not causal:
+                self.conv1 = weight_norm(self.conv1)
+                self.conv2 = weight_norm(self.conv2)
+
+            self.norm1 = nn.Identity()
+            self.norm2 = nn.Identity()
+        elif norm == "layer":
+            self.norm1 = TransposeLayerNorm(out_channels)
+            self.norm2 = TransposeLayerNorm(out_channels)
+        else:
+            self.norm1 = nn.InstanceNorm1d(out_channels, affine=True)
+            self.norm2 = nn.InstanceNorm1d(out_channels, affine=True)
+
+        if act == "taptx":
+            self.relu = APTx(trainable=True)
+        elif act == "aptx":
+            self.relu = APTx()
+        elif act == "relu":
+            self.relu = nn.ReLU()
+        else:
+            raise RuntimeError(f"Unknown activation: {act}")
         self.dropout = nn.Dropout(dropout)
 
         self.residual = nn.Conv1d(in_channels, out_channels,
                                   kernel_size=1) if in_channels != out_channels else nn.Identity()
 
     def forward(self, x, x_mask=None):
+        """
+        Forward pass through the Residual Block 1D
+        :param x: Input size (B, Cin, T)
+        :param x_mask: Boolean sequence mask size (B, 1, T) where True=padded
+        :return: Output size (B, Cout, T)
+        """
         residual = self.residual(x)
         out = self.conv1(x)
         out = self.norm1(out)
@@ -1606,7 +1738,7 @@ class ResidualBlock1D(nn.Module):
         if x_mask is not None:
             out = out.masked_fill(x_mask, 0)
         out = self.relu(out)
-        out = self.dropout(out)
+
 
         out = self.conv2(out)
         out = self.norm2(out)
@@ -1617,7 +1749,6 @@ class ResidualBlock1D(nn.Module):
         if x_mask is not None:
             out = out.masked_fill(x_mask, 0)
         out = self.relu(out)
-
         out = self.dropout(out)
         return out
 

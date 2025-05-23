@@ -12,7 +12,7 @@ from torch.utils.tensorboard import SummaryWriter
 from tqdm import tqdm
 import itertools
 from utils.model import get_model, get_vocoder, get_param_num, load_pretrained_weights, get_pre_encoder
-from utils.tools import to_device, log, synth_one_sample_st, test_one_fs2, log_attention_maps, log_attention_maps_mh
+from utils.tools import to_device, log, synth_one_sample_st, test_one_fs2, log_attention_maps, log_attention_maps_mh, test_one_sturmschlag
 from model import SturmLoss
 from model.loss import LSGANLoss
 from dataset import Dataset
@@ -156,6 +156,7 @@ def main(args, configs):
     save_step = train_config["step"]["save_step"]
     synth_step = train_config["step"]["synth_step"]
     val_step = train_config["step"]["val_step"]
+    test_step = save_step // 2
 
     outer_bar = tqdm(total=total_step, desc="Training", position=0, miniters=1)
     outer_bar.n = args.restore_step
@@ -283,25 +284,24 @@ def main(args, configs):
 
                 if step % val_step == 0:
                     model.eval()
-                    message = evaluate_st(model, step, configs, val_logger, vocoder, epoch)
+                    message, _ = evaluate_st(model, step, configs, val_logger, vocoder, epoch)
                     with open(os.path.join(val_log_path, "log.txt"), "a") as f:
                         f.write(message + "\n")
                     outer_bar.write(message)
 
+                    model.train()
+
+                if step % test_step == 0:
+                    model.eval()
                     speakers = train_config['test_speakers']
                     sentences = train_config['test_sentences']
-
-                    # turn off testing for now
-                    speakers = []
-                    sentences = []
 
                     # Generate all combinations of speakers and sentences
                     pairs = list(itertools.product(speakers, sentences))
 
                     for idx, (spkid, sent) in enumerate(pairs, start=1):
                         blocks, hid = bert_model.infer(sent)
-                        t_aud = test_one_fs2(model.module, vocoder, sent, blocks.cpu().numpy(), hid.cpu().numpy(),
-                                             int(spkid))
+                        t_aud = test_one_sturmschlag(model.module, vocoder, hid.unsqueeze(1), sent, int(spkid))
                         if t_aud is None:
                             continue
                         log(
@@ -311,7 +311,6 @@ def main(args, configs):
                             sampling_rate=preprocess_config["preprocessing"]["audio"]["sampling_rate"],
                             tag=f"Test/sentence_{idx}"
                         )
-
                     model.train()
 
                 if step % save_step == 0:

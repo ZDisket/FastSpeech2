@@ -637,6 +637,70 @@ def fs2_infer(inmodel, text, in_blocks, in_hid, in_speakers):
     return mel, mel_postnet, mel_torch, mel_postnet_torch
 
 
+def synthesize_st(inmodel, speakers, text, em_hidden=None):
+    """
+    Prepares inputs and runs inference for the Sturmschlag model.
+
+    Args:
+        inmodel (nn.Module): The Sturmschlag model.
+        speakers (list or array): Speaker IDs (e.g., [0] for single speaker).
+        text (np.array): Preprocessed text as a numpy array of token IDs.
+        em_hidden (torch.Tensor, optional): Emotion features (from BERT).
+
+    Returns:
+        mel_out (torch.Tensor): Generated mel spectrogram (processed for display).
+        gate_out (torch.Tensor): Gate predictions (processed for display).
+        mel_torch (torch.Tensor): Raw mel spectrogram output from the model.
+        gate_torch (torch.Tensor): Raw gate output from the model.
+    """
+    src_len = torch.tensor([text.shape[1]]).to(device)
+    text = torch.IntTensor(text).to(device)
+    speakers = torch.LongTensor(speakers).to(device)
+
+    # Call the model's inference method.
+    mel, gate = inmodel.infer(speakers, text, src_len, em_hidden)
+
+    # For further processing, also get a transposed version.
+    mel_torch = mel.transpose(1, 2).detach()
+    gate_torch = gate.detach()
+    mel_out = mel[0].cpu().transpose(0, 1).detach()
+    gate_out = gate[0].cpu().detach()
+
+    return mel_out, gate_out, mel_torch, gate_torch
+
+def test_one_sturmschlag(inmodel, invocoder, em_hidden, in_txt, spkid=31):
+    """
+    Run a single Sturmschlag inference and vocoder pass inside the training loop.
+
+    Args:
+        inmodel (nn.Module): your Sturmschlag model (e.g. model.module).
+        invocoder:    your vocoder instance.
+        in_txt (str): the raw input sentence.
+        spkid (int):  the speaker ID to use.
+
+    Returns:
+        np.ndarray or torch.Tensor: the waveform, or None on failure.
+    """
+    with torch.no_grad():
+        try:
+            # 2) preprocess text
+            txt_arr = preproc_text(in_txt)            # -> 1D numpy array
+            txt = np.expand_dims(txt_arr, 0)           # -> shape [1, seq_len]
+
+            # 3) run Sturmschlag
+            speakers = [spkid]
+            mel_out, gate_out, mel_torch, gate_torch = synthesize_st(
+                inmodel, speakers, txt, em_hidden
+            )
+        except RuntimeError as e:
+            print(f"Error inferring '{in_txt}': {e}")
+            return None
+
+        # 4) vocode to waveform
+        audio = invocoder.infer(mel_torch.to(device))
+        return audio
+
+
 def test_one_fs2(inmodel, invocoder, in_txt, in_blocks, in_hid, in_spkid=0):
     with torch.no_grad():
         txt = preproc_text(in_txt)

@@ -1,10 +1,8 @@
 import torch
 import torch.nn as nn
-from tensorboard.errors import InvalidArgumentError
-
 from .attentions import TransformerEncoder, TemporalConvNet, MultiHeadAttention, \
     mask_to_causal_attention_mask, TransposeLayerNorm, AttentionPooling, APTxS1, APTx, SwiGLUConvFFN, NeoTCNAttention, \
-    ConvReluNorm, TransformerDecoder, expand_self_attention_mask, ResidualBlock1D
+    ConvReluNorm, TransformerDecoder, expand_self_attention_mask, ResidualBlock1D, RWKVFormerDecoder
 from torch.nn.utils.rnn import pack_padded_sequence, pad_packed_sequence
 import torch.nn.functional as F
 from .attblocks import CBAM2d, MaskedSEBlock1D, CBAM1D
@@ -13,6 +11,7 @@ import monotonic_align, math
 from torchbnn import BayesLinear
 from .subatts import RMSNorm
 from .finite_scalar_quantization import FSQ
+
 
 # Applying LayerNorm + Dropout on embeddings increases performance, probably due to the regularizing effect
 # Thanks dathudeptrai from TensorFlowTTS for discovering this.
@@ -163,8 +162,178 @@ class SimpleEmProj(nn.Module):
         return x
 
 
+class GroupActNorm1d(nn.Module):
+    """
+    Glow-style ActNorm that shares γ, β across groups of mel bins
+    (B, C=n_mels, T)  →  z-scored per group.
+
+    Call .forward(x)  to normalise
+         .inverse(z)  to restore the original scale
+    """
+
+    def __init__(self, n_mels: int, group_size: int = 8, eps: float = 1e-6):
+        super().__init__()
+        assert n_mels % group_size == 0, "`n_mels` must be divisible by `group_size`"
+        self.n_groups = n_mels // group_size
+        self.group_size = group_size
+        self.eps = eps
+
+        # learnable β, log σ  (one pair per group)
+        self.bias = nn.Parameter(torch.zeros(self.n_groups))
+        self.log_scale = nn.Parameter(torch.zeros(self.n_groups))
+
+        self.initialised = False  # data-dependent init on first forward
+
+    # ---------- helpers ----------
+    def _reshape(self, x):
+        B, C, T = x.shape
+        g = self.group_size
+        return x.view(B, self.n_groups, g, T)
+
+    def _get_affine(self):
+        # broadcast to (1, n_groups, 1, 1)
+        scale = self.log_scale.exp().view(1, self.n_groups, 1, 1)
+        bias = self.bias.view(1, self.n_groups, 1, 1)
+        return scale, bias
+
+    # ---------- API ----------
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Normalise → mean ≈ 0, std ≈ 1  per group."""
+        x_ = self._reshape(x)
+
+        if not self.initialised:  # data-dependent init
+            with torch.no_grad():
+                mean = x_.mean(dim=[0, 2, 3])
+                std = x_.std(dim=[0, 2, 3]) + self.eps
+                self.bias.data.copy_(mean)
+                self.log_scale.data.copy_(std.log())
+            self.initialised = True
+
+        scale, bias = self._get_affine()
+        y_ = (x_ - bias) / scale  # z-score
+        return y_.view_as(x)  # (B, C, T)
+
+    def inverse(self, z: torch.Tensor) -> torch.Tensor:
+        """Undo the normalisation (γ, β come from the same layer)."""
+        z_ = self._reshape(z)
+        scale, bias = self._get_affine()
+        x_ = z_ * scale + bias
+        return x_.view_as(z)
+
+
+class MelMixer(nn.Module):
+    def __init__(self, channels, k_mel=5):
+        super().__init__()
+        self.dw = nn.Conv2d(
+            channels, channels, (k_mel, 1),
+            padding=(k_mel // 2, 0),
+            groups=channels, bias=False)  # depth-wise
+        self.pw = nn.Conv2d(channels, channels, 1)  # point-wise
+        self.act = nn.GELU()
+
+    def forward(self, x):  # x: (B,C,mel,T)
+        return self.act(self.pw(self.dw(x))) + x
+
+
+from torch.nn.utils import weight_norm
+
+
+class ConvBlock2D(nn.Module):
+    """
+    2-D convolutional block that supports:
+      • weight-norm wrapping
+      • regular or depth-wise-separable conv
+      • boolean padding mask (B, 1, H, W)  – keeps padded pixels at 0
+
+    Forward signature
+    -----------------
+    y = block(x, x_mask=None)
+
+    If x_mask is provided (True = padded), the block applies
+    `out = out.masked_fill(mask_expanded, 0)` right *before* the
+    non-linearity.  This mirrors the masking strategy used in
+    ResidualBlock2D.
+    """
+
+    def __init__(
+            self,
+            in_channels: int,
+            out_channels: int,
+            kernel_size: int | tuple[int, int] = 3,
+            stride: int | tuple[int, int] = 1,
+            dilation: int | tuple[int, int] = 1,
+            *,
+            depthwise: bool = False,
+            use_weight_norm: bool = True,
+            act: str = "relu",
+            dropout: float = 0.1,
+            bias: bool = True,
+    ):
+        super().__init__()
+
+        # ------ util ------ #
+        def _make_conv(cin, cout, k, s, d, groups=1):
+            padding = (
+                d * (k // 2) if isinstance(k, int)
+                else (d[0] * (k[0] // 2), d[1] * (k[1] // 2))
+            )
+            conv = nn.Conv2d(
+                cin, cout, k, stride=s, padding=padding,
+                dilation=d, groups=groups, bias=bias
+            )
+            return weight_norm(conv) if use_weight_norm else conv
+
+        # ------ conv path ------ #
+        if depthwise:
+            self.dw = _make_conv(in_channels, in_channels, kernel_size, stride, dilation,
+                                 groups=in_channels)  # depth-wise
+            self.pw = _make_conv(in_channels, out_channels, 1, 1, 1)  # point-wise
+        else:
+            self.conv = _make_conv(in_channels, out_channels, kernel_size, stride, dilation)
+
+        # ------ activation ------ #
+        if act.lower() == "gelu":
+            self.activation = nn.GELU()
+        elif act.lower() == "aptx":
+            self.activation = APTx()
+        else:
+            self.activation = nn.ReLU(inplace=True)
+
+        self.dropout = nn.Dropout(dropout) if dropout > 0 else nn.Identity()
+        self.depthwise = depthwise  # store flag for forward()
+        self.conv_out = nn.Conv2d(out_channels, 1, 1)
+
+    # --------------------------------------------------------------------- #
+    def _apply_mask(self, tensor: torch.Tensor, mask: torch.Tensor | None) -> torch.Tensor:
+        if mask is not None:
+            tensor = tensor.masked_fill(mask.expand_as(tensor), 0.0)
+        return tensor
+
+    # --------------------------------------------------------------------- #
+    def forward(self, x: torch.Tensor, x_mask: torch.Tensor | None = None) -> torch.Tensor:
+        """
+        x       : (B, Cin, H, W)
+        x_mask  : (B, 1, H, W) boolean, True = padding
+        """
+        # (B, H, W)
+        x = x.unsqueeze(1)
+        x_mask = x_mask.unsqueeze(1)
+        if self.depthwise:
+            out = self.dw(x)
+            out = self._apply_mask(out, x_mask)
+            out = self.pw(out)
+        else:
+            out = self.conv(x)
+
+        out = self._apply_mask(out, x_mask)
+        out = self.activation(out)
+        out = self.dropout(out)
+        out = self.conv_out(out)
+        return out.squeeze(1)
+
+
 class PreEncoder(nn.Module):
-    def __init__(self, mel_channels, channels, kernel_sizes, fsq_levels=[8, 5, 5, 5], dropout=0.5):
+    def __init__(self, mel_channels, channels, kernel_sizes, fsq_levels=[8, 8, 5, 5, 5], dropout=0.1):
         """
         Spectrogram Pre-Encoder.
         ResNet-based autoencoder with configurable encoder and decoder blocks.
@@ -180,10 +349,12 @@ class PreEncoder(nn.Module):
         super(PreEncoder, self).__init__()
         # Project input from mel_channels to channels[0]
         self.proj = nn.Linear(mel_channels, channels[0])
+        self.pre = ConvBlock2D(1, channels[0], kernel_size=5, depthwise=True, act="aptx")
         self.quantizer_dim = len(fsq_levels)
         # Encoder: build a sequence of ResidualBlock1D modules
         self.encoder_blocks = nn.ModuleList([
-            ResidualBlock1D(channels[i], channels[i + 1], kernel_size=kernel_sizes[i], dropout=dropout, act="aptx")
+            ResidualBlock1D(channels[i], channels[i + 1], kernel_size=kernel_sizes[i], dropout=dropout, act="taptx",
+                            norm="weight")
             for i in range(len(channels) - 1)
         ])
 
@@ -193,15 +364,19 @@ class PreEncoder(nn.Module):
         self.q_in_proj = nn.Linear(latent_dim, self.quantizer_dim)
         self.quantizer = FSQ(levels=fsq_levels)
         self.q_out_proj = nn.Linear(self.quantizer_dim, latent_dim)
-        self.codebook_size = 1024 # TODO: dyn calculate this
+        self.codebook_size = 8010  # TODO: dyn calculate this
+        self.bos_token_id = 8001
+        self.eos_token_id = 8002
 
         # Decoder: use the reversed lists so that the decoder mirrors the encoder.
         rev_channels = list(reversed(channels))
         rev_kernel_sizes = list(reversed(kernel_sizes))
         self.decoder_blocks = nn.ModuleList([
-            ResidualBlock1D(rev_channels[i], rev_channels[i + 1], kernel_size=rev_kernel_sizes[i], dropout=dropout, act="aptx", causal=True)
+            ResidualBlock1D(rev_channels[i], rev_channels[i + 1], kernel_size=rev_kernel_sizes[i], dropout=dropout,
+                            act="taptx", causal=True, norm="weight")
             for i in range(len(rev_channels) - 1)
         ])
+        self.post = ConvBlock2D(1, channels[0], kernel_size=5, depthwise=True, act="aptx")
 
         # Output projection: map from the decoder’s final channel (channels[0]) back to mel_channels.
         self.out_proj = nn.Linear(channels[0], mel_channels)
@@ -222,7 +397,8 @@ class PreEncoder(nn.Module):
         x = x.permute(0, 2, 1)
 
         x_mask = sequence_mask(x.size(2), x_lengths)
-        x_mask = x_mask.unsqueeze(1)
+        x_mask = x_mask.unsqueeze(1)  # (B, 1, T)
+        x = self.pre(x, x_mask)
 
         # Pass through the encoder blocks
         for block in self.encoder_blocks:
@@ -240,10 +416,12 @@ class PreEncoder(nn.Module):
         for block in self.decoder_blocks:
             x = block(x, x_mask=x_mask)
 
+        x = self.post(x, x_mask)
         # Permute back to (batch, mel_len, channels[0])
         x = x.permute(0, 2, 1)
         # Final projection back to mel_channels
         x = self.out_proj(x)
+
         return x
 
     def encode(self, x, x_mask=None):
@@ -266,6 +444,8 @@ class PreEncoder(nn.Module):
         if x_mask is None:
             x_mask = torch.zeros((x.size(0), 1, x.size(2)), device=x.device).bool()
 
+        x = self.pre(x, x_mask)
+
         # Pass through the encoder blocks
         for block in self.encoder_blocks:
             x = block(x, x_mask=x_mask)
@@ -275,9 +455,9 @@ class PreEncoder(nn.Module):
         x = self.q_in_proj(x)
         # Quantize and obtain indices
         _, indices = self.quantizer(x)
-        return indices.long() # otherwise cross entropy loss bitches later
+        return indices.long()  # otherwise cross entropy loss bitches later
 
-    def decode(self, indices, x_mask=None):
+    def decode(self, indices, x_mask=None, return_hidden=False):
         """
         Decodes discrete latent indices into a reconstructed spectrogram.
 
@@ -302,11 +482,19 @@ class PreEncoder(nn.Module):
         for block in self.decoder_blocks:
             x = block(x, x_mask=x_mask)
 
+        if return_hidden:
+            last_hid = x.clone()
+
+        x = self.post(x, x_mask)
         # Permute back to (batch, mel_len, latent_dim)
         x = x.permute(0, 2, 1)
         # Project back to the original mel_channels
         x = self.out_proj(x)
+        if return_hidden:
+            return x, last_hid
+
         return x
+
 
 class TextEncoder(nn.Module):
     def __init__(self, vocab_size, embed_size, num_heads, num_layers, forward_expansion, dropout, kernel_sizes,
@@ -315,12 +503,14 @@ class TextEncoder(nn.Module):
         super().__init__()
         self.embed = NormalizedEmbedding(vocab_size, embed_size)
         self.encoder = TransformerEncoder(embed_size, num_heads, num_layers, forward_expansion, dropout,
-                                          alibi_alpha=alibi_alpha, start_i=start_i, multi_scale=True,
-                                          kernel_size=kernel_sizes,
-                                          act="relugtz")
-        self.use_prenet = False
+                                          alibi_alpha=alibi_alpha, start_i=start_i, multi_scale=False,
+                                          kernel_size=1,
+                                          act="relu2")
+        self.use_prenet = True
+        self.speaker_add_lid = num_layers // 2
         if self.use_prenet:
-            self.pre = Prenet(embed_size, 384, embed_size, 5, 3, 0.5, "aptx")
+            print("Using prenet")
+            self.pre = Prenet(embed_size, embed_size, embed_size, 3, 2, 0.5, "relu")
 
         self.emotion_channels = emotion_channels
         self.speaker_channels = speaker_channels
@@ -335,7 +525,9 @@ class TextEncoder(nn.Module):
         x_mask_conv = x_mask.unsqueeze(1)
 
         if self.speaker_channels > 0:
-            x = x + self.spk_cond(spk_emb)
+            spk_res = (self.speaker_add_lid, self.spk_cond(spk_emb))
+        else:
+            spk_res = None
 
         if self.use_prenet:
             x = self.pre(x, x_mask_conv)
@@ -346,7 +538,7 @@ class TextEncoder(nn.Module):
         sa_mask = expand_self_attention_mask(x_mask)
 
         # Pass through the transformer encoder
-        x = self.encoder(x, sa_mask, x_mask_conv)
+        x = self.encoder(x, sa_mask, x_mask_conv, [spk_res])
 
         return x
 
@@ -710,6 +902,72 @@ def expand_masks2(x_mask, y_mask):
     return attention_mask
 
 
+class ConvNormA(nn.Module):
+    def __init__(
+            self,
+            in_channels,
+            out_channels,
+            kernel_size=1,
+            stride=1,
+            padding=None,
+            dilation=1,
+            bias=True,
+            w_init_gain='linear',
+            use_weight_norm: bool = False,
+            norm_fn=None,
+    ):
+        super(ConvNormA, self).__init__()
+        if padding is None:
+            # Ensure kernel_size is odd when using symmetric padding.
+            assert kernel_size % 2 == 1, "Kernel size must be odd if padding is not specified."
+            padding = int(dilation * (kernel_size - 1) / 2)
+
+        # Use the standard 1D convolution.
+        self.conv = nn.Conv1d(
+            in_channels,
+            out_channels,
+            kernel_size=kernel_size,
+            stride=stride,
+            padding=padding,
+            dilation=dilation,
+            bias=bias,
+        )
+
+        # Initialize the convolution weights using Xavier initialization.
+        nn.init.xavier_uniform_(self.conv.weight, gain=nn.init.calculate_gain(w_init_gain))
+
+        if use_weight_norm:
+            self.conv = nn.utils.weight_norm(self.conv)
+
+        # Set up an optional normalization layer if provided.
+        self.norm = norm_fn(out_channels, affine=True) if norm_fn is not None else None
+
+    def forward(self, input: torch.Tensor) -> torch.Tensor:
+        output = self.conv(input)
+        if self.norm is not None:
+            output = self.norm(output)
+        return output
+
+
+class LocationLayer(nn.Module):
+    def __init__(self, attention_n_filters, attention_kernel_size,
+                 attention_dim):
+        super(LocationLayer, self).__init__()
+        padding = int((attention_kernel_size - 1) / 2)
+        self.location_conv = ConvNormA(2, attention_n_filters,
+                                       kernel_size=attention_kernel_size,
+                                       padding=padding, bias=False, stride=1,
+                                       dilation=1)
+        self.location_dense = nn.Linear(attention_n_filters, attention_dim,
+                                        bias=False)
+
+    def forward(self, attention_weights_cat):
+        processed_attention = self.location_conv(attention_weights_cat)
+        processed_attention = processed_attention.transpose(1, 2)
+        processed_attention = self.location_dense(processed_attention)
+        return processed_attention
+
+
 class LSAttention(nn.Module):
     def __init__(self, attention_rnn_dim, embedding_dim, attention_dim,
                  attention_location_n_filters, attention_location_kernel_size):
@@ -718,8 +976,8 @@ class LSAttention(nn.Module):
             Tacotron 2 Location Sensitive Attention
         """
         self.query_layer = nn.Linear(attention_rnn_dim, attention_dim,
-                                      bias=False)
-        self.memory_layer = nn.Linear(embedding_dim, attention_dim, bias=False,)
+                                     bias=False)
+        self.memory_layer = nn.Linear(embedding_dim, attention_dim, bias=False, )
         self.v = nn.Linear(attention_dim, 1, bias=False)
         self.location_layer = LocationLayer(attention_location_n_filters,
                                             attention_location_kernel_size,
@@ -774,37 +1032,42 @@ class LSAttention(nn.Module):
 
 class SpectrogramDecoderAR(nn.Module):
     def __init__(self, encoder_channels, mel_channels, filter_channels, depth, heads, dropout=0.1,
-                 alibi_alpha=1.0, forward_expansion=4, speaker_channels=0, dec_type = "transformer"):
+                 alibi_alpha=1.0, forward_expansion=4, speaker_channels=0, dec_type="transformer"):
         super().__init__()
 
         self.encoder_channels = encoder_channels
         self.filter_channels = filter_channels
         self.embed_channels = 256
-        self.codebook_size = 8010
+        self.codebook_size = 1000
+        self.n_embeds = self.codebook_size + 10
         self.speaker_channels = speaker_channels
-        self.bos_token_id = 8001
-        self.eos_token_id = 8002
-        self.pad_token_id = 8003
+        self.bos_token_id = self.codebook_size + 1
+        self.eos_token_id = self.codebook_size + 2
+        self.pad_token_id = self.codebook_size + 3
         self.use_rnn = False
 
-
         self.dec_type = dec_type.lower()
+        self.decoder_type = self.dec_type
 
         self.x_proj = nn.Identity()
 
         self.spk_cond = nn.Linear(speaker_channels, filter_channels) if speaker_channels > 0 else None
 
-
         if self.dec_type == "transformer":
-            self.embed = nn.Embedding(self.codebook_size, self.filter_channels)
+            self.embed = nn.Embedding(self.n_embeds, self.filter_channels)
 
             self.dec = TransformerDecoder(filter_channels, heads=heads, num_layers=depth,
                                           forward_expansion=forward_expansion, dropout=dropout,
                                           alibi_alpha=alibi_alpha, start_i=0, act="relu2", talking_heads=True,
-                                          dynamic_alibi=True)
-            self.out_size = filter_channels
+                                          dynamic_alibi=False, use_ca=True)
+
+            self.out_proj = nn.Linear(filter_channels, self.n_embeds)
+            self.speaker_add_lid = depth // 2
+            self.x_prenet = nn.Identity()
+            # self.pre_aligner = SimpleAttention(filter_channels, 256, filter_channels)
+
         elif self.dec_type == "lstm":
-            self.embed = nn.Embedding(self.codebook_size, self.embed_channels)
+            self.embed = nn.Embedding(self.n_embeds, self.embed_channels)
             self.p_attention_dropout = 0.1
             self.p_decoder_dropout = 0.1
 
@@ -823,13 +1086,12 @@ class SpectrogramDecoderAR(nn.Module):
                 self.filter_channels + self.encoder_channels,
                 self.filter_channels)
 
-            self.out_size = filter_channels + self.encoder_channels
+            self.out_proj = nn.Linear(filter_channels + self.encoder_channels, self.n_embeds)
         else:
             raise RuntimeError(f"Invalid decoder type: {self.dec_type}")
 
-        self.out_proj = nn.Linear(self.out_size, self.codebook_size)
         self.gate_proj = nn.Identity()  # no sigmoid, we use BCEWithLogitsLoss
-        #  self.pre_aligner = SimpleAttention(filter_channels, self.embed_channels // 2, filter_channels)
+
         self.g_drop = nn.Dropout(0.1)
 
     def _initialize_lstm_states(self, memory, mask):
@@ -848,9 +1110,9 @@ class SpectrogramDecoderAR(nn.Module):
         self.attention_weights_cum = torch.zeros(B, MAX_TIME, device=device)
         self.attention_context = torch.zeros(B, self.encoder_channels, device=device)
 
-        self.memory = memory # (B, T_enc, enc_dim)
-        self.processed_memory = self.attention_layer.memory_layer(memory) # (B, T_enc, att_dim)
-        self.mask = mask # Boolean mask, True means mask (used by attention)
+        self.memory = memory  # (B, T_enc, enc_dim)
+        self.processed_memory = self.attention_layer.memory_layer(memory)  # (B, T_enc, att_dim)
+        self.mask = mask  # Boolean mask, True means mask (used by attention)
 
     def _lstm_decode_step(self, step_input_embedding):
         """ Single decode step for LSTM decoder (NO PRENET).
@@ -887,10 +1149,9 @@ class SpectrogramDecoderAR(nn.Module):
             (self.decoder_hidden, self.attention_context), dim=1)
 
         # Predict logits for VQVAE codes
-        logits = self.out_proj(decoder_hidden_attention_context) # (B, codebook_size)
+        logits = self.out_proj(decoder_hidden_attention_context)  # (B, codebook_size)
 
-        return logits, self.attention_weights # Return current step's weights
-
+        return logits, self.attention_weights  # Return current step's weights
 
     def forward(self, x, x_mask, y, y_mask, spk_emb=None, shift_tokens=True, rnn_hidden=None):
         """
@@ -912,14 +1173,14 @@ class SpectrogramDecoderAR(nn.Module):
             x_mask_in: The shifted mask (B, L-1) so you can pass it to the loss if needed
         """
         # 1) Modify x and x_mask in-place if shift_tokens is True for autoregressive input prep
-        B, L, _ = x.size()
+        B, L = x.size()
+        spk_res = None
 
         if shift_tokens:
             # Create the shifted sequence [x_0, ..., x_{L-2}]
             x = x[:, :-1]  # Shape: (B, L-1)
             # Create the corresponding mask for the shifted sequence
             x_mask = x_mask[:, :-1]  # Shape: (B, L-1)
-
 
         # Create masks
         sa_mask = expand_self_attention_mask(x_mask)  # self-attention
@@ -929,17 +1190,27 @@ class SpectrogramDecoderAR(nn.Module):
 
         x = self.embed(x)
 
-        x = self.x_proj(x)
+        x = self.x_prenet(x)
 
         if self.speaker_channels > 0:
-            x = x + self.spk_cond(spk_emb)
+            spk_res = (self.speaker_add_lid, self.spk_cond(spk_emb))
+        else:
+            spk_res = None
 
-        # 3) Pre-aligner: helps with alignment signals
-        # x_pre, x_pre_weights, attn_logprob = self.pre_aligner(x, y, y, mask=ca_mask.squeeze(1))
-        attn_logprob = None
+        if self.decoder_type == "transformer":
+            # 3) Post-aligner: helps with alignment signals
+            #    x_pre, x_pre_weights, attn_logprob = self.pre_aligner(x, y, y, mask=ca_mask.squeeze(1))
+            #   attn_logprob = attn_logprob.unsqueeze(1)
+            #  x = x + x_pre
 
-        if self.dec_type == "transformer":
-            dec_out = self.dec(x, y, sa_mask, ca_mask, conv_x_mask)
+            dec_out, stacked_attns = self.dec(x, y, sa_mask, ca_mask, conv_x_mask, residuals=[spk_res])
+            attn_logprob = torch.log(stacked_attns + 1e-6)
+
+            # 3) Post-aligner: helps with alignment signals
+            # x_pre, x_pre_weights, attn_logprob = self.pre_aligner(dec_out, y, y, mask=ca_mask.squeeze(1))
+            # attn_logprob = attn_logprob.unsqueeze(1)
+            # dec_out = dec_out + x_pre
+
             # 5) Final projections to mel frames + gate
             indices_pred = self.out_proj(dec_out)  # (B, L-1, 1024)
             gate_pred = torch.zeros(B, indices_pred.size(1), 1, device=x.device)
@@ -947,7 +1218,7 @@ class SpectrogramDecoderAR(nn.Module):
             rnn_hidden = None
             return indices_pred, gate_pred, attn_logprob, x_mask, rnn_hidden
 
-        elif self.dec_type == "lstm":
+        elif self.decoder_type == "lstm":
             if shift_tokens:
 
                 self._initialize_lstm_states(y, y_mask.bool())
@@ -959,7 +1230,7 @@ class SpectrogramDecoderAR(nn.Module):
 
                 for t in range(L_out):
                     # Input for this step: embedding of token x_in[:, t]
-                    current_input_embedded = x[:, t, :] # (B, embed_channels)
+                    current_input_embedded = x[:, t, :]  # (B, embed_channels)
 
                     # Run one decode step using the *embedding* directly
                     logits, alignment = self._lstm_decode_step(current_input_embedded)
@@ -969,22 +1240,23 @@ class SpectrogramDecoderAR(nn.Module):
                     all_alignments.append(alignment)
 
                 # Stack outputs: (L_out, B, Dim) -> (B, L_out, Dim)
-                indices_pred = torch.stack(all_logits, dim=1) # (B, L_out, codebook_size)
-                attn_logprob = torch.stack(all_alignments, dim=1) # (B, L_out, T_enc)
-
+                indices_pred = torch.stack(all_logits, dim=1)  # (B, L_out, codebook_size)
+                attn_logprob = torch.stack(all_alignments, dim=1)  # (B, L_out, T_enc)
+                attn_logprob = torch.log(attn_logprob + 1e-6).unsqueeze(1)  # (B, 1, L_out, T_enc)
+            # attn_logprob = None
 
             else:
                 # Assume states are initialized externally by infer()
                 # x_processed has shape (B, L, lstm_embed_channels), L is current history length
                 # We only need the *last* token's embedding for the step
-                current_input_embedded = x[:, -1, :] # (B, lstm_embed_channels)
+                current_input_embedded = x[:, -1, :]  # (B, lstm_embed_channels)
 
                 # Perform one step, updates self.* states implicitly
                 logits, alignment = self._lstm_decode_step(current_input_embedded)
 
                 # Output shape needs to be (B, 1, Dim) for consistency
-                indices_pred = logits.unsqueeze(1) # (B, 1, codebook_size)
-                attn_logprob = alignment.unsqueeze(1) # (B, 1, T_enc)
+                indices_pred = logits.unsqueeze(1)  # (B, 1, codebook_size)
+                attn_logprob = alignment.unsqueeze(1)  # (B, 1, T_enc)
 
             gate_pred = torch.zeros(B, indices_pred.size(1), 1, device=x.device)
             return indices_pred, gate_pred, attn_logprob, x_mask, rnn_hidden
@@ -1023,13 +1295,12 @@ class SpectrogramDecoderAR(nn.Module):
         finished = torch.zeros(B, dtype=torch.bool, device=device)
         rnn_hidden = None
 
-        if self.dec_type == 'lstm':
+        if self.decoder_type == 'lstm':
             self._initialize_lstm_states(y, y_mask.bool())
 
         for t in range(max_length):
             if t == max_length - 1:
                 print("Warning! Reached max decoder steps.")
-
 
             current_length = decoder_input.size(1)
             # In inference mode, no positions are padded.
@@ -1126,7 +1397,7 @@ class SpectrogramDecoder(nn.Module):
         self.dec = TransformerEncoder(filter_channels, heads=heads, num_layers=depth,
                                       forward_expansion=forward_expansion, dropout=dropout,
                                       alibi_alpha=alibi_alpha, start_i=4, kernel_size=kernel_sizes,
-                                      act="relugt", rma_mem_dim=0, conv_att=False, multi_scale=True, talking_heads=True,
+                                      act="relu2", rma_mem_dim=0, conv_att=False, multi_scale=True, talking_heads=True,
                                       dynamic_alibi=True, coarse_fine=False)
 
         self.mel_fc = nn.Linear(filter_channels, mel_channels)
@@ -1485,7 +1756,8 @@ class Aligner(nn.Module):
         # Run through MultiHeadAttention
         if self.attn_type == "simple":
             # query, key, value
-            attended, attention_weights, attn_logprob = self.attn(mel_proj, text_proj, text_proj, mask=mha_mask.squeeze(1))
+            attended, attention_weights, attn_logprob = self.attn(mel_proj, text_proj, text_proj,
+                                                                  mask=mha_mask.squeeze(1))
             attention_weights = attention_weights.unsqueeze(1)
         else:
             # values, keys, queries

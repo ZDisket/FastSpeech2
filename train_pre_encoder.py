@@ -1,609 +1,633 @@
-# train_autoencoder.py
+"""
+train_lstm_music_enhanced.py
+----------------------------
+Enhanced training script for genre-conditioned next-token prediction on music-token
+sequences. Model: 2-layer LSTM (1024 hidden) + projection, with a learned genre
+embedding added to token embeddings.
 
-import os
+Adds:
+- Validation loop for evaluation loss.
+- Weights & Biases (WandB) integration for logging.
+- Mixed Precision training with bfloat16 (bf16) via torch.cuda.amp.
+
+Data format comes from:
+    ① *.npy files – 1-D int arrays of token IDs (BOS already prepended)
+    ② fname_to_id.json – maps each chunk file to its GENREID
+"""
+
 import argparse
+import json
+import math
+import time
+import random
 import numpy as np
+from pathlib import Path
+from typing import List, Tuple, Optional
+import os
 import torch
-
-# having this True is bad (both for CUDA and ROCm) when we use diff lens each batch
-torch.backends.cudnn.benchmark = False
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader, random_split
-from torchvision.transforms import Pad
-import torch.optim as optim
+from torch.cuda.amp import GradScaler, autocast  # For Mixed Precision
 from tqdm import tqdm
-from torch.cuda.amp import GradScaler, autocast
-import matplotlib.pyplot as plt
-import random
-from model.submodels import PreEncoder
-from utils.model import get_param_num
-from model.discriminator import MelSpectrogramPatchDiscriminator
-from model.loss import LSGANLoss, CharbonnierMel
+import wandb  # For logging
 
-# =============================================================================
-# Dataset & DataLoader for Real Spectrograms
-# =============================================================================
-class RealMelSpectrogramDataset(Dataset):
-    def __init__(self, data_dir):
-        self.real_dir = data_dir
-        if not os.path.isdir(self.real_dir):
-            raise FileNotFoundError(f"Directory not found: {self.real_dir}")
+# Check CUDA availability for mixed precision
+IS_CUDA_AVAILABLE = torch.cuda.is_available()
+if IS_CUDA_AVAILABLE:
+    # Set benchmark to False for reproducibility if needed, True might speed up
+    # training if input sizes don't vary much. Let's keep it False as per original.
+    torch.backends.cudnn.benchmark = False
+    print(f"CUDA available: {torch.cuda.get_device_name(0)}")
+    # Check bf16 support
+    try:
+        # Attempt a small operation in bf16
+        _ = torch.randn(1, device='cuda').to(torch.bfloat16) * torch.randn(1, device='cuda').to(torch.bfloat16)
+        IS_BF16_SUPPORTED = True
+        print("BF16 is supported on this device.")
+    except RuntimeError:
+        IS_BF16_SUPPORTED = False
+        print("BF16 is NOT supported on this device. Mixed precision will use FP32.")
 
-        self.filenames = []
-        print(f"Searching for .npy files recursively in: {self.real_dir}")
-        for root, _, files in os.walk(self.real_dir):
-            for filename in files:
-                if filename.endswith('.npy'):
-                    full_path = os.path.join(root, filename)
-                    self.filenames.append(full_path)
+else:
+    IS_BF16_SUPPORTED = False
+    print("CUDA not available. Running on CPU. Mixed precision disabled.")
 
-        if not self.filenames:
-            print(f"Warning: No .npy files found in {self.real_dir} or its subdirectories.")
-        else:
-            print(f"Found {len(self.filenames)} .npy files.")
 
-    def __len__(self):
-        return len(self.filenames)
+# ---------- Dataset & Collate (same as before) ----------
+class MusicChunkDataset(Dataset):
+    """
+    Loads *.npy chunks that contain 1-D int arrays of token indices and their genre ID.
+    A <BOS> token is prepended; sequences are padded inside the collate_fn.
+    """
 
-    def __getitem__(self, idx):
-        real_path = self.filenames[idx]
+    def __init__(
+            self,
+            chunks_dir: str | Path,
+            mapping_json: str | Path,
+            bos_id: int = 1,
+            pad_id: int = 0,
+    ):
+        self.chunks_dir = Path(chunks_dir)
+        self.bos_id = bos_id
+        self.pad_id = pad_id
+
+        # map filename → genreID
+        print(f"Loading mapping from: {mapping_json}")
+        with open(mapping_json, "r", encoding="utf-8") as f:
+            fname2genre = json.load(f)
+        print(f"Found {len(fname2genre)} entries in mapping file.")
+
+        # keep only files that actually exist in chunks_dir
+        print(f"Scanning for files in: {self.chunks_dir}")
+        self.items: List[Tuple[Path, int]] = [
+            (self.chunks_dir / fname, gid)
+            for fname, gid in tqdm(fname2genre.items(), desc="Checking files")
+            if (self.chunks_dir / fname).is_file()
+        ]
+
+        if not self.items:
+            raise RuntimeError(f"No matching .npy files found in {self.chunks_dir} based on {mapping_json}!")
+        print(f"Found {len(self.items)} valid chunk files.")
+
+    def __len__(self) -> int:
+        return len(self.items)
+
+    def __getitem__(self, idx: int) -> Tuple[torch.Tensor, int, int]:
+        fpath, genre_id = self.items[idx]
         try:
-            real_spectrogram = np.load(real_path)
+            seq = np.load(fpath).astype(np.int64)  # (T,)
+            seq = np.insert(seq, 0, self.bos_id)  # prepend BOS
+            seq = torch.from_numpy(seq)
+            # filename pattern: XXXXX_chunkYYY.npy  → extract YYY (as int)
+            chunk_id = int(fpath.stem.split('_')[-1].replace('chunk', ''))
+
+            return seq, genre_id, chunk_id
         except Exception as e:
-            print(f"Error loading file {real_path}: {e}")
-            # Return a dummy item or raise an error
-            # Returning dummy data to avoid crashing the whole batch
-            # Adjust dummy shape based on expected input
-            return np.zeros((1, 88), dtype=np.float32), 1, os.path.basename(real_path) + "_load_error"
-
-        # Ensure spectrogram has 2 dimensions (time, mel_channels)
-        if real_spectrogram.ndim != 2:
-            print(
-                f"Warning: Spectrogram {real_path} has unexpected shape {real_spectrogram.shape}. Skipping or using dummy.")
-            # You might want to reshape if appropriate, or return dummy data
-            return np.zeros((1, 88), dtype=np.float32), 1, os.path.basename(real_path) + "_shape_error"
-
-        mel_len = real_spectrogram.shape[0]
-        # Return basename for easier identification in logs/plots
-        filename_base = os.path.basename(real_path)
-        return real_spectrogram, mel_len, filename_base
+            print(f"Error loading or processing file {fpath}: {e}")
+            # Handle error: return a dummy item or raise an exception
+            # Returning a dummy item might skew training if not handled properly.
+            # For simplicity here, we re-raise, but a robust pipeline might skip.
+            raise e
 
 
-def pad_collate_fn(batch):
-    # Filter out potential error items (if __getitem__ returns None on error)
+def collate_music(batch: List[Tuple[torch.Tensor, int, int]], pad_id: int = 0):
+    """
+    Pads variable-length sequences to the max length in the batch.
+    Returns: tokens (B, L), genre_ids (B,), lengths (B,)
+    """
+    # Filter out potential errors if __getitem__ handled them gracefully (e.g., returned None)
     batch = [item for item in batch if item is not None]
     if not batch:
-        return None, None, None  # Handle empty batch case
+        return None, None, None  # Indicate an empty batch
 
-    # Unpack the batch of (spectrogram, mel_len, filename)
-    real_spectrograms, mel_lens, filenames = zip(*batch)
+    seqs, genres, chunk_ids_raw = zip(*batch)
+    lengths = torch.tensor([len(s) for s in seqs], dtype=torch.long)
 
-    # Find max mel_len *after* filtering potential errors
-    if not mel_lens:
-        return None, None, None
-    max_mel_len = max(mel_lens)
+    # Handle edge case where all sequences might be empty after BOS prepending
+    if lengths.numel() == 0 or lengths.max().item() == 0:
+        # Create minimal tensors to avoid errors downstream
+        max_len = 1  # At least BOS
+    else:
+        max_len = lengths.max().item()
 
-    # Pad each spectrogram along the time dimension (dim 0)
-    real_padded = []
-    valid_mel_lens = []
-    valid_filenames = []
-    for mel, length, fname in zip(real_spectrograms, mel_lens, filenames):
-        # Double check dimensions before padding
-        if mel.ndim == 2:
-            pad_amount = max_mel_len - length
-            # Pad format is (padding_left, padding_right, padding_top, padding_bottom)
-            # We want to pad the time dimension (dim 0), so pad_top=0, pad_bottom=pad_amount
-            # We don't pad the mel channels dim (dim 1), so pad_left=0, pad_right=0
-            # For torchvision Pad, it's (left, top, right, bottom) - THIS IS FOR 2D IMAGES.
-            # For tensors directly, use F.pad. Input: (Batch, Channel, H, W) or similar.
-            # Our input is (Time, MelChannels). Need (Batch, Time, MelChannels) later.
-            # Let's use torch.nn.functional.pad
-            # pad takes (pad_left, pad_right, pad_top, pad_bottom, ...)
-            # For (Time, Mel), we need to pad dim 0 (Time) at the end.
-            # F.pad requires input tensor.
-            mel_tensor = torch.tensor(mel, dtype=torch.float32)
-            # Padding format for F.pad is (pad_dim_N_start, pad_dim_N_end, pad_dim_N-1_start, ...)
-            # For tensor (Time, Mel), need padding (0, 0, 0, pad_amount) -> pads Mel dim, pads Time dim
-            padded_mel = F.pad(mel_tensor, (0, 0, 0, pad_amount), mode='constant', value=0)
-            real_padded.append(padded_mel)
-            valid_mel_lens.append(length)
-            valid_filenames.append(fname)
-        else:
-            print(f"Skipping item {fname} in collate_fn due to unexpected dimensions: {mel.shape}")
+    padded = torch.full((len(seqs), max_len), pad_id, dtype=torch.long)
 
-    if not real_padded:
-        return None, None, None  # Handle case where all items in batch had errors
+    for i, seq in enumerate(seqs):
+        # Ensure seq is not empty before padding
+        if len(seq) > 0:
+            padded[i, : len(seq)] = seq
 
-    real_padded_stacked = torch.stack(real_padded)
-    mel_lens_tensor = torch.tensor(valid_mel_lens, dtype=torch.int32)
-
-    return real_padded_stacked, mel_lens_tensor, valid_filenames
+    genre_ids = torch.tensor(genres, dtype=torch.long)
+    chunk_ids = torch.tensor(chunk_ids_raw, dtype=torch.long)
+    return padded, genre_ids, lengths, chunk_ids
 
 
-def get_dataloader(data_dir, batch_size=16, shuffle=True, num_workers=0):
-    dataset = RealMelSpectrogramDataset(data_dir)
-    if len(dataset) == 0:
-        print("Error: Dataset is empty. Cannot create DataLoader.")
-        return None
-    dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=shuffle,
-                            num_workers=num_workers, collate_fn=pad_collate_fn,
-                            pin_memory=True if num_workers > 0 else False)  # Added pin_memory
-    return dataloader
+# ---------- Model (same as before) ---------------------------------
+class MusicLSTM(nn.Module):
+    def __init__(
+            self,
+            vocab_size: int,
+            num_genres: int,
+            emb_dim: int = 512,
+            lstm_hid: int = 1024,
+            lstm_layers: int = 2,
+            pad_id: int = 0,
+            drop=0.1,
+    ):
+        super().__init__()
+        self.pad_id = pad_id
+
+        self.tok_emb = nn.Embedding(vocab_size, emb_dim, padding_idx=pad_id)
+        self.genre_emb = nn.Embedding(num_genres, emb_dim)
+        self.dropout = nn.Dropout(drop)
+
+        self.lstm = nn.LSTM(
+            input_size=emb_dim,
+            hidden_size=lstm_hid,
+            num_layers=lstm_layers,
+            batch_first=True,
+        )
+        self.proj = nn.Linear(lstm_hid, vocab_size)
+        print(
+            f"Model initialized: Vocab={vocab_size}, Genres={num_genres}, Emb={emb_dim}, LSTM_Hid={lstm_hid}, Layers={lstm_layers}")
+        num_params = sum(p.numel() for p in self.parameters() if p.requires_grad)
+        print(f"Total trainable parameters: {num_params / 1_000_000:.2f} M")
+
+    def forward(self, tokens, genre_ids, lengths):
+        """
+        tokens   : (B, L)
+        genre_ids: (B,)
+        lengths  : (B,)  valid lengths including BOS
+        """
+        tok_e = self.tok_emb(tokens)  # (B, L, D)
+        gen_e = self.genre_emb(genre_ids)[:, None, :]  # (B, 1, D)
+        x = tok_e + gen_e + chunk_e  # broadcast add
+
+        # Ensure lengths are valid (at least 1) before packing
+        valid_lengths = torch.clamp(lengths, min=1)
+
+        # Move lengths to CPU for pack_padded_sequence as required
+        packed = nn.utils.rnn.pack_padded_sequence(
+            x, valid_lengths.cpu(), batch_first=True, enforce_sorted=False
+        )
+        packed_out, _ = self.lstm(packed)
+        # Pad sequence back
+        out, _ = nn.utils.rnn.pad_packed_sequence(
+            packed_out, batch_first=True, padding_value=0.0  # Use 0.0 for padding features
+        )  # (B, L, H)
+
+        out = self.dropout(out)
+        logits = self.proj(out)  # (B, L, V)
+
+        return logits
 
 
-# =============================================================================
-# Utility: Plot Spectrogram
-# =============================================================================
-def plot_mel_spectrogram(spectrogram, vmin, vmax, save_path, title='Mel Spectrogram', ylabel='Frequency',
-                         xlabel='Time'):
-    """
-    Plot a mel spectrogram with a fixed color scale and save it to a file.
-    """
-    if isinstance(spectrogram, torch.Tensor):
-        # Ensure tensor is on CPU and detached before converting to numpy
-        spectrogram = spectrogram.cpu().detach().numpy()
+# ---------- Loss (using built-in CrossEntropyLoss is fine) ----------
+# The original train loop already used nn.CrossEntropyLoss(ignore_index=pad_id),
+# which is efficient and equivalent to the masked_ce_loss function. We'll stick with that.
 
-    # Ensure it's 2D
-    if spectrogram.ndim != 2:
-        print(f"Error plotting: Spectrogram has unexpected shape {spectrogram.shape}. Expected 2D.")
-        return
+# ---------- Training Loop (Modified) -------------------------------
+def train_loop(
+        model: nn.Module,
+        dataloader: DataLoader,
+        optimizer: torch.optim.Optimizer,
+        criterion: nn.Module,
+        device: torch.device,
+        scaler: Optional[GradScaler],  # Optional GradScaler for AMP
+        use_amp: bool,  # Flag to enable AMP context
+        epoch: int,
+        pad_id: int,
+        log_every: int = 100,
+        wandb_log: bool = True,
+        global_step: int = 0,
+        max_grad_norm: float = 1.0
+) -> Tuple[float, int]:
+    """Runs one epoch of training."""
+    model.train()
+    total_loss = 0.0
+    num_batches = 0
+    last_log_time = time.time()
 
-    # Transpose for visualization: (mel_channels, time) -> (time, mel_channels) seems standard in audio
-    # The original code transposed (Batch?, Time, Mel) -> (Batch?, Mel, Time) for imshow
-    # Let's stick to the original code's transpose logic: (Time, Mel) -> (Mel, Time)
-    spectrogram_display = np.transpose(spectrogram, (1, 0))
+    # Determine AMP dtype
+    amp_dtype = torch.bfloat16 if use_amp and IS_BF16_SUPPORTED else torch.float16
+    if use_amp and not IS_BF16_SUPPORTED and device.type == 'cuda':
+        print("Warning: BF16 not supported, using FP16 for mixed precision.")
+    elif use_amp and device.type == 'cpu':
+        print("Warning: Mixed precision requested on CPU, disabling AMP.")
+        use_amp = False  # Disable AMP on CPU
 
-    fig, ax = plt.subplots(figsize=(10, 4))  # Use fig, ax for better control
-    im = ax.imshow(spectrogram_display, aspect='auto', origin='lower', vmin=vmin, vmax=vmax, cmap='magma')  # Added cmap
-    fig.colorbar(im, ax=ax, format='%+2.0f dB')
-    ax.set_title(title)
-    ax.set_ylabel(ylabel)
-    ax.set_xlabel(xlabel)
-    plt.tight_layout()
+    pbar = tqdm(dataloader, desc=f"Epoch {epoch} Training")
+    for step, batch_data in enumerate(pbar, 1):
+        # Handle potential empty batches from collate_fn
+        if batch_data[0] is None:
+            print(f"Skipping empty batch at step {step}")
+            continue
 
-    # Ensure the directory exists
-    os.makedirs(os.path.dirname(save_path), exist_ok=True)
-    plt.savefig(save_path)
-    plt.close(fig)  # Close the figure to free memory
+        tok, genres, lengths, chunks = batch_data
+        tok, genres, chunks = tok.to(device), genres.to(device), chunks.to(device)
+        # lengths stay on CPU for pack_padded_sequence
 
+        # Input/Target shift for next-token prediction
+        # Ensure lengths are at least 1 for slicing
+        valid_mask = lengths >= 1
+        if not valid_mask.any():  # Skip batch if all sequences are empty
+            print(f"Skipping batch {step} due to all sequences being length 0.")
+            continue
 
-# =============================================================================
-# Training Loop for the Autoencoder
-# =============================================================================
-def train(model, train_dataloader, eval_dataset, criterion_recon, optimizer, scaler, device, args):
-    """
-    Trains the autoencoder model.
+        # Filter batch based on valid lengths before processing
+        tok = tok[valid_mask]
+        genres = genres[valid_mask]
+        lengths = lengths[valid_mask]
 
-    Args:
-        model: The autoencoder model instance.
-        train_dataloader: DataLoader for the training set.
-        eval_dataset: Dataset for evaluation (used for plotting random samples).
-        criterion_recon: Reconstruction loss function.
-        optimizer: Optimizer for the model.
-        scaler: Gradient scaler for mixed precision.
-        device: The device to train on (e.g., 'cuda' or 'cpu').
-        args: Command line arguments containing num_epochs, output_dir, etc.
-    """
-    plot_dir = os.path.join(args.output_dir, 'plots')
-    os.makedirs(plot_dir, exist_ok=True)
-    print(f"Plots will be saved to: {plot_dir}")
+        # Adjust lengths and targets for next-token prediction (predict token t+1 from token t)
+        # We need lengths >= 2 to have a valid target after BOS
+        pred_mask = lengths >= 2
+        if not pred_mask.any():
+            print(f"Skipping batch {step} as no sequences have length >= 2 for prediction.")
+            continue
 
-    model, discriminator = model
-    optimizer, optimizer_d = optimizer
-    gan_loss = LSGANLoss()
-    crit_recon = CharbonnierMel()
+        # Filter again for prediction pairs
+        tok = tok[pred_mask]
+        genres = genres[pred_mask]
+        lengths = lengths[pred_mask]
 
-    if train_dataloader is None:
-        print("Training dataloader is None. Skipping training.")
-        return
+        # inp: tokens up to T-1, tgt: tokens from 1 to T
+        inp, tgt = tok[:, :-1], tok[:, 1:]
+        # lengths for LSTM should be the length of the input sequence `inp`
+        input_lengths = lengths - 1
 
-    n_steps = 0
-    for epoch in range(args.num_epochs):
-        model.train()
-        discriminator.train()
-        epoch_loss = 0.0
-        num_batches = len(train_dataloader)
-        loop = tqdm(train_dataloader, leave=True, desc=f"Epoch [{epoch + 1}/{args.num_epochs}]")
+        # Skip if inputs become empty after slicing
+        if inp.shape[1] == 0:
+            print(f"Skipping batch {step} because input sequence length became 0 after slicing.")
+            continue
 
-        for batch_idx, batch_data in enumerate(loop):
-            n_steps += 1
+        optimizer.zero_grad(set_to_none=True)
 
-            # Check if batch data is valid (from collate_fn)
-            if batch_data[0] is None:
-                print(f"Skipping empty batch {batch_idx + 1}/{num_batches}")
-                continue
+        # Mixed Precision Context
+        with autocast(enabled=use_amp, dtype=amp_dtype if device.type == 'cuda' else torch.float32):
+            logits = model(inp, genres, input_lengths)  # (B, L-1, V)
+            B, L_pred, V = logits.shape
 
-            real_spectrograms, mel_lens, filenames = batch_data
-            real_spectrograms = real_spectrograms.to(device)  # Shape: (batch, max_mel_len, mel_channels)
-            mel_lens = mel_lens.to(device)
+            # Reshape for CrossEntropyLoss: (B * L_pred, V) and (B * L_pred,)
+            # Target tensor `tgt` already has shape (B, L-1)
+            loss = criterion(logits.reshape(B * L_pred, V), tgt.reshape(-1))
 
-            # Check if batch size is > 0 after potential errors in collate/getitem
-            if real_spectrograms.size(0) == 0:
-                print(f"Skipping batch {batch_idx + 1}/{num_batches} due to zero valid items.")
-                continue
+        if torch.isnan(loss) or torch.isinf(loss):
+            print(
+                f"Warning: NaN or Inf loss detected at step {global_step + step}. Skipping backward pass for this batch.")
+            # Optionally: log details, save batch for debugging
+            # wandb.log({"error": "NaN/Inf loss"}, step=global_step + step)
+            continue  # Skip optimizer step for this batch
 
-            optimizer.zero_grad()
-            optimizer_d.zero_grad()
-
-            # Enable autocast context manager for mixed precision
-            with autocast(enabled=True):  # Use enabled=True for clarity, default is True if torch.cuda.is_available()
-                # 1) D on real
-                real_logits, real_mask = discriminator(real_spectrograms, mel_lens)
-
-                # Forward pass: reconstruct the input spectrograms
-                recon_spectrograms = model(real_spectrograms, mel_lens)  # Expects (batch, seq_len, features)
-
-                # 2) D on fake (detach generator)
-                fake_logits, fake_mask = discriminator(recon_spectrograms.detach(), mel_lens)
-                loss_D = gan_loss.discriminator_loss(real_logits, fake_logits, real_mask, fake_mask)
-                scaler.scale(loss_D).backward()
-                scaler.step(optimizer_d)
-                scaler.update()
-
-                # Ensure output shape matches input shape
-                if recon_spectrograms.shape != real_spectrograms.shape:
-                    print(f"Shape mismatch! Input: {real_spectrograms.shape}, Output: {recon_spectrograms.shape}")
-                    # Decide how to handle: maybe skip batch, maybe raise error
-                    continue  # Skip this batch
-
-                # Create a mask to ignore padded regions.
-                max_mel_len = real_spectrograms.size(1)  # mel_len is now dimension 1 (time)
-                # Create mask (batch, max_mel_len)
-                mask_time = torch.arange(max_mel_len, device=device).expand(len(mel_lens),
-                                                                            max_mel_len) < mel_lens.unsqueeze(1)
-                # Expand mask to match spectrogram shape (batch, max_mel_len, mel_channels)
-                mask = mask_time.unsqueeze(2).expand(-1, -1, real_spectrograms.size(2)).float()
-
-                # Compute reconstruction loss only on valid (non-padded) elements.
-                loss_recon = crit_recon(recon_spectrograms, real_spectrograms, mel_lens)
-
-                gen_logits, gen_mask = discriminator(recon_spectrograms, mel_lens)
-                loss_gan = gan_loss.generator_loss(gen_logits, gen_mask)
-                loss = loss_recon + loss_gan
-
-            # Backward pass and optimization step using GradScaler
+        # Scale loss and backpropagate if using AMP scaler
+        if scaler is not None:
             scaler.scale(loss).backward()
-            # Unscales gradients and calls optimizer.step()
+            # Unscale gradients before clipping (recommended)
+            scaler.unscale_(optimizer)
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_grad_norm)
             scaler.step(optimizer)
-            # Updates the scale for next iteration
             scaler.update()
+        else:  # Standard backward pass
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_grad_norm)
+            optimizer.step()
 
-            current_loss = loss.item()
-            epoch_loss += current_loss
-            loop.set_postfix(D=loss_D.item(),
-                             G_recon=loss_recon.item(),
-                             G_gan=loss_gan.item(),
-                             total_loss=loss.item(),)
+        current_loss = loss.item()
+        total_loss += current_loss
+        num_batches += 1
 
-        avg_loss = epoch_loss / num_batches if num_batches > 0 else 0
-        print(f"Epoch [{epoch + 1}/{args.num_epochs}], Average Loss: {avg_loss:.6f}")
+        # Logging
+        pbar.set_postfix(loss=f"{current_loss:.4f}")
+        if step % log_every == 0:
+            avg_loss_interval = total_loss / num_batches  # Or calculate over the interval if preferred
+            current_time = time.time()
+            elapsed = current_time - last_log_time
+            steps_per_sec = log_every / elapsed if elapsed > 0 else 0
+            print(
+                f"\nEpoch {epoch} | Step {step:5d} | Avg Train Loss (epoch): {avg_loss_interval:.4f} | Steps/sec: {steps_per_sec:.2f}")
+            if wandb_log:
+                wandb.log({
+                    "train/loss_step": current_loss,
+                    "train/steps_per_sec": steps_per_sec,
+                    "step": global_step + step,
+                    "epoch": epoch + (step / len(dataloader))  # Fractional epoch
+                })
+            last_log_time = time.time()
 
-        # --- Plotting training examples ---
-        if real_spectrograms is not None and real_spectrograms.size(0) > 0 and recon_spectrograms is not None:
-            # For consistent visualization, determine global vmin and vmax across the batch
-            with torch.no_grad():
-                vmin = min(real_spectrograms.min().item(), recon_spectrograms.min().item())
-                vmax = max(real_spectrograms.max().item(), recon_spectrograms.max().item())
+    avg_epoch_loss = total_loss / num_batches if num_batches > 0 else 0.0
+    return avg_epoch_loss, global_step + num_batches  # Return avg loss and updated global step
 
-            num_plots = min(args.num_plot_examples, real_spectrograms.size(0))
-            for i in range(num_plots):
-                # Extract the actual length for plotting
-                actual_len = mel_lens[i].item()
-                # Slice the spectrograms to their original length before plotting
-                original_spec = real_spectrograms[i, :actual_len, :]
-                recon_spec = recon_spectrograms[i, :actual_len, :]
-                original_filename = filenames[i] if i < len(filenames) else f"Unknown_{i}"
 
-                plot_mel_spectrogram(
-                    original_spec, vmin=vmin, vmax=vmax,
-                    save_path=os.path.join(plot_dir,
-                                           f'epoch_{epoch + 1:03d}_train_orig_{i + 1}_{os.path.splitext(original_filename)[0]}.png'),
-                    title=f'Epoch {epoch + 1} - Original {i + 1} ({original_filename})'
-                )
-                plot_mel_spectrogram(
-                    recon_spec, vmin=vmin, vmax=vmax,
-                    save_path=os.path.join(plot_dir,
-                                           f'epoch_{epoch + 1:03d}_train_recon_{i + 1}_{os.path.splitext(original_filename)[0]}.png'),
-                    title=f'Epoch {epoch + 1} - Reconstructed {i + 1} ({original_filename})'
-                )
+# ---------- Evaluation Loop (New) ----------------------------------
+@torch.no_grad()  # Disable gradient calculations
+def evaluate_loop(
+        model: nn.Module,
+        dataloader: DataLoader,
+        criterion: nn.Module,
+        device: torch.device,
+        use_amp: bool,  # Flag to enable AMP context
+        epoch: int,
+        pad_id: int
+) -> float:
+    """Runs evaluation on the validation set."""
+    model.eval()  # Set model to evaluation mode
+    total_loss = 0.0
+    num_batches = 0
+
+    # Determine AMP dtype
+    amp_dtype = torch.bfloat16 if use_amp and IS_BF16_SUPPORTED else torch.float16
+    if use_amp and device.type == 'cpu':
+        use_amp = False  # Disable AMP on CPU
+
+    pbar = tqdm(dataloader, desc=f"Epoch {epoch} Evaluating")
+    for batch_data in pbar:
+        # Handle potential empty batches
+        if batch_data[0] is None:
+            continue
+
+        tok, genres, lengths = batch_data
+        tok, genres = tok.to(device), genres.to(device)
+        # lengths stay on CPU
+
+        # Input/Target shift (same logic as training)
+        valid_mask = lengths >= 1
+        if not valid_mask.any(): continue
+        tok, genres, lengths = tok[valid_mask], genres[valid_mask], lengths[valid_mask]
+
+        pred_mask = lengths >= 2
+        if not pred_mask.any(): continue
+        tok, genres, lengths = tok[pred_mask], genres[pred_mask], lengths[pred_mask]
+
+        inp, tgt = tok[:, :-1], tok[:, 1:]
+        input_lengths = lengths - 1
+
+        if inp.shape[1] == 0: continue
+
+        # Mixed Precision Context (only for forward pass in eval)
+        with autocast(enabled=use_amp, dtype=amp_dtype if device.type == 'cuda' else torch.float32):
+            logits = model(inp, genres, input_lengths)
+            B, L_pred, V = logits.shape
+            loss = criterion(logits.reshape(B * L_pred, V), tgt.reshape(-1))
+
+        if not (torch.isnan(loss) or torch.isinf(loss)):
+            total_loss += loss.item()
+            num_batches += 1
         else:
-            print(f"Skipping training plots for epoch {epoch + 1} due to missing data.")
+            print(f"Warning: NaN or Inf loss detected during evaluation. Skipping batch.")
 
-        # --- Evaluation plotting ---
-        if (epoch + 1) % args.eval_interval == 0 and eval_dataset is not None and len(eval_dataset) > 0:
-            print(f"Running evaluation plots for epoch {epoch + 1}...")
-            model.eval()
-            with torch.no_grad():
-                num_eval_samples = min(args.num_plot_examples, len(eval_dataset))
-                eval_indices = random.sample(range(len(eval_dataset)), num_eval_samples)
-
-                for i, idx in enumerate(eval_indices):
-                    # Get raw data from the underlying dataset if eval_dataset is a Subset
-                    if isinstance(eval_dataset, torch.utils.data.Subset):
-                        actual_idx = eval_dataset.indices[idx]
-                        sample, mel_len, filename = eval_dataset.dataset[actual_idx]
-                    else:  # If it's the original dataset type
-                        sample, mel_len, filename = eval_dataset[idx]
-
-                    # Convert the sample (numpy array) to a tensor and add batch dimension.
-                    sample_tensor = torch.tensor(sample, dtype=torch.float32).unsqueeze(0).to(device)
-
-                    # Perform inference
-                    with autocast(enabled=True):
-                        indices = model.encode(sample_tensor)
-                        reconstructed = model.decode(indices)
-
-                    # Determine plot range for this specific sample
-                    vmin_eval = sample_tensor.min().item()
-                    vmax_eval = sample_tensor.max().item()
-                    if reconstructed is not None and reconstructed.numel() > 0:
-                        vmin_eval = min(vmin_eval, reconstructed.min().item())
-                        vmax_eval = max(vmax_eval, reconstructed.max().item())
-
-                    # Plot the original and reconstructed spectrograms.
-                    plot_mel_spectrogram(
-                        sample_tensor[0],  # Remove batch dim
-                        vmin=vmin_eval, vmax=vmax_eval,
-                        save_path=os.path.join(plot_dir,
-                                               f'epoch_{epoch + 1:03d}_eval_orig_{i + 1}_{os.path.splitext(filename)[0]}.png'),
-                        title=f'Epoch {epoch + 1} Eval - Original ({filename})'
-                    )
-                    if reconstructed is not None and reconstructed.numel() > 0:
-                        plot_mel_spectrogram(
-                            reconstructed[0],  # Remove batch dim
-                            vmin=vmin_eval, vmax=vmax_eval,
-                            save_path=os.path.join(plot_dir,
-                                                   f'epoch_{epoch + 1:03d}_eval_recon_{i + 1}_{os.path.splitext(filename)[0]}.png'),
-                            title=f'Epoch {epoch + 1} Eval - Reconstructed ({filename})'
-                        )
-                    else:
-                        print(f"Skipping reconstructed plot for eval sample {filename} due to error or empty output.")
-
-            model.train()  # Set back to train mode after evaluation
-
-        # Optional: Save checkpoint
-        if (epoch + 1) % args.save_interval == 0:
-            checkpoint_path = os.path.join(args.output_dir, f'checkpoint_epoch_{epoch + 1:03d}.pth')
-            torch.save({
-                'epoch': epoch + 1,
-                'model_state_dict': model.state_dict(),
-                'optimizer_state_dict': optimizer.state_dict(),
-                'scaler_state_dict': scaler.state_dict(),
-                'loss': avg_loss,
-                'args': args
-            }, checkpoint_path)
-            print(f"Checkpoint saved to {checkpoint_path}")
+    avg_val_loss = total_loss / num_batches if num_batches > 0 else 0.0
+    return avg_val_loss
 
 
-# =============================================================================
-# Main execution block
-# =============================================================================
+# ---------- CLI / main (Modified) ----------------------------------
 def main():
-    parser = argparse.ArgumentParser(description="Train a Mel Spectrogram Autoencoder")
-
+    p = argparse.ArgumentParser(description="Train a genre-conditioned LSTM music model.")
     # Data args
-    parser.add_argument('--data_dir', type=str, required=True,
-                        help='Root directory containing the "real" subdirectory with .npy spectrograms.')
-    parser.add_argument('--output_dir', type=str, default='training_output',
-                        help='Directory to save plots and checkpoints.')
-    parser.add_argument('--batch_size', type=int, default=16, help='Training batch size.')
-    parser.add_argument('--num_workers', type=int, default=0, help='Number of workers for DataLoader.')
-    parser.add_argument('--validation_split', type=float, default=0.1,
-                        help='Fraction of data to use for validation/evaluation plotting (0.0 to 1.0).')
-
+    p.add_argument("--chunks_dir", default="musicmels", help="Directory containing *.npy chunk files.")
+    p.add_argument("--mapping_json", default="fname_to_id.json", help="JSON mapping filenames to genre IDs.")
+    p.add_argument("--val_split", type=float, default=0.1,
+                   help="Fraction of data to use for validation (e.g., 0.1 for 10%).")
     # Model args
-    parser.add_argument('--mel_channels', type=int, default=88,
-                        help='Number of mel frequency channels in the input spectrograms.')
-    parser.add_argument('--latent_dim', type=int, default=1024,
-                        help='Dimension of the latent space in the autoencoder.')
-
+    p.add_argument("--vocab_size", type=int, required=True, help="Size of the token vocabulary.")
+    p.add_argument("--num_genres", type=int, required=True, help="Number of unique genres.")
+    p.add_argument("--emb_dim", type=int, default=512, help="Dimension of token and genre embeddings.")
+    p.add_argument("--lstm_hid", type=int, default=1024, help="Hidden dimension size of LSTM layers.")
+    p.add_argument("--lstm_layers", type=int, default=2, help="Number of LSTM layers.")
+    p.add_argument("--bos_id", type=int, default=1, help="Token ID for Beginning-Of-Sequence.")
+    p.add_argument("--pad_id", type=int, default=0, help="Token ID for Padding.")
     # Training args
-    parser.add_argument('--num_epochs', type=int, default=20, help='Number of training epochs.')
-    parser.add_argument('--lr', type=float, default=0.0002, help='Learning rate for the Adam optimizer.')
-    parser.add_argument('--beta1', type=float, default=0.5, help='Beta1 hyperparameter for the Adam optimizer.')
-    parser.add_argument('--beta2', type=float, default=0.999, help='Beta2 hyperparameter for the Adam optimizer.')
-    parser.add_argument('--eval_interval', type=int, default=2,
-                        help='Frequency (in epochs) to perform evaluation plotting.')
-    parser.add_argument('--save_interval', type=int, default=5, help='Frequency (in epochs) to save model checkpoints.')
-    parser.add_argument('--num_plot_examples', type=int, default=3,
-                        help='Number of examples to plot during training and evaluation.')
-    parser.add_argument('--seed', type=int, default=42, help='Random seed for reproducibility.')
-    parser.add_argument('--no_cuda', action='store_true', help='Disable CUDA even if available.')
-    parser.add_argument('--pretrained', type=str, default=None,
-                        help='Path to a pretrained checkpoint (.pth) to warm start from.')  # <-- ADDED ARGUMENT
+    p.add_argument("--epochs", type=int, default=5, help="Number of training epochs.")
+    p.add_argument("--batch_size", type=int, default=32, help="Batch size per device.")
+    p.add_argument("--lr", type=float, default=1e-3, help="Learning rate for AdamW optimizer.")
+    p.add_argument("--max_grad_norm", type=float, default=1.0, help="Gradient clipping norm value.")
+    p.add_argument("--device", default="cuda" if IS_CUDA_AVAILABLE else "cpu", help="Device to use ('cuda' or 'cpu').")
+    p.add_argument("--num_workers", type=int, default=4, help="Number of dataloader worker processes.")
+    p.add_argument("--log_every", type=int, default=100, help="Log training loss every N steps.")
+    p.add_argument("--seed", type=int, default=42, help="Random seed for reproducibility.")
+    # Mixed Precision args
+    p.add_argument("--mixed_precision", action="store_true",
+                   help="Enable BFloat16 mixed precision training (requires CUDA with BF16 support). Falls back to FP16 if BF16 not available.")
+    # WandB args
+    p.add_argument("--wandb_project", type=str, default="music-lstm", help="WandB project name.")
+    p.add_argument("--wandb_entity", type=str, default=None, help="WandB entity (username or team).")
+    p.add_argument("--wandb_name", type=str, default=None, help="WandB run name (defaults to auto-generated).")
+    p.add_argument("--no_wandb", action="store_true", help="Disable WandB logging.")
+    p.add_argument("--out_dir", type=str, default="logs/musiclstm-run1", help="Run out dir")
 
-    args = parser.parse_args()
+    args = p.parse_args()
 
-    # --- Setup ---
-    # Create output directory
-    os.makedirs(args.output_dir, exist_ok=True)
-
-    # Set random seeds
+    # Seed setting for reproducibility
     random.seed(args.seed)
     np.random.seed(args.seed)
     torch.manual_seed(args.seed)
-    if torch.cuda.is_available() and not args.no_cuda:
+    if IS_CUDA_AVAILABLE:
         torch.cuda.manual_seed_all(args.seed)
-        # Potentially enable deterministic algorithms for reproducibility
-        # torch.backends.cudnn.deterministic = True
-        # torch.backends.cudnn.benchmark = False # Benchmark can introduce non-determinism
 
-    # Set device
-    use_cuda = torch.cuda.is_available() and not args.no_cuda
-    device = torch.device("cuda" if use_cuda else "cpu")
-    print(f"Using device: {device}")
+    os.makedirs(args.out_dir, exist_ok=True)
 
-    # --- Data Loading ---
-    print("Loading dataset...")
-    try:
-        # Load full dataset and split: (1-val_split)% training, val_split% evaluation.
-        full_dataset = RealMelSpectrogramDataset(args.data_dir)
-        if len(full_dataset) == 0:
-            print("Error: Dataset is empty after initialization. Exiting.")
-            return  # Exit if no data found
+    # Setup device
+    device = torch.device(args.device)
+    if args.device == "cuda" and not IS_CUDA_AVAILABLE:
+        print("Warning: CUDA requested but not available. Switching to CPU.")
+        device = torch.device("cpu")
+        args.device = "cpu"  # Update args to reflect actual device
 
-        eval_size = int(args.validation_split * len(full_dataset))
-        train_size = len(full_dataset) - eval_size
-
-        if train_size <= 0 or eval_size < 0:  # Eval size can be 0 if split is 0.0
-            print(
-                f"Error: Invalid train/eval split sizes. Train: {train_size}, Eval: {eval_size}. Check validation_split.")
-            return
-
-        print(f"Dataset size: {len(full_dataset)}. Splitting into {train_size} train and {eval_size} eval samples.")
-        # Use a generator for reproducibility if seed is set
-        generator = torch.Generator().manual_seed(args.seed)
-        train_dataset, eval_dataset_subset = random_split(full_dataset, [train_size, eval_size], generator=generator)
-
-        # Create DataLoader for training
-        train_dataloader = DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True,
-                                      num_workers=args.num_workers, collate_fn=pad_collate_fn,
-                                      pin_memory=use_cuda)  # Use pin_memory if using CUDA
-
-        # We pass the eval_dataset_subset (a Subset object) directly to train for plotting
-        # No DataLoader needed for eval if just plotting individual samples
-
-    except FileNotFoundError as e:
-        print(f"Error initializing dataset: {e}")
-        return
-    except Exception as e:
-        print(f"An unexpected error occurred during data loading: {e}")
-        import traceback
-        traceback.print_exc()
-        return
-
-    # --- Model, Loss, Optimizer ---
-    print("Initializing model...")
-    # Instantiate the ResNet autoencoder and move to device.
-    autoencoder = PreEncoder(mel_channels=args.mel_channels, channels=[512, 512, 384], kernel_sizes=[11, 5, 3],
-                             dropout=0.1, fsq_levels=[8, 6, 5]).to(device)
-
-    ae_params = get_param_num(autoencoder)
-
-    discriminator = MelSpectrogramPatchDiscriminator(args.mel_channels,  hidden_channels = [1024, 1024, 1024, 2048]).to(device)
-    disc_params = get_param_num(discriminator)
-
-
-    print("Number of Pre-Encoder Parameters: {:.2f}M".format(ae_params / 1e6))
-    print("Number of discriminator parameters: {:.2f}M".format(disc_params / 1e6))
-
-    if args.pretrained:
-        if os.path.isfile(args.pretrained):
-            print(f"=> Loading checkpoint '{args.pretrained}'")
-            try:
-                checkpoint = torch.load(args.pretrained, map_location=device, weights_only=False)
-
-                # --- Flexible State Dict Loading ---
-                if 'model_state_dict' in checkpoint:
-                    pretrained_dict = checkpoint['model_state_dict']
-                elif 'state_dict' in checkpoint:  # Common alternative key
-                    pretrained_dict = checkpoint['state_dict']
-                else:
-                    pretrained_dict = checkpoint  # Assume the whole file is the state_dict
-
-                model_dict = autoencoder.state_dict()
-                loaded_keys = []
-                skipped_mismatch = []
-                skipped_missing_in_model = []  # Should be empty if filtered correctly below
-                model_missing_keys = []
-
-                # 0. Handle potential 'module.' prefix if saved with DataParallel/DDP
-                # Create a new dict without 'module.' prefix
-                clean_pretrained_dict = {}
-                for k, v in pretrained_dict.items():
-                    if k.startswith('module.'):
-                        clean_pretrained_dict[k[7:]] = v  # remove 'module.' prefix
-                    else:
-                        clean_pretrained_dict[k] = v
-                pretrained_dict = clean_pretrained_dict
-
-                # 1. Filter out keys from pretrained_dict that are not in the current model
-                filtered_pretrained_dict = {k: v for k, v in pretrained_dict.items() if k in model_dict}
-
-                # 2. Filter out keys where shapes don't match
-                final_dict_to_load = {}
-                for k, v in filtered_pretrained_dict.items():
-                    if v.shape == model_dict[k].shape:
-                        final_dict_to_load[k] = v
-                        loaded_keys.append(k)
-                    else:
-                        skipped_mismatch.append(k)
-                        print(f"  Warning: Skipping layer {k} due to shape mismatch. "
-                              f"Checkpoint shape: {v.shape}, Model shape: {model_dict[k].shape}")
-
-                # 3. Load the filtered state dict
-                # Use strict=False for robustness, although strict=True should work if filtering is correct
-                missing_keys, unexpected_keys = autoencoder.load_state_dict(final_dict_to_load, strict=False)
-
-                # 4. Report results
-                print(f"Successfully loaded {len(loaded_keys)} layers from checkpoint.")
-                if skipped_mismatch:
-                    print(f"Skipped {len(skipped_mismatch)} layers due to shape mismatch.")
-                if missing_keys:
-                    print(
-                        f"Warning: {len(missing_keys)} layers in the current model were missing from the loaded checkpoint: {missing_keys}")
-                if unexpected_keys:
-                    # This should ideally be empty due to our filtering, but good to check
-                    print(
-                        f"Warning: {len(unexpected_keys)} keys from the checkpoint were not found in the model: {unexpected_keys}")
-
-                # Optionally load optimizer, scaler, and epoch (if resuming training)
-                # Add checks for key existence before accessing
-                if 'epoch' in checkpoint:
-                    start_epoch = checkpoint['epoch']
-                    args.start_epoch = start_epoch  # Store start epoch in args for train loop
-                    print(f"  Resuming training from epoch {start_epoch + 1}")
-                # Careful when loading optimizer: only load if model architecture hasn't changed drastically
-                # or if you are sure the optimizer state is compatible. Usually safer *not* to load optimizer
-                # when just warm-starting with potentially different architecture.
-                # if 'optimizer_state_dict' in checkpoint:
-                #     try:
-                #         optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
-                #         print("  Loaded optimizer state.")
-                #     except ValueError as e:
-                #         print(f"  Warning: Could not load optimizer state, likely due to parameter mismatch: {e}")
-                # if 'scaler_state_dict' in checkpoint and use_cuda:
-                #     scaler.load_state_dict(checkpoint['scaler_state_dict'])
-                #     print("  Loaded GradScaler state.")
-
-            except Exception as e:
-                print(f"Error loading checkpoint '{args.pretrained}': {e}")
-                print("Training will start from scratch.")
-                start_epoch = 0  # Reset start epoch on error
+    # Determine if AMP should be used
+    use_amp = args.mixed_precision and device.type == 'cuda'
+    if use_amp and not (IS_BF16_SUPPORTED or torch.cuda.is_bf16_supported()):  # Double check bf16 support
+        print("Warning: Requested BF16 mixed precision, but it's not supported. Trying FP16.")
+        if not torch.cuda.is_available() or not hasattr(torch.cuda, 'amp') or not torch.cuda.get_device_capability()[
+                                                                                      0] >= 7:
+            print("Warning: FP16 mixed precision also not well supported. Disabling mixed precision.")
+            use_amp = False
         else:
-            print(f"Warning: Pretrained checkpoint not found at '{args.pretrained}'. Training from scratch.")
+            # Use FP16 if BF16 isn't available but FP16 likely is
+            print("Using FP16 mixed precision.")
+    elif args.mixed_precision and device.type == 'cpu':
+        print("Mixed precision is only supported on CUDA. Disabling.")
+        use_amp = False
+
+    print(f"Using device: {device}")
+    print(f"Mixed Precision (AMP) enabled: {use_amp}")
+
+    # Initialize WandB
+    if not args.no_wandb:
+        try:
+            wandb.init(
+                project=args.wandb_project,
+                entity=args.wandb_entity,
+                name=args.wandb_name,
+                config=vars(args)  # Log all hyperparameters
+            )
+            wandb_log = True
+            print("WandB initialized.")
+        except Exception as e:
+            print(f"Could not initialize WandB: {e}. Disabling WandB logging.")
+            wandb_log = False
     else:
-        print("No pretrained checkpoint specified. Training from scratch.")
-    # --- End of Load Pretrained Weights Section ---
+        wandb_log = False
+        print("WandB logging disabled.")
 
-    # Define the reconstruction loss (MSE) computed only on non-padded regions.
-    # Using reduction='sum' and manually normalizing later in the loop.
-    criterion_recon = nn.MSELoss(reduction='sum')
-
-    # Use an optimizer for the autoencoder parameters
-    optimizer = optim.Adam(autoencoder.parameters(), lr=args.lr, betas=(args.beta1, args.beta2))
-    optimizer_d = optim.Adam(discriminator.parameters(), lr=args.lr, betas=(args.beta1, args.beta2))
-
-    # Initialize GradScaler for mixed precision training
-    # enabled=use_cuda means scaler is only active when using GPU
-    scaler = GradScaler(enabled=use_cuda)
-
-    # --- Start Training ---
-    print("Starting training...")
-    train(
-        model=(autoencoder, discriminator),
-        train_dataloader=train_dataloader,
-        eval_dataset=eval_dataset_subset,  # Pass the Subset for eval plotting
-        criterion_recon=criterion_recon,
-        optimizer=(optimizer, optimizer_d),
-        scaler=scaler,
-        device=device,
-        args=args
+    # --- Data Loading and Splitting ---
+    print("Loading dataset...")
+    full_dataset = MusicChunkDataset(
+        args.chunks_dir, args.mapping_json, bos_id=args.bos_id, pad_id=args.pad_id
     )
 
-    print("Training finished.")
+    # Split dataset
+    total_size = len(full_dataset)
+    val_size = int(args.val_split * total_size)
+    train_size = total_size - val_size
+
+    if val_size == 0 or train_size == 0:
+        raise ValueError(
+            f"Validation split {args.val_split} resulted in zero samples for train or val. Adjust split or check dataset size ({total_size}).")
+
+    print(f"Splitting dataset: Train={train_size}, Validation={val_size}")
+    # Use generator for reproducibility with seed
+    generator = torch.Generator().manual_seed(args.seed)
+    train_ds, val_ds = random_split(full_dataset, [train_size, val_size], generator=generator)
+
+    # Create DataLoaders
+    train_dl = DataLoader(
+        train_ds,
+        batch_size=args.batch_size,
+        shuffle=True,
+        num_workers=args.num_workers,
+        pin_memory=True if device.type == 'cuda' else False,  # Pin memory only for CUDA
+        collate_fn=lambda b: collate_music(b, pad_id=args.pad_id),
+        persistent_workers=True if args.num_workers > 0 else False  # Helps speed up epoch starts
+    )
+    val_dl = DataLoader(
+        val_ds,
+        batch_size=args.batch_size * 2,  # Often possible to use larger batch for eval
+        shuffle=False,
+        num_workers=args.num_workers,
+        pin_memory=True if device.type == 'cuda' else False,
+        collate_fn=lambda b: collate_music(b, pad_id=args.pad_id),
+        persistent_workers=True if args.num_workers > 0 else False
+    )
+    print(f"Train batches: {len(train_dl)}, Val batches: {len(val_dl)}")
+
+    # --- Model, Optimizer, Loss ---
+    model = MusicLSTM(
+        vocab_size=args.vocab_size,
+        num_genres=args.num_genres,
+        emb_dim=args.emb_dim,
+        lstm_hid=args.lstm_hid,
+        lstm_layers=args.lstm_layers,
+        pad_id=args.pad_id,
+    ).to(device)
+
+    if wandb_log:
+        wandb.watch(model, log="all", log_freq=args.log_every * 10)  # Watch model gradients/parameters
+
+    optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr)
+    criterion = nn.CrossEntropyLoss(ignore_index=args.pad_id)
+
+    # Initialize GradScaler for Mixed Precision (only if use_amp is True)
+    scaler = GradScaler(enabled=use_amp) if device.type == 'cuda' else None
+    if use_amp and scaler:
+        print("Initialized GradScaler for AMP.")
+
+    # --- Training & Evaluation Loop ---
+    print(f"\nStarting training for {args.epochs} epochs...")
+    global_step = 0
+    best_val_loss = float('inf')
+
+    for epoch in range(1, args.epochs + 1):
+        print(f"\n=== Epoch {epoch}/{args.epochs} ===")
+
+        # Training
+        avg_train_loss, global_step = train_loop(
+            model=model,
+            dataloader=train_dl,
+            optimizer=optimizer,
+            criterion=criterion,
+            device=device,
+            scaler=scaler,
+            use_amp=use_amp,
+            epoch=epoch,
+            pad_id=args.pad_id,
+            log_every=args.log_every,
+            wandb_log=wandb_log,
+            global_step=global_step,
+            max_grad_norm=args.max_grad_norm
+        )
+
+        # Evaluation
+        avg_val_loss = evaluate_loop(
+            model=model,
+            dataloader=val_dl,
+            criterion=criterion,
+            device=device,
+            use_amp=use_amp,  # Use autocast in eval but no grad scaling
+            epoch=epoch,
+            pad_id=args.pad_id
+        )
+
+        # Perplexity (lower is better)
+        train_ppl = math.exp(avg_train_loss) if avg_train_loss < 700 else float('inf')  # Avoid overflow
+        val_ppl = math.exp(avg_val_loss) if avg_val_loss < 700 else float('inf')
+
+        print(f"\nEpoch {epoch} Summary:")
+        print(f"  Avg Train Loss: {avg_train_loss:.4f} | Train Perplexity: {train_ppl:.2f}")
+        print(f"  Avg Val Loss  : {avg_val_loss:.4f} | Val Perplexity  : {val_ppl:.2f}")
+
+        # Log epoch metrics to WandB
+        if wandb_log:
+            wandb.log({
+                "epoch": epoch,
+                "train/loss_epoch": avg_train_loss,
+                "train/perplexity": train_ppl,
+                "val/loss": avg_val_loss,
+                "val/perplexity": val_ppl,
+                "global_step": global_step  # Log final step count for the epoch
+            })
+
+        # Simple best model saving based on validation loss
+        if avg_val_loss < best_val_loss:
+            best_val_loss = avg_val_loss
+            file_name = f"model_epoch_{epoch}_valloss_{avg_val_loss:.4f}.pt"
+            out_path = os.path.join(args.out_dir, file_name)
+            save_path = Path(out_path)
+            torch.save({
+                'epoch': epoch,
+                'model_state_dict': model.state_dict(),
+                'optimizer_state_dict': optimizer.state_dict(),
+                'loss': avg_val_loss,
+                'args': args  # Save args for reproducibility
+            }, save_path)
+            print(f"  New best validation loss. Saved model to {save_path}")
+            if wandb_log:
+                wandb.save(str(save_path))  # Save best model checkpoints to WandB
+
+    print("\nTraining finished.")
+    if wandb_log:
+        wandb.finish()
+    print("Done.")
 
 
-if __name__ == '__main__':
+if __name__ == "__main__":
     main()
