@@ -6,10 +6,12 @@ from .attentions import SEBlock1D, TransposeRMSNorm, AttentionPooling, Transpose
     ResidualBlock1D, CBAM1D, CAM1D
 from .submodels import sequence_mask, mask_to_attention_mask, Prenet, GroupActNorm1d
 from torch.nn.utils.rnn import pack_padded_sequence, pad_packed_sequence
-from .s4 import S4Block as S4 
+from .s4 import S4Block as S4
 from torch.cuda.amp import GradScaler, autocast
 import torch.nn.functional as F
 from torch.nn.utils import spectral_norm
+from typing import Union, Tuple, List
+
 
 class SequenceNormalization(nn.Module):
     """
@@ -82,6 +84,108 @@ class ConvBlock1D(nn.Module):
         return out
 
 
+class MelSpectrogramPatchDiscriminator(nn.Module):
+    """
+    PatchGAN-style discriminator for mel-spectrogram inputs with strided convolutions.
+
+    Args:
+        mel_channels (int): number of mel frequency bins.
+        hidden_channels (List[int]): channels for each conv layer.
+        kernel_sizes (List[int]): kernel sizes (len = len(hidden_channels)+1).
+
+    Forward returns a patch mask where True indicates padded patches.
+    """
+
+    def __init__(
+            self,
+            mel_channels: int,
+            hidden_channels: list = [64, 128, 256, 512],
+            kernel_sizes: list = [7, 5, 5, 3, 3],
+            stride=2,
+            norm_bin_size=8,
+    ):
+        super().__init__()
+        assert len(kernel_sizes) == len(hidden_channels) + 1, \
+            "kernel_sizes must be hidden_channels len + 1"
+
+        self.pre_norm = GroupActNorm1d(mel_channels, group_size=norm_bin_size)
+        self.convs = nn.ModuleList()
+        self.proj = nn.Linear(mel_channels, hidden_channels[0])
+        in_ch = hidden_channels[0]
+        # feature layers
+        for out_ch, k in zip(hidden_channels, kernel_sizes[:-1]):
+            conv = spectral_norm(
+                nn.Conv1d(in_ch, out_ch, kernel_size=k, stride=stride, padding=(k - 1) // 2)
+            )
+            self.convs.append(conv)
+            in_ch = out_ch
+        # final layer
+        self.se_block = CAM1D(in_ch, 8)
+        final_conv = spectral_norm(
+            nn.Conv1d(in_ch, 1, kernel_size=kernel_sizes[-1], stride=1, padding=(kernel_sizes[-1] - 1) // 2)
+        )
+        self.convs.append(final_conv)
+
+        self.activation = nn.LeakyReLU(0.2, inplace=True)
+        self._initialize_weights()
+
+    def _initialize_weights(self):
+        for m in self.modules():
+            if isinstance(m, nn.Conv1d):
+                nn.init.normal_(m.weight, 0.0, 0.02)
+                if m.bias is not None:
+                    nn.init.zeros_(m.bias)
+
+    def forward(self, x: torch.Tensor, x_lengths: torch.Tensor, return_features=False):
+        """
+        Args:
+            x: (batch, time, mel_channels)
+            x_lengths: (batch,) lengths of each sequence
+        Returns:
+            out: (batch, 1, L_out) patch logits
+            patch_mask: (batch, 1, L_out) bool mask where True indicates padded patches
+        """
+        x = self.pre_norm(
+            x.transpose(1, 2)
+        ).transpose(1, 2)
+
+        B, T, C = x.size()
+        # build padded mask (True indicates padding)
+        padded_mask = sequence_mask(T, x_lengths)  # (B, T)
+        x = self.proj(x)
+        # zero out padded input
+        x = x.masked_fill(padded_mask.unsqueeze(-1), 0.0)
+        out = x.transpose(1, 2)  # (B, C, T)
+        features = []
+
+        # propagate through convs, downsampling padded_mask
+        for i, conv in enumerate(self.convs):
+            if i == len(self.convs) - 1:
+                out = self.se_block(out, padded_mask.unsqueeze(1))
+
+            out = self.activation(conv(out))
+            stride = conv.stride[0]
+            if stride > 1:
+                # downsample padded_mask to align with out
+                padded_mask = F.max_pool1d(
+                    padded_mask.float().unsqueeze(1),
+                    kernel_size=stride,
+                    stride=stride,
+                    ceil_mode=True
+                ).squeeze(1).bool()
+            # mask out fully-padded patches
+            out = out.masked_fill(padded_mask.unsqueeze(1), 0.0)
+            if return_features:
+                features.append((out, padded_mask))
+
+        # final patch mask: True=padded
+        patch_mask = padded_mask.unsqueeze(1)
+        patch_mask = ~patch_mask  # True=valid, loss uses that
+        if return_features:
+            return out, patch_mask, features
+        return out, patch_mask
+
+
 class ChannelSELayerMasked(nn.Module):
     """
     Squeeze-and-Excitation that supports a padding mask.
@@ -106,23 +210,23 @@ class ChannelSELayerMasked(nn.Module):
         reduced = max(1, num_channels // reduction_ratio)
 
         self.fc1 = nn.Linear(num_channels, reduced, bias=True)
-        self.fc2 = nn.Linear(reduced,   num_channels, bias=True)
+        self.fc2 = nn.Linear(reduced, num_channels, bias=True)
 
         self.relu = nn.ReLU(inplace=True)
         self.sigmoid = nn.Sigmoid()
 
     # ------------------------------------------------------------------
     def forward(
-        self,
-        x: torch.Tensor,              # (B, C, H, W)
-        padding_mask=None  # (B, 1, H, W) -- True = padded
+            self,
+            x: torch.Tensor,  # (B, C, H, W)
+            padding_mask=None  # (B, 1, H, W) -- True = padded
     ):
         B, C, H, W = x.shape
 
         # ---------- SQUEEZE (masked global average) ------------------
         if padding_mask is None:
             # Vanilla SE: mean over spatial dims
-            squeeze = x.view(B, C, -1).mean(dim=2)           # (B, C)
+            squeeze = x.view(B, C, -1).mean(dim=2)  # (B, C)
         else:
             # Exclude padded positions
             #   mask_valid : (B, 1, H, W)   True = valid
@@ -130,8 +234,8 @@ class ChannelSELayerMasked(nn.Module):
             # prevent div-by-zero
             denom = mask_valid.sum(dim=(2, 3), keepdim=False).clamp(min=1)  # (B,1)
             # spatial sum over valid positions
-            summed = (x * mask_valid).view(B, C, -1).sum(dim=2)             # (B,C)
-            squeeze = summed / denom                                        # (B,C)
+            summed = (x * mask_valid).view(B, C, -1).sum(dim=2)  # (B,C)
+            squeeze = summed / denom  # (B,C)
 
         # ---------- EXCITATION ---------------------------------------
         excite = self.sigmoid(self.fc2(self.relu(self.fc1(squeeze))))  # (B,C)
@@ -140,7 +244,6 @@ class ChannelSELayerMasked(nn.Module):
         y = x * excite.view(B, C, 1, 1)
 
         return y
-
 
 
 class MelSpectrogramPatchDiscriminator2D(nn.Module):
@@ -156,17 +259,18 @@ class MelSpectrogramPatchDiscriminator2D(nn.Module):
     mel_channels   : number of mel bins (F)
     hidden_channels: list[int] – output channels per conv block
     kernel_sizes   : list[int] – square kernels, len = len(hidden_channels)+1
-    stride         : int       – stride for down-sampling conv blocks
+    stride         : tuple(int, int) or list[tuple(int,int)]       – stride for down-sampling conv blocks
     norm_bin_size  : int       – freq-group size for GroupActNorm2d
     """
 
     def __init__(
-        self,
-        mel_channels: int,
-        hidden_channels: list = (64, 128, 256, 512),
-        kernel_sizes: list = (7, 5, 5, 3, 3),
-        stride: int = 2,
-        norm_bin_size: int = 8,
+            self,
+            mel_channels: int,
+            hidden_channels: list = (64, 128, 256, 512),
+            kernel_sizes: list = (7, 5, 5, 3, 3),
+            stride: Union[int, Tuple[int, int], List[Tuple[int, int]]] = (2, 2),
+            norm_bin_size: int = 8,
+            lengthwise_only=False,
     ):
         super().__init__()
         assert len(kernel_sizes) == len(hidden_channels) + 1, (
@@ -176,41 +280,77 @@ class MelSpectrogramPatchDiscriminator2D(nn.Module):
         # --- Convolutional backbone ------------------------------------
         self.convs = nn.ModuleList()
         self.mel_channels = mel_channels
-        ret_features_map = [True] * len(hidden_channels)
+        in_ch = 1  # we keep a single input channel and treat (F,T) as H×W
+
+        ret_features_map = [True] * (len(hidden_channels) + 1)
         ret_features_map[0] = False
         ret_features_map[1] = False
         ret_features_map[-1] = False
         self.ret_features_map = ret_features_map
 
+        # Build a per-layer list of (h_stride, w_stride)
+        if isinstance(stride, int):
+            layer_strides = [(1, stride)] * len(kernel_sizes)
+        elif isinstance(stride, tuple) and len(stride) == 2:
+            layer_strides = [stride] * len(kernel_sizes)
+        else:
+            # list of tuples
+            assert len(stride) == len(kernel_sizes), "stride list must match kernel_sizes"
+            layer_strides = [tuple(s) for s in stride]
 
-        in_ch = 1  # we keep a single input channel and treat (F,T) as H×W
+        # intermediate layers
+        for out_ch, k, (sh, sw) in zip(hidden_channels, kernel_sizes[:-1], layer_strides[:-1]):
+            if lengthwise_only:
+                # only convolve / stride in time (width)
+                kernel = (1, k)
+                stride_ = (1, sw)
+                padding = (0, (k - 1) // 2)
+            else:
+                if isinstance(k, tuple):
+                    k1, k2 = k
+                else:
+                    k1 = k
+                    k2 = k
+                # square conv
+                kernel = (k1, k2)
+                stride_ = (sh, sw)
+                padding = ((k1 - 1) // 2, (k2 - 1) // 2)
 
-        for out_ch, k in zip(hidden_channels, kernel_sizes[:-1]):
             self.convs.append(
                 spectral_norm(
                     nn.Conv2d(
                         in_ch,
                         out_ch,
-                        kernel_size=(k, k),
-                        stride=(stride, stride),
-                        padding=(k - 1) // 2,
+                        kernel_size=kernel,
+                        stride=stride_,
+                        padding=padding,
                     )
                 )
             )
             in_ch = out_ch
 
-        # final 1-channel logits layer
+        # final logits conv (always square & stride=1)
+        k = kernel_sizes[-1]
+        if isinstance(k, tuple):
+            k1, k2 = k
+        else:
+            k1 = k
+            k2 = k
+
+        pad = (0, (k - 1) // 2) if lengthwise_only else ((k1 - 1) // 2, (k2 - 1) // 2)
+        kernel = (1, k) if lengthwise_only else (k1, k2)
         self.convs.append(
             spectral_norm(
-                nn.Conv2d(
-                    in_ch,
-                    1,
-                    kernel_size=(kernel_sizes[-1], kernel_sizes[-1]),
-                    stride=1,
-                    padding=(kernel_sizes[-1] - 1) // 2,
-                )
+                nn.Conv2d(in_ch, 1,
+                          kernel_size=kernel,
+                          stride=(1, 1),
+                          padding=pad)
             )
         )
+
+        self.activation = nn.LeakyReLU(0.2, inplace=True)
+        self.se_block = ChannelSELayerMasked(in_ch, norm_bin_size)
+        self._initialize_weights()
 
         self.activation = nn.LeakyReLU(0.2, inplace=True)
         self.se_block = ChannelSELayerMasked(in_ch, 8)
@@ -233,16 +373,16 @@ class MelSpectrogramPatchDiscriminator2D(nn.Module):
         returns : (B, 1, F, T) – True = padded
         """
         # time mask (B, T)
-        tmask = sequence_mask(T, lengths)           # True = padded
+        tmask = sequence_mask(T, lengths)  # True = padded
         # broadcast across frequency bins and channel dim
         return tmask.unsqueeze(1).unsqueeze(2).expand(-1, 1, Freq, -1)
 
     # ------------------------------------------------------------------
     def forward(
-        self,
-        x: torch.Tensor,           # (B, T, F)
-        x_lengths: torch.Tensor,   # (B,)
-        return_features: bool = False,
+            self,
+            x: torch.Tensor,  # (B, T, F)
+            x_lengths: torch.Tensor,  # (B,)
+            return_features: bool = False,
     ):
         B, T, _ = x.shape
 
@@ -250,6 +390,9 @@ class MelSpectrogramPatchDiscriminator2D(nn.Module):
         padded_mask = self._build_mask(T, self.mel_channels, x_lengths)  # (B,1,F,T)
 
         # bring to 2-D conv layout
+        # (B, Lmel, subCmel) => (B, subCmel, Lmel)
+        # We want Cmel to be the 1st dim after batch because our subbin Ds
+        # stide along the 2nd dim only
         out = x.transpose(1, 2).unsqueeze(1)  # (B,1,F,T)
 
         features = []
@@ -284,122 +427,19 @@ class MelSpectrogramPatchDiscriminator2D(nn.Module):
         return out, patch_mask
 
 
-
-
-
-class MelSpectrogramPatchDiscriminator(nn.Module):
-    """
-    PatchGAN-style discriminator for mel-spectrogram inputs with strided convolutions (optional)
-
-    Args:
-        mel_channels (int): number of mel frequency bins.
-        hidden_channels (List[int]): channels for each conv layer.
-        kernel_sizes (List[int]): kernel sizes (len = len(hidden_channels)+1).
-
-    Forward returns a patch mask where True indicates padded patches.
-    """
-    def __init__(
-        self,
-        mel_channels: int,
-        hidden_channels: list = [64, 128, 256, 512],
-        kernel_sizes: list = [7, 5, 5, 3, 3],
-        stride = 2,
-        norm_bin_size = 8,
-    ):
-        super().__init__()
-        assert len(kernel_sizes) == len(hidden_channels) + 1, \
-            "kernel_sizes must be hidden_channels len + 1"
-
-        self.pre_norm = GroupActNorm1d(mel_channels, group_size=norm_bin_size)
-        self.convs = nn.ModuleList()
-        self.proj = nn.Linear(mel_channels, hidden_channels[0])
-        in_ch = hidden_channels[0]
-        # feature layers
-        for out_ch, k in zip(hidden_channels, kernel_sizes[:-1]):
-            conv = spectral_norm(
-                nn.Conv1d(in_ch, out_ch, kernel_size=k, stride=stride, padding=(k-1)//2)
-            )
-            self.convs.append(conv)
-            in_ch = out_ch
-        # final layer
-        final_conv = spectral_norm(
-            nn.Conv1d(in_ch, 1, kernel_size=kernel_sizes[-1], stride=1, padding=(kernel_sizes[-1]-1)//2)
-        )
-        self.convs.append(final_conv)
-
-        self.activation = nn.LeakyReLU(0.2, inplace=True)
-        self.se_block = CAM1D(in_ch, 8)
-        self._initialize_weights()
-
-    def _initialize_weights(self):
-        for m in self.modules():
-            if isinstance(m, nn.Conv1d):
-                nn.init.normal_(m.weight, 0.0, 0.02)
-                if m.bias is not None:
-                    nn.init.zeros_(m.bias)
-
-    def forward(self, x: torch.Tensor, x_lengths: torch.Tensor, return_features=False):
-        """
-        Args:
-            x: (batch, time, mel_channels)
-            x_lengths: (batch,) lengths of each sequence
-        Returns:
-            out: (batch, 1, L_out) patch logits
-            patch_mask: (batch, 1, L_out) bool mask where True indicates padded patches
-        """
-
-        x = self.pre_norm(
-            x.transpose(1,2)
-        ).transpose(1,2)
-        B, T, C = x.size()
-        # build padded mask (True indicates padding)
-        padded_mask = sequence_mask(T, x_lengths)  # (B, T)
-        x = self.proj(x)
-        # zero out padded input
-        x = x.masked_fill(padded_mask.unsqueeze(-1), 0.0)
-        out = x.transpose(1, 2)  # (B, C, T)
-        features = []
-
-        # propagate through convs, downsampling padded_mask
-        for i, conv in enumerate(self.convs):
-            if i == len(self.convs) - 1:
-                out = self.se_block(out, padded_mask.unsqueeze(1))
-
-            out = self.activation(conv(out))
-            stride = conv.stride[0]
-            if stride > 1:
-                # downsample padded_mask to align with out
-                padded_mask = F.max_pool1d(
-                    padded_mask.float().unsqueeze(1),
-                    kernel_size=stride,
-                    stride=stride,
-                    ceil_mode=True
-                ).squeeze(1).bool()
-            # mask out fully-padded patches
-            out = out.masked_fill(padded_mask.unsqueeze(1), 0.0)
-            if return_features:
-                features.append((out, padded_mask))
-
-
-        # final patch mask: True=padded
-        patch_mask = padded_mask.unsqueeze(1)
-        patch_mask = ~patch_mask # True=valid, loss uses that
-        if return_features:
-            return out, patch_mask, features
-        return out, patch_mask
-
-
 class MultiBinDiscriminator(nn.Module):
     """
     Splits the mel axis into `n_bins` equal bands and runs an independent
     MelSpectrogramPatchDiscriminator on each band.
     """
+
     def __init__(
-        self,
-        mel_channels: int,
-        n_bins: int = 4,
-        hidden_channels: list = (64, 128, 256, 512),
-        kernel_sizes:   list = (7, 5, 5, 3, 3),
+            self,
+            mel_channels: int,
+            n_bins: int = 4,
+            hidden_channels: list = (64, 128, 256, 512),
+            kernel_sizes: list = (7, 5, 5, 3, 3),
+            n_no_strides: int = 2,
     ):
         super().__init__()
         assert mel_channels % n_bins == 0, "mel_channels must divide n_bins"
@@ -407,19 +447,29 @@ class MultiBinDiscriminator(nn.Module):
         sub_hidden_channels = []
         for h in hidden_channels:
             assert h % n_bins == 0, f"hidden size {h} must divide n_bins"
-            sub_hidden_channels.append(h // n_bins)
+            sub_hidden_channels.append(h)
 
         self.n_bins = n_bins
-        bin_size   = mel_channels // n_bins
+        bin_size = mel_channels // n_bins
+        strides_lst = []
+        for i in range(len(kernel_sizes)):
+            # first n_no_strides layers: no downsampling in time
+            if i < n_no_strides:
+                strides_lst.append((1, 1))
+            else:
+                # after that, stride=2 along time only
+                strides_lst.append((1, 2))
+
+        ksizes_lst = [(3, ks) for ks in kernel_sizes]
 
         self.discriminators = nn.ModuleList(
             [
                 MelSpectrogramPatchDiscriminator2D(
                     mel_channels=bin_size,
                     hidden_channels=list(sub_hidden_channels),
-                    kernel_sizes=list(kernel_sizes),
-                    stride=2, #  stride
-                    norm_bin_size= bin_size // 2, # half norm for each bin
+                    kernel_sizes=ksizes_lst,
+                    stride=strides_lst,  # stride
+                    norm_bin_size=bin_size // 2,  # half norm for each bin
                 )
                 for _ in range(n_bins)
             ]
@@ -435,23 +485,19 @@ class MultiBinDiscriminator(nn.Module):
 
         outs, masks, feats = [], [], []
         for disc, sub_x in zip(self.discriminators, splits):
-            # (B, Lmel, subCmel) => (B, subCmel, Lmel)
-            # We want Cmel to be the 1st dim after batch because our subbin Ds
-            # stide along the 2nd dim only -- it must only reduce the seq len and keep the bin dim intact.
-            sub_x = sub_x.transpose(1,2)
-
             if return_features:
                 o, m, f = disc(sub_x, x_lengths, True)
-                outs.append(o); masks.append(m); feats.append(f)
+                outs.append(o);
+                masks.append(m);
+                feats.append(f)
             else:
                 o, m = disc(sub_x, x_lengths, False)
-                outs.append(o); masks.append(m)
+                outs.append(o);
+                masks.append(m)
 
         if return_features:
             return outs, masks, feats
         return outs, masks
-
-
 
 
 class S4Block1D(nn.Module):
@@ -497,6 +543,7 @@ class S4Block1D(nn.Module):
         out = self.dropout(out)
         return out
 
+
 class AdvSeqDiscriminatorS4(nn.Module):
     """
     Conv+S4 Discriminator.
@@ -504,7 +551,9 @@ class AdvSeqDiscriminatorS4(nn.Module):
 
     I tried residual design but found that it's hard to optimize.
     """
-    def __init__(self, hidden_dim=1024, num_ssm_layers=6, conv_kernel_size=[3, 7, 11], conv_dropout=0.5, ssm_dropout=0.3, use_cbam=True, norm="layer"):
+
+    def __init__(self, hidden_dim=1024, num_ssm_layers=6, conv_kernel_size=[3, 7, 11], conv_dropout=0.5,
+                 ssm_dropout=0.3, use_cbam=True, norm="layer"):
         """
         Init S4+Conv D
         :param hidden_dim: Hidden dimension size for all layers
@@ -520,13 +569,14 @@ class AdvSeqDiscriminatorS4(nn.Module):
         self.num_ssm_layers = num_ssm_layers
 
         self.convs = nn.ModuleList(
-            [ConvBlock1D(hidden_dim, hidden_dim, kernel_size=ks, dropout=conv_dropout, norm=norm) for ks in conv_kernel_size]
+            [ConvBlock1D(hidden_dim, hidden_dim, kernel_size=ks, dropout=conv_dropout, norm=norm) for ks in
+             conv_kernel_size]
         )
 
         self.ssms = nn.ModuleList(
             [S4Block1D(hidden_dim, hidden_dim, dropout=ssm_dropout, norm="layer") for _ in range(num_ssm_layers)]
         )
-        
+
         # Optional CBAM block (unchanged)
         if self.use_cbam:
             self.cbam = CBAM1D(hidden_dim)
@@ -573,7 +623,6 @@ class AdvSeqDiscriminatorS4(nn.Module):
         return out
 
 
-
 ########################################
 # Updated MultiLengthDiscriminator
 ########################################
@@ -592,8 +641,8 @@ class MultiLengthDiscriminator(nn.Module):
     def __init__(self,
                  text_hidden=256, num_channels=1, hidden_dim=1024,
                  n_heads=0, dropout=0.5, kernel_size=[[3, 3, 5], [7, 7, 9, 11]],
-                 emotion_hidden=0,use_cbam=True, att_dropout=0.3,
-                 ssm_dropout=0.3, ssm_depths = [ 0, 0 ], norm="layer"):
+                 emotion_hidden=0, use_cbam=True, att_dropout=0.3,
+                 ssm_dropout=0.3, ssm_depths=[0, 0], norm="layer"):
         super(MultiLengthDiscriminator, self).__init__()
 
         self.text_hidden = text_hidden
@@ -622,7 +671,6 @@ class MultiLengthDiscriminator(nn.Module):
             )
         else:
             self.em_proj = None
-
 
         # Optional Attention mechanism at the parent level
         if self.n_heads > 0:
